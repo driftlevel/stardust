@@ -108,7 +108,6 @@ pub const DHCPServer = struct {
 
     /// Main server loop. Binds a UDP socket on port 67 and processes packets.
     pub fn run(self: *Self) !void {
-        const stdout = td.fs.File.stdout().writeAll();
 
         self.running.store(true, .seq_cst);
         defer self.running.store(false, .seq_cst);
@@ -151,7 +150,7 @@ pub const DHCPServer = struct {
             @sizeOf(std.posix.sockaddr.in),
         );
 
-        try stdout.print("DHCP server listening on {s}:{d}\n", .{
+        try std.fs.File.stdout().writeAll("DHCP server listening on {s}:{d}\n", .{
             self.cfg.listen_address,
             dhcp_server_port,
         });
@@ -168,14 +167,14 @@ pub const DHCPServer = struct {
                 @ptrCast(&src_addr),
                 &src_len,
             ) catch |err| {
-                try stdout.print("recvfrom error: {s}\n", .{@errorName(err)});
+                try std.fs.File.stdout().writeAll("recvfrom error: {s}\n", .{@errorName(err)});
                 continue;
             };
 
             const packet = buf[0..n];
 
             const response = self.processPacket(packet) catch |err| {
-                try stdout.print("Error processing packet: {s}\n", .{@errorName(err)});
+                try std.fs.File.stdout().writeAll("Error processing packet: {s}\n", .{@errorName(err)});
                 continue;
             };
 
@@ -195,12 +194,12 @@ pub const DHCPServer = struct {
                     @ptrCast(&dst_addr),
                     @sizeOf(std.posix.sockaddr.in),
                 ) catch |err| {
-                    try stdout.print("sendto error: {s}\n", .{@errorName(err)});
+                    try std.fs.File.stdout().writeAll("sendto error: {s}\n", .{@errorName(err)});
                 };
             }
         }
 
-        try stdout.print("DHCP server stopped\n", .{});
+        try std.fs.File.stdout().writeAll("DHCP server stopped\n", .{});
     }
 
     fn processPacket(self: *Self, packet: []const u8) !?[]u8 {

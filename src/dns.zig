@@ -35,20 +35,19 @@ pub const DNSUpdater = struct {
     }
 
     pub fn run(self: *Self) !void {
-        const stdout = td.fs.File.stdout().writeAll();
 
         if (!self.config.enable) {
-            try stdout.print("DNS updater disabled in config\n", .{});
+            try std.fs.File.stdout().writeAll("DNS updater disabled in config\n", .{});
             return;
         }
 
-        try stdout.print("DNS updater running...\n", .{});
+        try std.fs.File.stdout().writeAll("DNS updater running...\n", .{});
 
         // This would be replaced with actual DNS update logic.
         // For now, just verify we can access the state.
         _ = try self.state_store.listLeases();
 
-        try stdout.print("DNS updater completed initial sync\n", .{});
+        try std.fs.File.stdout().writeAll("DNS updater completed initial sync\n", .{});
     }
 
     pub fn cleanup(self: *Self) void {
