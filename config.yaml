@@ -1,0 +1,32 @@
+# DHCP Server Configuration
+listen_address: "0.0.0.0"
+
+# Network configuration
+subnet: "192.168.1.0"
+router: "192.168.1.1"
+subnet_mask: 255.255.255.0
+
+# DHCP settings
+lease_time: 3600
+
+# DNS settings
+dns_servers:
+  - "8.8.8.8"
+  - "8.8.4.4"
+
+domain_name: "example.com"
+
+# State storage
+state_dir: "/var/lib/stardust"
+
+# DNS updates configuration
+dns_update:
+  enable: false
+  server: "127.0.0.1"
+  zone: "example.com"
+  key_name: "dhcp-update"
+  key_file: "/etc/bind/key.dhcp-update.key"
+
+# Additional DHCP options
+dhcp_options:
+  # option_name: value
