@@ -1,43 +1,8 @@
 const std = @import("std");
+const state = @import("./state.zig");
 
 pub const Error = error{
     InvalidConfig,
-};
-
-pub const DNSUpdater = struct {
-    allocator: std.mem.Allocator,
-    config: *const Config,
-    state: *const state.StateStore,
-
-    pub fn create(allocator: std.mem.Allocator, config: *const Config, state_store: *const state.StateStore) !*DNSUpdater {
-        return DNSUpdater{
-            .allocator = allocator,
-            .config = config,
-            .state = state_store,
-        };
-    }
-
-    pub fn run(updater: *DNSUpdater) !void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-
-        if (!updater.config.enable) {
-            stdout.print("DNS updater disabled in config\n", .{}) catch return;
-            return;
-        }
-
-        stdout.print("DNS updater running...\n", .{}) catch return;
-
-        // This would be replaced with actual DNS update logic
-        // For now, just verify we can access the state
-        _ = try updater.state.listLeases();
-
-        stdout.print("DNS updater completed initial sync\n", .{}) catch return;
-    }
-
-    pub fn cleanup(updater: *DNSUpdater) void {
-        // Cleanup resources
-        _ = updater;
-    }
 };
 
 pub const Config = struct {
@@ -48,8 +13,53 @@ pub const Config = struct {
     key_file: []const u8,
 };
 
-const state = @import("./state.zig");
+pub const DNSUpdater = struct {
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    state_store: *const state.StateStore,
 
-pub fn create_updater(allocator: std.mem.Allocator, config: *const Config, store: *const state.StateStore) !*DNSUpdater {
+    const Self = @This();
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        config: *const Config,
+        store: *const state.StateStore,
+    ) !*Self {
+        const self = try allocator.create(Self);
+        self.* = .{
+            .allocator = allocator,
+            .config = config,
+            .state_store = store,
+        };
+        return self;
+    }
+
+    pub fn run(self: *Self) !void {
+        const stdout = std.io.getStdOut().writer();
+
+        if (!self.config.enable) {
+            try stdout.print("DNS updater disabled in config\n", .{});
+            return;
+        }
+
+        try stdout.print("DNS updater running...\n", .{});
+
+        // This would be replaced with actual DNS update logic.
+        // For now, just verify we can access the state.
+        _ = try self.state_store.listLeases();
+
+        try stdout.print("DNS updater completed initial sync\n", .{});
+    }
+
+    pub fn cleanup(self: *Self) void {
+        self.allocator.destroy(self);
+    }
+};
+
+pub fn create_updater(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    store: *const state.StateStore,
+) !*DNSUpdater {
     return DNSUpdater.create(allocator, config, store);
 }
