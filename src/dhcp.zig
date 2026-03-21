@@ -88,6 +88,7 @@ pub const DHCPServer = struct {
     cfg: *const Config,
     store: *StateStore,
     running: std.atomic.Value(bool),
+    last_prune: i64,
 
     const Self = @This();
 
@@ -98,6 +99,7 @@ pub const DHCPServer = struct {
             .cfg = cfg,
             .store = store,
             .running = std.atomic.Value(bool).init(false),
+            .last_prune = 0,
         };
         return self;
     }
@@ -173,6 +175,12 @@ pub const DHCPServer = struct {
 
             const packet = buf[0..n];
 
+            const now_ts = std.time.timestamp();
+            if (now_ts - self.last_prune > 60) {
+                self.store.pruneExpired();
+                self.last_prune = now_ts;
+            }
+
             const response = self.processPacket(packet) catch |err| {
                 std.debug.print("Error processing packet: {s}\n", .{@errorName(err)});
                 continue;
@@ -224,8 +232,9 @@ pub const DHCPServer = struct {
         };
     }
 
-    fn getMessageType(packet: []const u8) ?MessageType {
-        if (packet.len < dhcp_min_packet_size + 4) return null;
+    /// Scan DHCP options for the first occurrence of `target`. Returns the value slice or null.
+    fn getOption(packet: []const u8, target: OptionCode) ?[]const u8 {
+        if (packet.len < dhcp_min_packet_size) return null;
         const opts = packet[dhcp_min_packet_size..];
         var i: usize = 0;
         while (i + 1 < opts.len) {
@@ -237,12 +246,16 @@ pub const DHCPServer = struct {
             }
             const len = opts[i + 1];
             if (i + 2 + len > opts.len) break;
-            if (code == @intFromEnum(OptionCode.MessageType) and len >= 1) {
-                return @enumFromInt(opts[i + 2]);
-            }
+            if (code == @intFromEnum(target)) return opts[i + 2 .. i + 2 + len];
             i += 2 + len;
         }
         return null;
+    }
+
+    fn getMessageType(packet: []const u8) ?MessageType {
+        const val = getOption(packet, .MessageType) orelse return null;
+        if (val.len < 1) return null;
+        return @enumFromInt(val[0]);
     }
 
     /// Scan the subnet for an unallocated host address to offer.
@@ -409,19 +422,21 @@ pub const DHCPServer = struct {
     /// Build a DHCPACK in response to a DHCPREQUEST.
     ///
     /// Allocates and returns a packet buffer; caller is responsible for freeing.
+    /// Returns null if the request is directed at another server.
+    /// Returns a DHCPNAK packet if the requested IP is invalid.
     fn createAck(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
 
+        // Option 54: ignore requests directed at a different server.
+        const our_ip = config_mod.parseIpv4(self.cfg.listen_address) catch return null;
+        if (getServerIdentifier(request)) |sid| {
+            if (!std.mem.eql(u8, &sid, &our_ip)) return null;
+        }
+
         // The client's requested IP comes from option 50, or ciaddr for renewals.
         const client_ip = getRequestedIp(request) orelse req_header.ciaddr;
-        const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
-        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
-        const router_ip = try config_mod.parseIpv4(self.cfg.router);
-        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
-        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time / 2));
-        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
 
-        // Record the lease
+        // Format MAC string early — needed for IP validation.
         const mac_bytes = req_header.chaddr[0..6];
         var mac_str_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -429,16 +444,27 @@ pub const DHCPServer = struct {
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch unreachable;
 
+        // Send DHCPNAK if the requested IP is not valid for our subnet.
+        if (!self.isIpValid(client_ip, mac_str)) return self.createNak(request);
+
+        const server_ip = our_ip;
+        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
+        const router_ip = try config_mod.parseIpv4(self.cfg.router);
+        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
+        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time / 2));
+        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
+
         var ip_str_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_str_buf, "{d}.{d}.{d}.{d}", .{
             client_ip[0], client_ip[1], client_ip[2], client_ip[3],
         }) catch unreachable;
 
+        // Record the lease (includes hostname from option 12 if present).
         const now = std.time.timestamp();
         self.store.addLease(.{
             .mac = mac_str,
             .ip = ip_str,
-            .hostname = null,
+            .hostname = getHostname(request),
             .expires = now + @as(i64, self.cfg.lease_time),
             .client_id = null,
         }) catch |err| {
@@ -556,24 +582,80 @@ pub const DHCPServer = struct {
 
     /// Scan options for option 50 (Requested IP Address).
     fn getRequestedIp(packet: []const u8) ?[4]u8 {
-        if (packet.len < dhcp_min_packet_size) return null;
-        const opts = packet[dhcp_min_packet_size..];
-        var i: usize = 0;
-        while (i + 1 < opts.len) {
-            const code = opts[i];
-            if (code == @intFromEnum(OptionCode.End)) break;
-            if (code == @intFromEnum(OptionCode.Pad)) {
-                i += 1;
-                continue;
-            }
-            const len = opts[i + 1];
-            if (i + 2 + len > opts.len) break;
-            if (code == @intFromEnum(OptionCode.RequestedIPAddress) and len == 4) {
-                return opts[i + 2 ..][0..4].*;
-            }
-            i += 2 + len;
+        const val = getOption(packet, .RequestedIPAddress) orelse return null;
+        if (val.len < 4) return null;
+        return val[0..4].*;
+    }
+
+    /// Scan options for option 54 (Server Identifier).
+    fn getServerIdentifier(packet: []const u8) ?[4]u8 {
+        const val = getOption(packet, .ServerIdentifier) orelse return null;
+        if (val.len < 4) return null;
+        return val[0..4].*;
+    }
+
+    /// Scan options for option 12 (Host Name).
+    fn getHostname(packet: []const u8) ?[]const u8 {
+        const val = getOption(packet, .HostName) orelse return null;
+        if (val.len == 0) return null;
+        return val;
+    }
+
+    /// Returns true if `ip` is a valid host address in our subnet that is either
+    /// unleased or already leased to `mac_str`.
+    fn isIpValid(self: *Self, ip: [4]u8, mac_str: []const u8) bool {
+        const ip_int = std.mem.readInt(u32, &ip, .big);
+        const subnet_bytes = config_mod.parseIpv4(self.cfg.subnet) catch return false;
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        const mask = self.cfg.subnet_mask;
+        const broadcast_int = subnet_int | ~mask;
+
+        if ((ip_int & mask) != subnet_int) return false;
+        if (ip_int == subnet_int or ip_int == broadcast_int) return false;
+
+        var ip_buf: [15]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return false;
+        if (self.store.getLeaseByIp(ip_str)) |lease| {
+            if (!std.mem.eql(u8, lease.mac, mac_str)) return false;
         }
-        return null;
+        return true;
+    }
+
+    /// Build a DHCPNAK in response to a DHCPREQUEST with an invalid IP.
+    fn createNak(self: *Self, request: []const u8) !?[]u8 {
+        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
+
+        var opts_buf: [16]u8 = undefined;
+        var opts_len: usize = 0;
+        opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
+        opts_len += 1;
+        opts_buf[opts_len] = 1;
+        opts_len += 1;
+        opts_buf[opts_len] = @intFromEnum(MessageType.DHCPNAK);
+        opts_len += 1;
+        opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
+        opts_len += 1;
+        opts_buf[opts_len] = 4;
+        opts_len += 1;
+        @memcpy(opts_buf[opts_len .. opts_len + 4], &server_ip);
+        opts_len += 4;
+        opts_buf[opts_len] = @intFromEnum(OptionCode.End);
+        opts_len += 1;
+
+        const pkt = try self.allocator.alloc(u8, dhcp_min_packet_size + opts_len);
+        @memset(pkt, 0);
+        const resp: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        resp.op = 2;
+        resp.htype = req_header.htype;
+        resp.hlen = req_header.hlen;
+        resp.xid = req_header.xid;
+        resp.flags = req_header.flags;
+        resp.giaddr = req_header.giaddr;
+        resp.chaddr = req_header.chaddr;
+        resp.magic = dhcp_magic_cookie;
+        @memcpy(pkt[dhcp_min_packet_size .. dhcp_min_packet_size + opts_len], opts_buf[0..opts_len]);
+        return pkt;
     }
 };
 
@@ -622,4 +704,270 @@ test "getRequestedIp absent" {
 
     const ip = DHCPServer.getRequestedIp(&pkt);
     try std.testing.expect(ip == null);
+}
+
+test "getOption finds target" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 16);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.HostName);
+    pkt[dhcp_min_packet_size + 1] = 4;
+    @memcpy(pkt[dhcp_min_packet_size + 2 .. dhcp_min_packet_size + 6], "test");
+    pkt[dhcp_min_packet_size + 6] = @intFromEnum(OptionCode.End);
+
+    const val = DHCPServer.getOption(&pkt, .HostName);
+    try std.testing.expect(val != null);
+    try std.testing.expectEqualStrings("test", val.?);
+}
+
+test "getOption skips pad bytes" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 16);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.Pad); // pad
+    pkt[dhcp_min_packet_size + 1] = @intFromEnum(OptionCode.HostName);
+    pkt[dhcp_min_packet_size + 2] = 3;
+    @memcpy(pkt[dhcp_min_packet_size + 3 .. dhcp_min_packet_size + 6], "foo");
+    pkt[dhcp_min_packet_size + 6] = @intFromEnum(OptionCode.End);
+
+    const val = DHCPServer.getOption(&pkt, .HostName);
+    try std.testing.expect(val != null);
+    try std.testing.expectEqualStrings("foo", val.?);
+}
+
+test "getOption returns null when absent" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 8);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.getOption(&pkt, .HostName) == null);
+}
+
+test "getServerIdentifier present" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 16);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.ServerIdentifier);
+    pkt[dhcp_min_packet_size + 1] = 4;
+    pkt[dhcp_min_packet_size + 2] = 192;
+    pkt[dhcp_min_packet_size + 3] = 168;
+    pkt[dhcp_min_packet_size + 4] = 1;
+    pkt[dhcp_min_packet_size + 5] = 1;
+    pkt[dhcp_min_packet_size + 6] = @intFromEnum(OptionCode.End);
+
+    const sid = DHCPServer.getServerIdentifier(&pkt);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &sid.?);
+}
+
+test "getServerIdentifier absent" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 8);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.getServerIdentifier(&pkt) == null);
+}
+
+test "getHostname present" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 16);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.HostName);
+    pkt[dhcp_min_packet_size + 1] = 6;
+    @memcpy(pkt[dhcp_min_packet_size + 2 .. dhcp_min_packet_size + 8], "client");
+    pkt[dhcp_min_packet_size + 8] = @intFromEnum(OptionCode.End);
+
+    const hn = DHCPServer.getHostname(&pkt);
+    try std.testing.expect(hn != null);
+    try std.testing.expectEqualStrings("client", hn.?);
+}
+
+test "getHostname absent" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 8);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.getHostname(&pkt) == null);
+}
+
+// ---------------------------------------------------------------------------
+// Server integration tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal DHCPREQUEST into buf. Returns the total packet length.
+fn makeRequest(
+    buf: []u8,
+    mac: [6]u8,
+    requested_ip: ?[4]u8,
+    server_id: ?[4]u8,
+    hostname: ?[]const u8,
+) usize {
+    @memset(buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x12345678;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &mac);
+
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    i += 1;
+    buf[i] = 1;
+    i += 1;
+    buf[i] = @intFromEnum(MessageType.DHCPREQUEST);
+    i += 1;
+    if (requested_ip) |ip| {
+        buf[i] = @intFromEnum(OptionCode.RequestedIPAddress);
+        i += 1;
+        buf[i] = 4;
+        i += 1;
+        @memcpy(buf[i..][0..4], &ip);
+        i += 4;
+    }
+    if (server_id) |sid| {
+        buf[i] = @intFromEnum(OptionCode.ServerIdentifier);
+        i += 1;
+        buf[i] = 4;
+        i += 1;
+        @memcpy(buf[i..][0..4], &sid);
+        i += 4;
+    }
+    if (hostname) |hn| {
+        buf[i] = @intFromEnum(OptionCode.HostName);
+        i += 1;
+        buf[i] = @intCast(hn.len);
+        i += 1;
+        @memcpy(buf[i..][0..hn.len], hn);
+        i += hn.len;
+    }
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+    return i;
+}
+
+/// Create a fully initialized test Config. Caller must call cfg.deinit().
+fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
+    return config_mod.Config{
+        .allocator = allocator,
+        .listen_address = try allocator.dupe(u8, "192.168.1.1"),
+        .subnet = try allocator.dupe(u8, "192.168.1.0"),
+        .subnet_mask = 0xFFFFFF00,
+        .router = try allocator.dupe(u8, "192.168.1.1"),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .lease_time = 3600,
+        .state_dir = try allocator.dupe(u8, "/tmp"),
+        .dns_update = .{
+            .enable = false,
+            .server = try allocator.dupe(u8, ""),
+            .zone = try allocator.dupe(u8, ""),
+            .key_name = try allocator.dupe(u8, ""),
+            .key_file = try allocator.dupe(u8, ""),
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+    };
+}
+
+/// Create a bare StateStore (no disk I/O on construction).
+fn makeTestStore(allocator: std.mem.Allocator) !*StateStore {
+    const store = try allocator.create(StateStore);
+    store.* = .{
+        .allocator = allocator,
+        .dir = "/tmp",
+        .leases = std.StringHashMap(state_mod.Lease).init(allocator),
+    };
+    return store;
+}
+
+test "createAck returns null when option 54 does not match our IP" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+        [4]u8{ 192, 168, 1, 50 },
+        [4]u8{ 10, 0, 0, 1 }, // different server
+        null,
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp == null);
+}
+
+test "createAck sends DHCPNAK for IP outside subnet" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+        [4]u8{ 10, 0, 0, 1 }, // outside 192.168.1.0/24
+        [4]u8{ 192, 168, 1, 1 }, // our server
+        null,
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPNAK, DHCPServer.getMessageType(resp.?).?);
+}
+
+test "createAck stores hostname from option 12" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+        [4]u8{ 192, 168, 1, 50 },
+        [4]u8{ 192, 168, 1, 1 },
+        "myhost",
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+
+    const lease = store.getLeaseByMac("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(lease != null);
+    try std.testing.expect(lease.?.hostname != null);
+    try std.testing.expectEqualStrings("myhost", lease.?.hostname.?);
+}
+
+test "createAck returns DHCPACK for valid request without option 54" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 },
+        [4]u8{ 192, 168, 1, 100 },
+        null, // no server identifier — renewal style
+        null,
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
 }

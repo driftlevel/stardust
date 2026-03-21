@@ -94,18 +94,42 @@ pub const StateStore = struct {
         }
     }
 
-    /// Look up a lease by MAC address. Returns null if not found.
+    /// Look up a lease by MAC address. Returns null if not found or expired.
     pub fn getLeaseByMac(store: *StateStore, mac: []const u8) ?Lease {
-        return store.leases.get(mac);
+        const lease = store.leases.get(mac) orelse return null;
+        if (lease.expires <= std.time.timestamp()) return null;
+        return lease;
     }
 
-    /// Look up a lease by IP address. Returns null if not found.
+    /// Look up a lease by IP address. Returns null if not found or expired.
     pub fn getLeaseByIp(store: *StateStore, ip: []const u8) ?Lease {
+        const now = std.time.timestamp();
         var it = store.leases.valueIterator();
         while (it.next()) |lease| {
+            if (lease.expires <= now) continue;
             if (std.mem.eql(u8, lease.ip, ip)) return lease.*;
         }
         return null;
+    }
+
+    /// Remove all expired leases from memory and persist.
+    pub fn pruneExpired(store: *StateStore) void {
+        const now = std.time.timestamp();
+        var to_remove: [64][]const u8 = undefined;
+        var count: usize = 0;
+        var it = store.leases.keyIterator();
+        while (it.next()) |key| {
+            const lease = store.leases.get(key.*).?;
+            if (lease.expires <= now) {
+                if (count < to_remove.len) {
+                    to_remove[count] = key.*;
+                    count += 1;
+                }
+            }
+        }
+        for (to_remove[0..count]) |mac| {
+            store.removeLease(mac);
+        }
     }
 
     /// Returns a slice of all leases. Caller owns the slice (free it) but not the string fields.
@@ -173,3 +197,88 @@ pub const StateStore = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Create a store that bypasses init (no disk I/O). Uses /tmp so save()
+/// calls that reach disk don't pollute the project tree.
+fn makeTestStore(allocator: std.mem.Allocator) !*StateStore {
+    const store = try allocator.create(StateStore);
+    store.* = .{
+        .allocator = allocator,
+        .dir = "/tmp",
+        .leases = std.StringHashMap(Lease).init(allocator),
+    };
+    return store;
+}
+
+/// Insert a lease directly into the map (bypasses save).
+fn putLease(store: *StateStore, mac: []const u8, ip: []const u8, expires: i64) !void {
+    const mac_owned = try store.allocator.dupe(u8, mac);
+    errdefer store.allocator.free(mac_owned);
+    const ip_owned = try store.allocator.dupe(u8, ip);
+    errdefer store.allocator.free(ip_owned);
+    try store.leases.put(mac_owned, .{
+        .mac = mac_owned,
+        .ip = ip_owned,
+        .hostname = null,
+        .expires = expires,
+        .client_id = null,
+    });
+}
+
+test "getLeaseByMac returns valid lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", std.time.timestamp() + 3600);
+
+    const lease = store.getLeaseByMac("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(lease != null);
+    try std.testing.expectEqualStrings("192.168.1.10", lease.?.ip);
+}
+
+test "getLeaseByMac returns null for expired lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", std.time.timestamp() - 1);
+
+    try std.testing.expect(store.getLeaseByMac("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "getLeaseByIp returns valid lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", std.time.timestamp() + 3600);
+
+    const lease = store.getLeaseByIp("192.168.1.10");
+    try std.testing.expect(lease != null);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", lease.?.mac);
+}
+
+test "getLeaseByIp returns null for expired lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", std.time.timestamp() - 1);
+
+    try std.testing.expect(store.getLeaseByIp("192.168.1.10") == null);
+}
+
+test "pruneExpired removes expired and keeps valid" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:01", "192.168.1.10", std.time.timestamp() - 1); // expired
+    try putLease(store, "aa:bb:cc:dd:ee:02", "192.168.1.11", std.time.timestamp() + 3600); // valid
+
+    store.pruneExpired();
+
+    try std.testing.expectEqual(@as(usize, 1), store.leases.count());
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:01") == null);
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:02") != null);
+}
