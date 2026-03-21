@@ -2,6 +2,7 @@ const std = @import("std");
 const config_mod = @import("./config.zig");
 const state_mod = @import("./state.zig");
 const dns_mod = @import("./dns.zig");
+const probe_mod = @import("./probe.zig");
 
 pub const Config = config_mod.Config;
 pub const StateStore = state_mod.StateStore;
@@ -163,6 +164,8 @@ pub const DHCPServer = struct {
     decline_records: std.AutoHashMap([17]u8, DeclineRecord),
     global_decline_count: u32,
     global_decline_window_start: i64,
+    /// Interface info for ARP probing. Null when not detected (probe falls back to ICMP).
+    if_info: ?probe_mod.IfaceInfo,
 
     const Self = @This();
 
@@ -186,6 +189,7 @@ pub const DHCPServer = struct {
             .decline_records = std.AutoHashMap([17]u8, DeclineRecord).init(allocator),
             .global_decline_count = 0,
             .global_decline_window_start = 0,
+            .if_info = null,
         };
         return self;
     }
@@ -260,6 +264,19 @@ pub const DHCPServer = struct {
             } else {
                 std.log.warn("Could not detect server IP for 0.0.0.0 listener", .{});
             }
+        }
+
+        // Detect the outbound interface for ARP conflict probing on local networks.
+        self.if_info = probe_mod.findIfaceForIp(self.server_ip) catch |err| blk: {
+            std.log.warn("Could not detect network interface ({s}); ARP probing disabled", .{@errorName(err)});
+            break :blk null;
+        };
+        if (self.if_info) |info| {
+            std.log.info("Interface for ARP probe: index={d}, mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                info.index,
+                info.mac[0], info.mac[1], info.mac[2],
+                info.mac[3], info.mac[4], info.mac[5],
+            });
         }
 
         std.log.info("DHCP server listening on {s}:{d}", .{
@@ -475,11 +492,57 @@ pub const DHCPServer = struct {
     ///
     /// Allocates and returns a packet buffer; caller is responsible for freeing.
     /// Returns null if no address is available to offer.
+    /// Returns true if `ip` appears to be in use on the network.
+    /// Uses ARP for locally-attached networks (giaddr==0), ICMP for relayed.
+    /// On any probe error, returns false (false negatives preferred over blocking).
+    fn probeConflict(self: *Self, ip: [4]u8, is_relayed: bool) bool {
+        if (is_relayed) {
+            return probe_mod.icmpProbe(ip) catch false;
+        } else {
+            const info = self.if_info orelse return false;
+            return probe_mod.arpProbe(info.mac, info.index, ip) catch false;
+        }
+    }
+
+    /// Quarantine a conflict-detected IP using the same sentinel-MAC mechanism
+    /// as DHCPDECLINE, so allocateIp skips it on the next attempt.
+    fn quarantineProbeConflict(self: *Self, ip: [4]u8) void {
+        var ip_buf: [15]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+            ip[0], ip[1], ip[2], ip[3],
+        }) catch return;
+        var mac_buf: [24]u8 = undefined;
+        const conflict_mac = std.fmt.bufPrint(&mac_buf, "conflict:{s}", .{ip_str}) catch return;
+        self.store.addLease(.{
+            .mac = conflict_mac,
+            .ip = ip_str,
+            .hostname = null,
+            .expires = std.time.timestamp() + probe_mod.probe_quarantine_secs,
+            .client_id = null,
+        }) catch {};
+        std.log.warn("Probe conflict: {s} is already in use, quarantining for {d}s", .{
+            ip_str, probe_mod.probe_quarantine_secs,
+        });
+    }
+
     fn createOffer(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
 
         const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
-        const offered_ip = (try self.allocateIp(mac_bytes)) orelse return null;
+
+        // giaddr != 0 means the DISCOVER came through a relay agent.
+        const is_relayed = !std.mem.eql(u8, &req_header.giaddr, &[_]u8{ 0, 0, 0, 0 });
+
+        // Probe up to probe_max_tries candidates. On conflict, quarantine the IP
+        // (so allocateIp skips it next iteration) and try again.
+        const offered_ip = blk: {
+            for (0..probe_mod.probe_max_tries) |_| {
+                const candidate = (try self.allocateIp(mac_bytes)) orelse break :blk null;
+                if (!self.probeConflict(candidate, is_relayed)) break :blk candidate;
+                self.quarantineProbeConflict(candidate);
+            }
+            break :blk null;
+        } orelse return null;
 
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
