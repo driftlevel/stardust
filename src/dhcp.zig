@@ -129,6 +129,18 @@ fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     return dst[0..copy_len];
 }
 
+// Decline rate-limiting: after decline_threshold declines within decline_window_secs,
+// the MAC is refused new allocations for decline_cooldown_secs.
+const decline_threshold: u32 = 3;
+const decline_window_secs: i64 = 60;
+const decline_cooldown_secs: i64 = 300; // 5 minutes
+
+const DeclineRecord = struct {
+    count: u32,
+    window_start: i64,
+    cooldown_until: i64, // 0 = not in cooldown
+};
+
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
     cfg: *const Config,
@@ -137,6 +149,8 @@ pub const DHCPServer = struct {
     running: std.atomic.Value(bool),
     last_prune: i64,
     server_ip: [4]u8,
+    /// Keyed by MAC as a fixed [17]u8 ("xx:xx:xx:xx:xx:xx") — no heap alloc per entry.
+    decline_records: std.AutoHashMap([17]u8, DeclineRecord),
 
     const Self = @This();
 
@@ -157,11 +171,13 @@ pub const DHCPServer = struct {
             // Pre-populate from listen_address so callers that don't call run() still
             // get a useful server_ip. run() will overwrite this with the detected IP.
             .server_ip = config_mod.parseIpv4(cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 },
+            .decline_records = std.AutoHashMap([17]u8, DeclineRecord).init(allocator),
         };
         return self;
     }
 
     pub fn deinit(self: *Self) void {
+        self.decline_records.deinit();
         self.allocator.destroy(self);
     }
 
@@ -381,6 +397,16 @@ pub const DHCPServer = struct {
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch unreachable;
+
+        // Refuse allocation if this MAC is in a decline cooldown period.
+        if (self.decline_records.get(mac_buf)) |rec| {
+            if (std.time.timestamp() < rec.cooldown_until) {
+                std.log.warn("Refusing allocation to {s}: in decline cooldown for {d}s", .{
+                    mac_str, rec.cooldown_until - std.time.timestamp(),
+                });
+                return null;
+            }
+        }
 
         // Reuse an existing confirmed lease for this client.
         if (self.store.getLeaseByMac(mac_str)) |lease| {
@@ -751,10 +777,11 @@ pub const DHCPServer = struct {
         }) catch return;
         self.store.removeLease(mac_str);
 
-        // Quarantine the declined IP for one lease period using a sentinel MAC.
+        // Quarantine the declined IP for max(lease_time/10, 5 min) using a sentinel MAC.
         // allocateIp skips IPs where getLeaseByIp != null.
         // isIpValid rejects IPs whose stored MAC != client MAC ("conflict:..." never matches).
-        // pruneExpired removes the quarantine after lease_time seconds.
+        // pruneExpiredWithDns removes the quarantine after the quarantine period.
+        const quarantine_secs: u32 = @max(self.cfg.lease_time / 10, 300);
         const declined_ip = getRequestedIp(request) orelse return;
         var ip_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
@@ -766,13 +793,36 @@ pub const DHCPServer = struct {
             .mac = conflict_mac,
             .ip = ip_str,
             .hostname = null,
-            .expires = std.time.timestamp() + @as(i64, self.cfg.lease_time),
+            .expires = std.time.timestamp() + @as(i64, quarantine_secs),
             .client_id = null,
         }) catch |err| {
             std.log.warn("Failed to quarantine declined IP {s}: {s}", .{ ip_str, @errorName(err) });
             return;
         };
-        std.log.info("DHCPDECLINE: quarantined {s} for {d}s", .{ ip_str, self.cfg.lease_time });
+        std.log.info("DHCPDECLINE: quarantined {s} for {d}s", .{ ip_str, quarantine_secs });
+
+        // Track declines per MAC. After decline_threshold declines within
+        // decline_window_secs, refuse further allocations for decline_cooldown_secs.
+        const now = std.time.timestamp();
+        var rec = self.decline_records.get(mac_buf) orelse DeclineRecord{
+            .count = 0,
+            .window_start = now,
+            .cooldown_until = 0,
+        };
+        if (now - rec.window_start > decline_window_secs) {
+            // Window expired — start a fresh count.
+            rec.count = 0;
+            rec.window_start = now;
+        }
+        rec.count += 1;
+        if (rec.count >= decline_threshold) {
+            rec.cooldown_until = now + decline_cooldown_secs;
+            rec.count = 0;
+            std.log.warn("DHCPDECLINE: rate-limiting {s} for {d}s after {d} declines in {d}s", .{
+                mac_str, decline_cooldown_secs, decline_threshold, decline_window_secs,
+            });
+        }
+        self.decline_records.put(mac_buf, rec) catch {};
     }
 
     /// Scan options for option 50 (Requested IP Address).
@@ -1431,4 +1481,85 @@ test "dhcp_options injected into OFFER packet" {
         j += 2 + opt_len;
     }
     try std.testing.expect(found_42);
+}
+
+test "handleDecline rate-limits MAC after threshold declines" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    const mac = [6]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01 };
+
+    // Send decline_threshold DHCPDECLINE packets for different IPs.
+    // Each one should be processed without blocking.
+    var i: u32 = 0;
+    while (i < decline_threshold) : (i += 1) {
+        var buf = [_]u8{0} ** 512;
+        const declined_ip = [4]u8{ 192, 168, 1, @intCast(10 + i) };
+
+        // First ACK the IP so handleDecline has a lease to remove.
+        const req_len = makeRequest(&buf, mac, declined_ip, [4]u8{ 192, 168, 1, 1 }, null);
+        const ack = try server.processPacket(buf[0..req_len]);
+        if (ack) |a| alloc.free(a);
+
+        const dec_len = makeDecline(&buf, mac, declined_ip);
+        const resp = try server.processPacket(buf[0..dec_len]);
+        try std.testing.expect(resp == null); // DECLINE generates no response
+    }
+
+    // After threshold declines, allocateIp should return null for this MAC.
+    const ip = try server.allocateIp(mac);
+    try std.testing.expect(ip == null);
+}
+
+test "quarantine period is max(lease_time/10, 300)" {
+    const alloc = std.testing.allocator;
+
+    // lease_time = 3600 → quarantine = 360s
+    {
+        var cfg = try makeTestConfig(alloc);
+        defer cfg.deinit();
+        cfg.lease_time = 3600;
+        const store = try makeTestStore(alloc);
+        defer store.deinit();
+        const server = try DHCPServer.create(alloc, &cfg, store, null);
+        defer server.deinit();
+
+        var buf = [_]u8{0} ** 512;
+        const len = makeDecline(&buf, [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, [4]u8{ 192, 168, 1, 50 });
+        _ = try server.processPacket(buf[0..len]);
+
+        const lease = store.getLeaseByIp("192.168.1.50");
+        try std.testing.expect(lease != null);
+        const remaining = lease.?.expires - std.time.timestamp();
+        // Should be ~360s (lease_time/10), not 3600s
+        try std.testing.expect(remaining <= 360 + 2);
+        try std.testing.expect(remaining >= 300);
+    }
+
+    // lease_time = 600 → quarantine = 300s (minimum floor)
+    {
+        var cfg = try makeTestConfig(alloc);
+        defer cfg.deinit();
+        cfg.lease_time = 600;
+        const store = try makeTestStore(alloc);
+        defer store.deinit();
+        const server = try DHCPServer.create(alloc, &cfg, store, null);
+        defer server.deinit();
+
+        var buf = [_]u8{0} ** 512;
+        const len = makeDecline(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, [4]u8{ 192, 168, 1, 60 });
+        _ = try server.processPacket(buf[0..len]);
+
+        const lease = store.getLeaseByIp("192.168.1.60");
+        try std.testing.expect(lease != null);
+        const remaining = lease.?.expires - std.time.timestamp();
+        // Should be ~300s (floor), not 60s (600/10)
+        try std.testing.expect(remaining <= 300 + 2);
+        try std.testing.expect(remaining >= 298);
+    }
 }
