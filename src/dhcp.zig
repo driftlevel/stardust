@@ -257,7 +257,7 @@ pub const DHCPServer = struct {
 
             const now_ts = std.time.timestamp();
             if (now_ts - self.last_prune > 60) {
-                self.store.pruneExpired();
+                self.pruneExpiredWithDns();
                 self.last_prune = now_ts;
             }
 
@@ -288,6 +288,34 @@ pub const DHCPServer = struct {
         }
 
         std.log.info("DHCP server stopped", .{});
+    }
+
+    /// Prune expired leases and send DNS delete updates for any that had hostnames.
+    /// Must not be called while iterating self.store.leases.
+    fn pruneExpiredWithDns(self: *Self) void {
+        const now = std.time.timestamp();
+
+        // Collect expired MACs first — cannot remove entries while iterating the map.
+        var to_remove: [64][]const u8 = undefined;
+        var count: usize = 0;
+        var it = self.store.leases.keyIterator();
+        while (it.next()) |key| {
+            const lease = self.store.leases.get(key.*).?;
+            if (lease.expires <= now and count < to_remove.len) {
+                to_remove[count] = key.*;
+                count += 1;
+            }
+        }
+
+        // Notify DNS before removing so the lease strings are still valid.
+        for (to_remove[0..count]) |mac| {
+            if (self.store.leases.get(mac)) |lease| {
+                if (self.dns_updater) |du| {
+                    du.notifyLeaseRemoved(lease.ip, lease.hostname);
+                }
+            }
+            self.store.removeLease(mac);
+        }
     }
 
     fn processPacket(self: *Self, packet: []const u8) !?[]u8 {
