@@ -111,6 +111,51 @@ fn probeServerIp() ?[4]u8 {
     return ip;
 }
 
+/// Compute the send destination for a DHCP response from the originating request.
+/// RFC 2131 §4.1 routing rules, in priority order:
+///   1. giaddr != 0  → relay agent at giaddr:67 (server port)
+///   2. ciaddr != 0  → renewing client at ciaddr:68 (unicast)
+///   3. broadcast bit (flags bit 15) set → 255.255.255.255:68
+///   4. else         → 255.255.255.255:68 (broadcast fallback; ARP unicast not implemented)
+fn resolveDestination(request: []const u8) std.posix.sockaddr.in {
+    if (request.len >= dhcp_min_packet_size) {
+        const req: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+
+        if (!std.mem.eql(u8, &req.giaddr, &[_]u8{ 0, 0, 0, 0 })) {
+            return .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, dhcp_server_port),
+                .addr = @bitCast(req.giaddr),
+            };
+        }
+
+        if (!std.mem.eql(u8, &req.ciaddr, &[_]u8{ 0, 0, 0, 0 })) {
+            return .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, dhcp_client_port),
+                .addr = @bitCast(req.ciaddr),
+            };
+        }
+
+        // flags is in the packet in network byte order; nativeToBig reinterprets
+        // the LE u16 so bit 15 (broadcast) maps to 0x8000.
+        if (std.mem.nativeToBig(u16, req.flags) & 0x8000 != 0) {
+            return .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, dhcp_client_port),
+                .addr = 0xFFFFFFFF,
+            };
+        }
+    }
+
+    // Fallback: broadcast. ARP unicast to yiaddr is not implemented.
+    return .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, dhcp_client_port),
+        .addr = 0xFFFFFFFF,
+    };
+}
+
 /// Encode an option value string into DHCP wire bytes in dst.
 /// Tries comma-separated IPv4 addresses first; falls back to raw string bytes.
 fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
@@ -316,12 +361,7 @@ pub const DHCPServer = struct {
             if (response) |resp| {
                 defer self.allocator.free(resp);
 
-                // Broadcast response to 255.255.255.255:68
-                const dst_addr = std.posix.sockaddr.in{
-                    .family = std.posix.AF.INET,
-                    .port = std.mem.nativeToBig(u16, dhcp_client_port),
-                    .addr = 0xFFFFFFFF,
-                };
+                const dst_addr = resolveDestination(packet);
                 _ = std.posix.sendto(
                     sock_fd,
                     resp,
@@ -1019,6 +1059,51 @@ pub fn create_server(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "resolveDestination: giaddr set -> relay at giaddr:67" {
+    var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    hdr.giaddr = [_]u8{ 10, 0, 0, 1 };
+    const dst = resolveDestination(&pkt);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_server_port), dst.port);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &@as([4]u8, @bitCast(dst.addr)));
+}
+
+test "resolveDestination: ciaddr set -> unicast to client:68" {
+    var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    hdr.ciaddr = [_]u8{ 192, 168, 1, 50 };
+    const dst = resolveDestination(&pkt);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_client_port), dst.port);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 50 }, &@as([4]u8, @bitCast(dst.addr)));
+}
+
+test "resolveDestination: giaddr takes priority over ciaddr" {
+    var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    hdr.giaddr = [_]u8{ 10, 0, 0, 1 };
+    hdr.ciaddr = [_]u8{ 192, 168, 1, 50 };
+    const dst = resolveDestination(&pkt);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_server_port), dst.port);
+}
+
+test "resolveDestination: broadcast flag -> 255.255.255.255:68" {
+    var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    // Broadcast flag: bit 15 in network byte order = 0x8000 BE.
+    // Stored in a LE extern struct as 0x0080.
+    hdr.flags = std.mem.bigToNative(u16, 0x8000);
+    const dst = resolveDestination(&pkt);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_client_port), dst.port);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), dst.addr);
+}
+
+test "resolveDestination: no flags -> broadcast fallback" {
+    var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
+    const dst = resolveDestination(&pkt);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_client_port), dst.port);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), dst.addr);
+}
 
 test "getMessageType discover" {
     var pkt = [_]u8{0} ** (dhcp_min_packet_size + 10);

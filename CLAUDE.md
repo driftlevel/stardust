@@ -27,9 +27,10 @@ main.zig → config.zig + state.zig + dns.zig + dhcp.zig
 
 - **main.zig** — Entry point. Initializes `GeneralPurposeAllocator`, loads config, creates `StateStore`, `DNSUpdater`, and `DHCPServer`, then runs the server loop.
 - **src/config.zig** — Loads `config.yaml` via `zig-yaml`. Uses a two-struct pattern: `RawConfig` (YAML-parsed strings) → `Config` (typed, with parsed IPs/masks). Has `parseIpv4()` and `parseMask()` helpers, tested in-file.
-- **src/dhcp.zig** — Core server. Binds UDP port 67, parses DHCP packets into `DHCPHeader` (extern struct matching RFC wire format), handles DISCOVER/OFFER/REQUEST/ACK/RELEASE flows. Broadcasts responses to 255.255.255.255:68.
-- **src/state.zig** — Lease store (MAC, IP, hostname, expiry, client ID). **Currently stub** — in-memory only, disk persistence not yet implemented.
-- **src/dns.zig** — DNS update integration. **Currently stub** — configuration parsing done, BIND TSIG update logic not yet implemented.
+- **src/dhcp.zig** — Core server. Binds UDP port 67, parses DHCP packets into `DHCPHeader` (extern struct matching RFC wire format), handles DISCOVER/OFFER/REQUEST/ACK/RELEASE/DECLINE flows. Response routing follows RFC 2131 §4.1 (`resolveDestination`: relay→giaddr:67, renewal→ciaddr:68, else broadcast).
+- **src/state.zig** — Lease store (MAC, IP, hostname, expiry, client ID). Persists leases to `leases.json` in the configured state directory; loaded at startup with expired entries skipped.
+- **src/dns.zig** — RFC 2136 dynamic DNS updates with TSIG authentication (HMAC-SHA256 / HMAC-MD5). Sends A and PTR record updates on lease grant/release. Parses BIND-format key files.
+- **src/probe.zig** — Pre-offer conflict detection. ARP probe (RFC 5227 style, SPA=0.0.0.0) for local networks; ICMP echo for relayed networks. Interface detection via `/sys/class/net` ioctls.
 
 ## Dependencies
 
