@@ -18,6 +18,8 @@ pub const Config = struct {
     domain_name: []const u8,
     lease_time: u32,
     state_dir: []const u8,
+    pool_start: []const u8, // "" = use subnet start
+    pool_end: []const u8, // "" = use subnet end
     dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
 
@@ -27,6 +29,8 @@ pub const Config = struct {
         self.allocator.free(self.listen_address);
         self.allocator.free(self.subnet);
         self.allocator.free(self.router);
+        self.allocator.free(self.pool_start);
+        self.allocator.free(self.pool_end);
         for (self.dns_servers) |s| self.allocator.free(s);
         self.allocator.free(self.dns_servers);
         self.allocator.free(self.domain_name);
@@ -56,6 +60,8 @@ const RawConfig = struct {
     domain_name: ?[]const u8 = null,
     lease_time: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    pool_start: ?[]const u8 = null,
+    pool_end: ?[]const u8 = null,
     dns_update: ?struct {
         enable: ?bool = null,
         server: ?[]const u8 = null,
@@ -98,6 +104,8 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .domain_name = try allocator.dupe(u8, raw.domain_name orelse ""),
         .lease_time = raw.lease_time orelse 3600,
         .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
+        .pool_start = try allocator.dupe(u8, raw.pool_start orelse ""),
+        .pool_end = try allocator.dupe(u8, raw.pool_end orelse ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),

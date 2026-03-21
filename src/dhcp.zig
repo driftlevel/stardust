@@ -83,12 +83,39 @@ pub const OptionCode = enum(u8) {
 // Server
 // ---------------------------------------------------------------------------
 
+var g_running: ?*std.atomic.Value(bool) = null;
+
+fn handleSignal(sig: c_int) callconv(.c) void {
+    _ = sig;
+    if (g_running) |r| r.store(false, .seq_cst);
+}
+
+/// UDP connect trick: connecting a datagram socket to an external address causes
+/// the kernel to select the outbound interface; getsockname returns that local IP.
+fn probeServerIp() ?[4]u8 {
+    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return null;
+    defer std.posix.close(sock);
+    const dst = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = @bitCast([4]u8{ 8, 8, 8, 8 }),
+    };
+    std.posix.connect(sock, @ptrCast(&dst), @sizeOf(std.posix.sockaddr.in)) catch return null;
+    var local: std.posix.sockaddr.in = undefined;
+    var local_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    std.posix.getsockname(sock, @ptrCast(&local), &local_len) catch return null;
+    const ip: [4]u8 = @bitCast(local.addr);
+    if (std.mem.eql(u8, &ip, &[4]u8{ 0, 0, 0, 0 })) return null;
+    return ip;
+}
+
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
     cfg: *const Config,
     store: *StateStore,
     running: std.atomic.Value(bool),
     last_prune: i64,
+    server_ip: [4]u8,
 
     const Self = @This();
 
@@ -100,6 +127,9 @@ pub const DHCPServer = struct {
             .store = store,
             .running = std.atomic.Value(bool).init(false),
             .last_prune = 0,
+            // Pre-populate from listen_address so callers that don't call run() still
+            // get a useful server_ip. run() will overwrite this with the detected IP.
+            .server_ip = config_mod.parseIpv4(cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 },
         };
         return self;
     }
@@ -113,6 +143,17 @@ pub const DHCPServer = struct {
 
         self.running.store(true, .seq_cst);
         defer self.running.store(false, .seq_cst);
+
+        g_running = &self.running;
+        defer g_running = null;
+
+        const sig_action = std.posix.Sigaction{
+            .handler = .{ .handler = handleSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &sig_action, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &sig_action, null);
 
         // Parse listen address
         const listen_ip = try config_mod.parseIpv4(self.cfg.listen_address);
@@ -151,6 +192,18 @@ pub const DHCPServer = struct {
             @ptrCast(&bind_addr),
             @sizeOf(std.posix.sockaddr.in),
         );
+
+        self.server_ip = listen_ip;
+        if (std.mem.eql(u8, &listen_ip, &[4]u8{ 0, 0, 0, 0 })) {
+            if (probeServerIp()) |detected| {
+                self.server_ip = detected;
+                std.debug.print("Detected server IP: {d}.{d}.{d}.{d}\n", .{
+                    detected[0], detected[1], detected[2], detected[3],
+                });
+            } else {
+                std.debug.print("Warning: could not detect server IP for 0.0.0.0 listener\n", .{});
+            }
+        }
 
         std.debug.print("DHCP server listening on {s}:{d}\n", .{
             self.cfg.listen_address,
@@ -228,6 +281,10 @@ pub const DHCPServer = struct {
                 self.handleRelease(packet);
                 break :blk null;
             },
+            .DHCPDECLINE => blk: {
+                self.handleDecline(packet);
+                break :blk null;
+            },
             else => null,
         };
     }
@@ -286,8 +343,23 @@ pub const DHCPServer = struct {
         const server_bytes = try config_mod.parseIpv4(self.cfg.listen_address);
         const server_int = std.mem.readInt(u32, &server_bytes, .big);
 
-        var candidate: u32 = subnet_int + 1;
-        while (candidate < broadcast_int) : (candidate += 1) {
+        var pool_start_int: u32 = subnet_int + 1;
+        var pool_end_int: u32 = broadcast_int - 1;
+        if (self.cfg.pool_start.len > 0) {
+            const b = config_mod.parseIpv4(self.cfg.pool_start) catch blk: {
+                break :blk subnet_bytes;
+            };
+            pool_start_int = std.mem.readInt(u32, &b, .big);
+        }
+        if (self.cfg.pool_end.len > 0) {
+            const b = config_mod.parseIpv4(self.cfg.pool_end) catch blk: {
+                break :blk subnet_bytes;
+            };
+            pool_end_int = std.mem.readInt(u32, &b, .big);
+        }
+
+        var candidate: u32 = pool_start_int;
+        while (candidate <= pool_end_int) : (candidate += 1) {
             if (candidate == router_int) continue;
             if (server_int != 0 and candidate == server_int) continue;
 
@@ -314,7 +386,7 @@ pub const DHCPServer = struct {
         const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
         const offered_ip = (try self.allocateIp(mac_bytes)) orelse return null;
 
-        const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
+        const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
         const router_ip = try config_mod.parseIpv4(self.cfg.router);
         const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
@@ -428,9 +500,8 @@ pub const DHCPServer = struct {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
 
         // Option 54: ignore requests directed at a different server.
-        const our_ip = config_mod.parseIpv4(self.cfg.listen_address) catch return null;
         if (getServerIdentifier(request)) |sid| {
-            if (!std.mem.eql(u8, &sid, &our_ip)) return null;
+            if (!std.mem.eql(u8, &sid, &self.server_ip)) return null;
         }
 
         // The client's requested IP comes from option 50, or ciaddr for renewals.
@@ -447,7 +518,7 @@ pub const DHCPServer = struct {
         // Send DHCPNAK if the requested IP is not valid for our subnet.
         if (!self.isIpValid(client_ip, mac_str)) return self.createNak(request);
 
-        const server_ip = our_ip;
+        const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
         const router_ip = try config_mod.parseIpv4(self.cfg.router);
         const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
@@ -580,6 +651,43 @@ pub const DHCPServer = struct {
         self.store.removeLease(mac_str);
     }
 
+    fn handleDecline(self: *Self, request: []const u8) void {
+        if (request.len < dhcp_min_packet_size) return;
+        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+
+        // Remove any existing offer-lease for this MAC.
+        const mac_bytes = req_header.chaddr[0..6];
+        var mac_buf: [17]u8 = undefined;
+        const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2],
+            mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch return;
+        self.store.removeLease(mac_str);
+
+        // Quarantine the declined IP for one lease period using a sentinel MAC.
+        // allocateIp skips IPs where getLeaseByIp != null.
+        // isIpValid rejects IPs whose stored MAC != client MAC ("conflict:..." never matches).
+        // pruneExpired removes the quarantine after lease_time seconds.
+        const declined_ip = getRequestedIp(request) orelse return;
+        var ip_buf: [15]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+            declined_ip[0], declined_ip[1], declined_ip[2], declined_ip[3],
+        }) catch return;
+        var conflict_buf: [24]u8 = undefined; // "conflict:255.255.255.255" = 24 chars
+        const conflict_mac = std.fmt.bufPrint(&conflict_buf, "conflict:{s}", .{ip_str}) catch return;
+        self.store.addLease(.{
+            .mac = conflict_mac,
+            .ip = ip_str,
+            .hostname = null,
+            .expires = std.time.timestamp() + @as(i64, self.cfg.lease_time),
+            .client_id = null,
+        }) catch |err| {
+            std.debug.print("warning: failed to quarantine declined IP {s}: {s}\n", .{ ip_str, @errorName(err) });
+            return;
+        };
+        std.debug.print("DHCPDECLINE: quarantined {s} for {d}s\n", .{ ip_str, self.cfg.lease_time });
+    }
+
     /// Scan options for option 50 (Requested IP Address).
     fn getRequestedIp(packet: []const u8) ?[4]u8 {
         const val = getOption(packet, .RequestedIPAddress) orelse return null;
@@ -613,6 +721,15 @@ pub const DHCPServer = struct {
         if ((ip_int & mask) != subnet_int) return false;
         if (ip_int == subnet_int or ip_int == broadcast_int) return false;
 
+        if (self.cfg.pool_start.len > 0) {
+            const b = config_mod.parseIpv4(self.cfg.pool_start) catch return false;
+            if (ip_int < std.mem.readInt(u32, &b, .big)) return false;
+        }
+        if (self.cfg.pool_end.len > 0) {
+            const b = config_mod.parseIpv4(self.cfg.pool_end) catch return false;
+            if (ip_int > std.mem.readInt(u32, &b, .big)) return false;
+        }
+
         var ip_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return false;
         if (self.store.getLeaseByIp(ip_str)) |lease| {
@@ -624,7 +741,7 @@ pub const DHCPServer = struct {
     /// Build a DHCPNAK in response to a DHCPREQUEST with an invalid IP.
     fn createNak(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
-        const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
+        const server_ip = self.server_ip;
 
         var opts_buf: [16]u8 = undefined;
         var opts_len: usize = 0;
@@ -855,6 +972,8 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .domain_name = try allocator.dupe(u8, ""),
         .lease_time = 3600,
         .state_dir = try allocator.dupe(u8, "/tmp"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -970,4 +1089,194 @@ test "createAck returns DHCPACK for valid request without option 54" {
     try std.testing.expect(resp != null);
     defer alloc.free(resp.?);
     try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+}
+
+/// Build a minimal DHCPDECLINE into buf. Returns total packet length.
+fn makeDecline(buf: []u8, mac: [6]u8, declined_ip: [4]u8) usize {
+    @memset(buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xDECADECA;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &mac);
+
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDECLINE);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress);
+    buf[i + 1] = 4;
+    @memcpy(buf[i + 2 .. i + 6], &declined_ip);
+    i += 6;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+    return i;
+}
+
+test "allocateIp skips addresses before pool_start" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    // Override pool_start to 192.168.1.100
+    alloc.free(cfg.pool_start);
+    cfg.pool_start = try alloc.dupe(u8, "192.168.1.100");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
+    try std.testing.expect(ip != null);
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 100 }, .big);
+    try std.testing.expect(ip_int >= start_int);
+}
+
+test "isIpValid rejects IP outside pool range" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pool_start);
+    alloc.free(cfg.pool_end);
+    cfg.pool_start = try alloc.dupe(u8, "192.168.1.100");
+    cfg.pool_end = try alloc.dupe(u8, "192.168.1.200");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    // Below pool_start
+    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff"));
+    // Above pool_end
+    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 210 }, "aa:bb:cc:dd:ee:ff"));
+    // Inside pool
+    try std.testing.expect(server.isIpValid([4]u8{ 192, 168, 1, 150 }, "aa:bb:cc:dd:ee:ff"));
+}
+
+test "handleDecline quarantines declined IP" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeDecline(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, [4]u8{ 192, 168, 1, 50 });
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp == null); // DECLINE generates no response
+
+    // The declined IP should now have a quarantine lease.
+    const lease = store.getLeaseByIp("192.168.1.50");
+    try std.testing.expect(lease != null);
+    // Quarantine MAC starts with "conflict:"
+    try std.testing.expect(std.mem.startsWith(u8, lease.?.mac, "conflict:"));
+}
+
+test "handleDecline removes MAC lease" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    // Pre-populate a lease for the MAC.
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+    try std.testing.expect(store.getLeaseByMac("aa:bb:cc:dd:ee:ff") != null);
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeDecline(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, [4]u8{ 192, 168, 1, 50 });
+    _ = try server.processPacket(buf[0..len]);
+
+    // MAC lease should be gone.
+    try std.testing.expect(store.getLeaseByMac("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "createOffer uses server_ip not listen_address" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    // Override server_ip to something different from listen_address
+    server.server_ip = [4]u8{ 192, 168, 1, 5 };
+
+    var buf = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+
+    // Option 54 in the response should contain server_ip, not listen_address.
+    const sid = DHCPServer.getServerIdentifier(resp.?);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 5 }, &sid.?);
+}
+
+test "createAck checks server_ip for option 54" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store);
+    defer server.deinit();
+
+    server.server_ip = [4]u8{ 192, 168, 1, 5 };
+
+    var buf = [_]u8{0} ** 512;
+    // Request directed at a different server — should return null.
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+        [4]u8{ 192, 168, 1, 50 },
+        [4]u8{ 192, 168, 1, 1 }, // different from server_ip (192.168.1.5)
+        null,
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp == null);
+
+    // Request directed at our server_ip — should be processed.
+    const len2 = makeRequest(
+        &buf,
+        [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+        [4]u8{ 192, 168, 1, 50 },
+        [4]u8{ 192, 168, 1, 5 }, // matches server_ip
+        null,
+    );
+    const resp2 = try server.processPacket(buf[0..len2]);
+    try std.testing.expect(resp2 != null);
+    defer alloc.free(resp2.?);
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp2.?).?);
 }
