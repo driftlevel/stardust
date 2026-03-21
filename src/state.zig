@@ -101,6 +101,19 @@ pub const StateStore = struct {
         return lease;
     }
 
+    /// Look up a lease by client identifier (option 61, hex-encoded). Returns null if not found or expired.
+    pub fn getLeaseByClientId(store: *StateStore, client_id: []const u8) ?Lease {
+        const now = std.time.timestamp();
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (lease.expires <= now) continue;
+            if (lease.client_id) |cid| {
+                if (std.mem.eql(u8, cid, client_id)) return lease.*;
+            }
+        }
+        return null;
+    }
+
     /// Look up a lease by IP address. Returns null if not found or expired.
     pub fn getLeaseByIp(store: *StateStore, ip: []const u8) ?Lease {
         const now = std.time.timestamp();

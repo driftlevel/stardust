@@ -2,41 +2,6 @@
 
 ## Pending
 
-### Critical — breaks relay agent operation
-
-**Relay response routing** (RFC 2131 §4.1 / RFC 1542)
-When `giaddr != 0` the response must be sent as unicast to `giaddr:67` (the
-relay agent's server port), not broadcast to `255.255.255.255:68`. Without
-this fix the relay agent never receives OFFER/ACK/NAK packets.
-
-Additionally, the broadcast flag (bit 15 of the `flags` field) must be
-respected: if the client sets it the server MUST broadcast; if clear it
-SHOULD unicast to `ciaddr` (renewal) or fall back to broadcast. We currently
-always broadcast regardless of the flag.
-
----
-
-### Moderate — RFC non-compliance or meaningful missing feature
-
-**DHCPINFORM not handled** (RFC 2131 §3.4)
-A client may send DHCPINFORM to obtain configuration options without
-acquiring a lease. The server should reply with a DHCPACK that has `yiaddr`
-zeroed but includes all requested options. Currently returns null (no
-response), which breaks Windows hosts, printers, and other devices that use
-this flow.
-
-**Client ID (option 61) not used** (RFC 2131 §2)
-`Lease.client_id` is always stored as `null`. RFC 2131 says the client
-identifier (if present) MUST take precedence over `chaddr` for uniquely
-identifying a client. VMs and some Windows hosts set this and will receive
-duplicate leases or incorrect behaviour.
-
-**`hops` field zeroed in responses** (RFC 1542 §2.1)
-Both `createOffer` and `createAck` set `resp_header.hops = 0`. It should
-echo `req_header.hops` so relay agents can enforce hop-count limits.
-
----
-
 ### Low — edge cases and nice-to-have
 
 **Option 55 (Parameter Request List) ignored** (RFC 2132 §9.8)
@@ -66,6 +31,21 @@ temp file and rename into place.
 ---
 
 ## Completed
+
+**DHCPINFORM handled** ✓
+`handleInform()` replies with DHCPACK, `yiaddr=0`, includes all config
+options (subnet mask, router, DNS, domain name, dhcp_options). No lease is
+created. `ciaddr` and `hops` are echoed from the request.
+
+**Client ID (option 61) stored and used** ✓
+`getClientId()` extracts option 61 raw bytes, stored as lowercase hex in
+`Lease.client_id`. `allocateIp` checks by client_id before chaddr so a
+client that changes MAC retains its lease. `isIpValid` accepts client_id
+match for renewals. `createAck` stores the client_id on confirmed leases.
+
+**`hops` echoed in responses** ✓
+`createOffer`, `createAck`, `createNak`, and `handleInform` all copy
+`req_header.hops` into the response so relay agents can enforce hop limits.
 
 **Relay response routing and broadcast flag** ✓
 `resolveDestination()` applies RFC 2131 §4.1 priority rules: relay agent

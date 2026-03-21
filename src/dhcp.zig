@@ -427,6 +427,7 @@ pub const DHCPServer = struct {
                 self.handleDecline(packet);
                 break :blk null;
             },
+            .DHCPINFORM => self.handleInform(packet),
             else => null,
         };
     }
@@ -462,7 +463,7 @@ pub const DHCPServer = struct {
     /// Returns the first host address in the subnet that has no active lease,
     /// skipping the router and (if specific) the server's own address.
     /// Returns null when the pool is exhausted.
-    fn allocateIp(self: *Self, mac_bytes: [6]u8) !?[4]u8 {
+    fn allocateIp(self: *Self, mac_bytes: [6]u8, client_id: ?[]const u8) !?[4]u8 {
         var mac_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
@@ -480,6 +481,16 @@ pub const DHCPServer = struct {
         }
 
         // Reuse an existing confirmed lease for this client.
+        // Client identifier (option 61) takes precedence over chaddr per RFC 2131 §2.
+        if (client_id) |cid| {
+            var cid_hex_buf: [510]u8 = undefined;
+            const cid_hex = std.fmt.bufPrint(&cid_hex_buf, "{}", .{std.fmt.fmtSliceHexLower(cid)}) catch "";
+            if (cid_hex.len > 0) {
+                if (self.store.getLeaseByClientId(cid_hex)) |lease| {
+                    return try config_mod.parseIpv4(lease.ip);
+                }
+            }
+        }
         if (self.store.getLeaseByMac(mac_str)) |lease| {
             return try config_mod.parseIpv4(lease.ip);
         }
@@ -569,6 +580,7 @@ pub const DHCPServer = struct {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
 
         const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
+        const client_id_raw = getClientId(request);
 
         // giaddr != 0 means the DISCOVER came through a relay agent.
         const is_relayed = !std.mem.eql(u8, &req_header.giaddr, &[_]u8{ 0, 0, 0, 0 });
@@ -577,7 +589,7 @@ pub const DHCPServer = struct {
         // (so allocateIp skips it next iteration) and try again.
         const offered_ip = blk: {
             for (0..probe_mod.probe_max_tries) |_| {
-                const candidate = (try self.allocateIp(mac_bytes)) orelse break :blk null;
+                const candidate = (try self.allocateIp(mac_bytes, client_id_raw)) orelse break :blk null;
                 if (!self.probeConflict(candidate, is_relayed)) break :blk candidate;
                 self.quarantineProbeConflict(candidate);
             }
@@ -684,7 +696,7 @@ pub const DHCPServer = struct {
         resp_header.op = 2; // BOOTREPLY
         resp_header.htype = req_header.htype;
         resp_header.hlen = req_header.hlen;
-        resp_header.hops = 0;
+        resp_header.hops = req_header.hops;
         resp_header.xid = req_header.xid;
         resp_header.secs = 0;
         resp_header.flags = req_header.flags;
@@ -716,7 +728,7 @@ pub const DHCPServer = struct {
         // The client's requested IP comes from option 50, or ciaddr for renewals.
         const client_ip = getRequestedIp(request) orelse req_header.ciaddr;
 
-        // Format MAC string early — needed for IP validation.
+        // Format MAC string and extract client_id — both needed for IP validation.
         const mac_bytes = req_header.chaddr[0..6];
         var mac_str_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -724,8 +736,15 @@ pub const DHCPServer = struct {
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch unreachable;
 
+        const client_id_raw = getClientId(request);
+        var cid_hex_buf: [510]u8 = undefined;
+        const client_id_hex: ?[]const u8 = if (client_id_raw) |cid|
+            std.fmt.bufPrint(&cid_hex_buf, "{}", .{std.fmt.fmtSliceHexLower(cid)}) catch null
+        else
+            null;
+
         // Send DHCPNAK if the requested IP is not valid for our subnet.
-        if (!self.isIpValid(client_ip, mac_str)) return self.createNak(request);
+        if (!self.isIpValid(client_ip, mac_str, client_id_hex)) return self.createNak(request);
 
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
@@ -739,7 +758,7 @@ pub const DHCPServer = struct {
             client_ip[0], client_ip[1], client_ip[2], client_ip[3],
         }) catch unreachable;
 
-        // Record the lease (includes hostname from option 12 if present).
+        // Record the lease (includes hostname from option 12 and client_id from option 61).
         const now = std.time.timestamp();
         const hostname = getHostname(request);
         self.store.addLease(.{
@@ -747,7 +766,7 @@ pub const DHCPServer = struct {
             .ip = ip_str,
             .hostname = hostname,
             .expires = now + @as(i64, self.cfg.lease_time),
-            .client_id = null,
+            .client_id = client_id_hex,
         }) catch |err| {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
         };
@@ -847,7 +866,7 @@ pub const DHCPServer = struct {
         resp_header.op = 2; // BOOTREPLY
         resp_header.htype = req_header.htype;
         resp_header.hlen = req_header.hlen;
-        resp_header.hops = 0;
+        resp_header.hops = req_header.hops;
         resp_header.xid = req_header.xid;
         resp_header.secs = 0;
         resp_header.flags = req_header.flags;
@@ -980,9 +999,16 @@ pub const DHCPServer = struct {
         return val;
     }
 
+    /// Scan options for option 61 (Client Identifier). Returns raw bytes or null.
+    fn getClientId(packet: []const u8) ?[]const u8 {
+        const val = getOption(packet, .ClientID) orelse return null;
+        if (val.len == 0) return null;
+        return val;
+    }
+
     /// Returns true if `ip` is a valid host address in our subnet that is either
-    /// unleased or already leased to `mac_str`.
-    fn isIpValid(self: *Self, ip: [4]u8, mac_str: []const u8) bool {
+    /// unleased or already leased to this client (matched by mac_str or client_id_hex).
+    fn isIpValid(self: *Self, ip: [4]u8, mac_str: []const u8, client_id_hex: ?[]const u8) bool {
         const ip_int = std.mem.readInt(u32, &ip, .big);
         const subnet_bytes = config_mod.parseIpv4(self.cfg.subnet) catch return false;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
@@ -1004,9 +1030,111 @@ pub const DHCPServer = struct {
         var ip_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return false;
         if (self.store.getLeaseByIp(ip_str)) |lease| {
-            if (!std.mem.eql(u8, lease.mac, mac_str)) return false;
+            if (!std.mem.eql(u8, lease.mac, mac_str)) {
+                // Accept if the stored client_id matches (client may have changed MAC).
+                if (client_id_hex) |cid| {
+                    if (lease.client_id) |stored_cid| {
+                        if (std.mem.eql(u8, cid, stored_cid)) return true;
+                    }
+                }
+                return false;
+            }
         }
         return true;
+    }
+
+    /// Build a DHCPACK in response to a DHCPINFORM (RFC 2131 §3.4).
+    /// yiaddr is 0 — no address is assigned. Returns configuration options only.
+    fn handleInform(self: *Self, request: []const u8) !?[]u8 {
+        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const server_ip = self.server_ip;
+
+        var opts_buf: [512]u8 = undefined;
+        var opts_len: usize = 0;
+
+        // Option 53: DHCPACK
+        opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
+        opts_buf[opts_len + 1] = 1;
+        opts_buf[opts_len + 2] = @intFromEnum(MessageType.DHCPACK);
+        opts_len += 3;
+
+        // Option 54: Server Identifier
+        opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
+        opts_len += 6;
+
+        // Option 1: Subnet Mask
+        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
+        opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
+        opts_len += 6;
+
+        // Option 3: Router
+        const router_ip = try config_mod.parseIpv4(self.cfg.router);
+        opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
+        opts_len += 6;
+
+        // Option 6: DNS Servers (up to 4)
+        if (self.cfg.dns_servers.len > 0) {
+            const count = @min(self.cfg.dns_servers.len, 4);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
+            opts_buf[opts_len + 1] = @intCast(count * 4);
+            opts_len += 2;
+            for (self.cfg.dns_servers[0..count]) |dns_str| {
+                const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
+                @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
+                opts_len += 4;
+            }
+        }
+
+        // Option 15: Domain Name
+        if (self.cfg.domain_name.len > 0) {
+            const dn_len = @min(self.cfg.domain_name.len, 255);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
+            opts_buf[opts_len + 1] = @intCast(dn_len);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
+            opts_len += 2 + dn_len;
+        }
+
+        // Inject operator-defined options from config
+        var opts_it = self.cfg.dhcp_options.iterator();
+        while (opts_it.next()) |entry| {
+            const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
+            if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
+            opts_buf[opts_len] = code;
+            opts_buf[opts_len + 1] = @intCast(encoded.len);
+            opts_len += 2 + encoded.len;
+        }
+
+        // End
+        opts_buf[opts_len] = @intFromEnum(OptionCode.End);
+        opts_len += 1;
+
+        const pkt = try self.allocator.alloc(u8, dhcp_min_packet_size + opts_len);
+        @memset(pkt, 0);
+
+        const resp_header: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        resp_header.op = 2; // BOOTREPLY
+        resp_header.htype = req_header.htype;
+        resp_header.hlen = req_header.hlen;
+        resp_header.hops = req_header.hops;
+        resp_header.xid = req_header.xid;
+        resp_header.flags = req_header.flags;
+        resp_header.ciaddr = req_header.ciaddr; // echo ciaddr; no lease assigned
+        // yiaddr stays 0 (zeroed by memset) — no address is being assigned
+        resp_header.siaddr = server_ip;
+        resp_header.giaddr = req_header.giaddr;
+        resp_header.chaddr = req_header.chaddr;
+        resp_header.magic = dhcp_magic_cookie;
+
+        @memcpy(pkt[dhcp_min_packet_size .. dhcp_min_packet_size + opts_len], opts_buf[0..opts_len]);
+
+        return pkt;
     }
 
     /// Build a DHCPNAK in response to a DHCPREQUEST with an invalid IP.
@@ -1037,6 +1165,7 @@ pub const DHCPServer = struct {
         resp.op = 2;
         resp.htype = req_header.htype;
         resp.hlen = req_header.hlen;
+        resp.hops = req_header.hops;
         resp.xid = req_header.xid;
         resp.flags = req_header.flags;
         resp.giaddr = req_header.giaddr;
@@ -1451,7 +1580,7 @@ test "allocateIp skips addresses before pool_start" {
     const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
-    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
+    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expect(ip != null);
     const ip_int = std.mem.readInt(u32, &ip.?, .big);
     const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 100 }, .big);
@@ -1472,11 +1601,11 @@ test "isIpValid rejects IP outside pool range" {
     defer server.deinit();
 
     // Below pool_start
-    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff"));
+    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff", null));
     // Above pool_end
-    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 210 }, "aa:bb:cc:dd:ee:ff"));
+    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 210 }, "aa:bb:cc:dd:ee:ff", null));
     // Inside pool
-    try std.testing.expect(server.isIpValid([4]u8{ 192, 168, 1, 150 }, "aa:bb:cc:dd:ee:ff"));
+    try std.testing.expect(server.isIpValid([4]u8{ 192, 168, 1, 150 }, "aa:bb:cc:dd:ee:ff", null));
 }
 
 test "handleDecline quarantines declined IP" {
@@ -1691,7 +1820,7 @@ test "handleDecline rate-limits MAC after threshold declines" {
     }
 
     // After threshold declines, allocateIp should return null for this MAC.
-    const ip = try server.allocateIp(mac);
+    const ip = try server.allocateIp(mac, null);
     try std.testing.expect(ip == null);
 }
 
@@ -1779,4 +1908,149 @@ test "global decline rate limit drops excess declines" {
         const ip_str = try std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
         try std.testing.expect(store.getLeaseByIp(ip_str) == null);
     }
+}
+
+test "hops is echoed in OFFER and ACK responses" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // Build a DISCOVER with hops=3
+    var buf = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    {
+        const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+        hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.hops = 3; hdr.xid = 0x11111111;
+        hdr.magic = dhcp_magic_cookie;
+        @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
+        var i: usize = dhcp_min_packet_size;
+        buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+        buf[i] = @intFromEnum(OptionCode.End); i += 1;
+        const resp = try server.processPacket(buf[0..i]);
+        try std.testing.expect(resp != null);
+        defer alloc.free(resp.?);
+        const resp_hdr: *const DHCPHeader = @alignCast(@ptrCast(resp.?.ptr));
+        try std.testing.expectEqual(@as(u8, 3), resp_hdr.hops);
+    }
+
+    // Build a REQUEST with hops=2
+    {
+        const len = makeRequest(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 }, [4]u8{ 192, 168, 1, 2 }, [4]u8{ 192, 168, 1, 1 }, null);
+        const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+        hdr.hops = 2;
+        const resp = try server.processPacket(buf[0..len]);
+        try std.testing.expect(resp != null);
+        defer alloc.free(resp.?);
+        const resp_hdr: *const DHCPHeader = @alignCast(@ptrCast(resp.?.ptr));
+        try std.testing.expectEqual(@as(u8, 2), resp_hdr.hops);
+    }
+}
+
+test "createAck stores client_id from option 61" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    const mac = [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    const client_id_bytes = [_]u8{ 0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }; // type=Ethernet + MAC
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeRequest(&buf, mac, [4]u8{ 192, 168, 1, 50 }, [4]u8{ 192, 168, 1, 1 }, null);
+    // Append option 61 before the End byte
+    var pkt = buf[0..len];
+    const end_pos = len - 1; // position of End option
+    var new_buf = [_]u8{0} ** 512;
+    @memcpy(new_buf[0..end_pos], pkt[0..end_pos]);
+    var i: usize = end_pos;
+    new_buf[i] = @intFromEnum(OptionCode.ClientID); i += 1;
+    new_buf[i] = @intCast(client_id_bytes.len); i += 1;
+    @memcpy(new_buf[i..][0..client_id_bytes.len], &client_id_bytes); i += client_id_bytes.len;
+    new_buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(new_buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+
+    const lease = store.getLeaseByMac("11:22:33:44:55:66");
+    try std.testing.expect(lease != null);
+    try std.testing.expect(lease.?.client_id != null);
+    // Stored client_id should be hex of client_id_bytes
+    try std.testing.expectEqualStrings("01112233445566", lease.?.client_id.?);
+}
+
+test "allocateIp reuses lease when client_id matches different MAC" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // Pre-populate a lease with a client_id for one MAC.
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.42",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = "01aabbccddeeff",
+    });
+
+    // Allocate with a different MAC but same client_id raw bytes.
+    const client_id_bytes = [_]u8{ 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    const different_mac = [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    const ip = try server.allocateIp(different_mac, &client_id_bytes);
+    try std.testing.expect(ip != null);
+    // Should reuse the existing lease IP, not allocate a new one.
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 42 }, &ip.?);
+}
+
+test "handleInform returns DHCPACK with yiaddr=0" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0xAABBCCDD;
+    hdr.magic = dhcp_magic_cookie;
+    hdr.ciaddr = [4]u8{ 192, 168, 1, 55 }; // client already has an IP
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPINFORM); i += 3;
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Must be DHCPACK
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+
+    // yiaddr must be 0 (no address assigned)
+    const resp_hdr: *const DHCPHeader = @alignCast(@ptrCast(resp.?.ptr));
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 0, 0, 0, 0 }, &resp_hdr.yiaddr);
+
+    // ciaddr should be echoed
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 55 }, &resp_hdr.ciaddr);
+
+    // Should include subnet mask (option 1)
+    try std.testing.expect(DHCPServer.getOption(resp.?, .SubnetMask) != null);
+
+    // No lease should have been created
+    try std.testing.expectEqual(@as(usize, 0), store.leases.count());
 }
