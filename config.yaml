@@ -46,6 +46,14 @@ dns_update:
   key_name: "dhcp-update"
   key_file: "dhcp-update.key"
 
+# Static routes (options 33 and 121) — sent per client PRL request.
+# Use the top-level 'router' option for the default gateway (0.0.0.0/0 is not allowed here).
+# static_routes:
+#   - destination: "10.10.10.0/24"
+#     router: "192.168.1.1"
+#   - destination: "172.16.0.0/12"
+#     router: "192.168.1.254"
+
 # Static reservations — pin a MAC (or client_id) to a specific IP
 # reservations:
 #   - mac: "aa:bb:cc:dd:ee:ff"

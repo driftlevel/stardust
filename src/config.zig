@@ -15,6 +15,12 @@ pub const Reservation = struct {
     client_id: ?[]const u8,
 };
 
+pub const StaticRoute = struct {
+    destination: [4]u8, // masked network address
+    prefix_len: u8,     // 0–32
+    router: [4]u8,
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     listen_address: []const u8,
@@ -38,6 +44,7 @@ pub const Config = struct {
     dhcp_options: std.StringHashMap([]const u8),
     log_level: std.log.Level,
     reservations: []Reservation,
+    static_routes: []StaticRoute,
 
     /// Free all allocator-owned memory. Must be called when the Config is no
     /// longer needed.
@@ -78,6 +85,7 @@ pub const Config = struct {
             if (r.client_id) |c| self.allocator.free(c);
         }
         self.allocator.free(self.reservations);
+        self.allocator.free(self.static_routes);
     }
 };
 
@@ -167,6 +175,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = try allocator.alloc(Reservation, 0),
+        .static_routes = try allocator.alloc(StaticRoute, 0),
     };
 
     if (raw.dns_servers) |servers| {
@@ -268,6 +277,12 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
                     try parseReservations(allocator, &cfg, res_list);
                 }
             }
+
+            if (root_map.get("static_routes")) |sr_val| {
+                if (sr_val.asList()) |sr_list| {
+                    try parseStaticRoutes(allocator, &cfg, sr_list);
+                }
+            }
         }
     }
 
@@ -355,6 +370,90 @@ fn parseReservations(allocator: std.mem.Allocator, cfg: *Config, list: anytype) 
 
     // Trim to actual count (in case some entries were skipped).
     cfg.reservations = allocator.realloc(cfg.reservations, idx) catch cfg.reservations;
+}
+
+/// Parse a single static route from destination and router strings.
+/// Returns null if the entry should be skipped (a log message is emitted).
+fn parseOneStaticRoute(dest_str: []const u8, router_str: []const u8) ?StaticRoute {
+    // Parse destination: split on '/' for CIDR; no slash = /32 host route.
+    var prefix_len: u8 = 32;
+    var ip_str: []const u8 = dest_str;
+    if (std.mem.indexOfScalar(u8, dest_str, '/')) |slash| {
+        ip_str = dest_str[0..slash];
+        const pl = std.fmt.parseInt(u8, dest_str[slash + 1 ..], 10) catch {
+            std.log.warn("config: static_route destination '{s}' has invalid prefix length, skipping", .{dest_str});
+            return null;
+        };
+        if (pl > 32) {
+            std.log.warn("config: static_route destination '{s}' prefix_len out of range, skipping", .{dest_str});
+            return null;
+        }
+        prefix_len = @intCast(pl);
+    }
+
+    // Reject /0 (default route) — use the top-level 'router' option instead.
+    if (prefix_len == 0) {
+        std.log.err("config: static_route '{s}' is a default route (0.0.0.0/0); use the 'router' option instead, skipping", .{dest_str});
+        return null;
+    }
+
+    const dest_bytes = parseIpv4(ip_str) catch {
+        std.log.warn("config: static_route destination '{s}' is invalid, skipping", .{dest_str});
+        return null;
+    };
+    const router_bytes = parseIpv4(router_str) catch {
+        std.log.warn("config: static_route router '{s}' is invalid, skipping", .{router_str});
+        return null;
+    };
+
+    // Apply CIDR mask to canonicalize destination (e.g. 10.0.0.5/24 → 10.0.0.0).
+    const mask: u32 = @as(u32, 0xFFFFFFFF) << @intCast(32 - prefix_len);
+    var dest_int = std.mem.readInt(u32, &dest_bytes, .big);
+    dest_int &= mask;
+    var masked_dest: [4]u8 = undefined;
+    std.mem.writeInt(u32, &masked_dest, dest_int, .big);
+
+    return StaticRoute{
+        .destination = masked_dest,
+        .prefix_len = prefix_len,
+        .router = router_bytes,
+    };
+}
+
+/// Parse the static_routes list from the untyped YAML walk and append valid entries to cfg.
+fn parseStaticRoutes(allocator: std.mem.Allocator, cfg: *Config, list: anytype) !void {
+    const old_len = cfg.static_routes.len;
+    var count: usize = 0;
+
+    for (list) |item| {
+        const m = item.asMap() orelse {
+            std.log.warn("config: static_route entry is not a map, skipping", .{});
+            continue;
+        };
+        const dest_val = m.get("destination") orelse {
+            std.log.warn("config: static_route missing 'destination', skipping", .{});
+            continue;
+        };
+        const router_val = m.get("router") orelse {
+            std.log.warn("config: static_route missing 'router', skipping", .{});
+            continue;
+        };
+        const dest_str = dest_val.asScalar() orelse {
+            std.log.warn("config: static_route 'destination' is not a scalar, skipping", .{});
+            continue;
+        };
+        const router_str = router_val.asScalar() orelse {
+            std.log.warn("config: static_route 'router' is not a scalar, skipping", .{});
+            continue;
+        };
+
+        const route = parseOneStaticRoute(dest_str, router_str) orelse continue;
+
+        const new_slice = try allocator.realloc(cfg.static_routes, old_len + count + 1);
+        cfg.static_routes = new_slice;
+        cfg.static_routes[old_len + count] = route;
+        count += 1;
+    }
 }
 
 /// Log warnings when pool_start/pool_end are misconfigured. Does not fail load().
@@ -503,4 +602,26 @@ test "parseMask accepts valid CIDR edge cases" {
     try std.testing.expectEqual(@as(u32, 0x00000000), try parseMask("0.0.0.0"));
     // /32 — host route
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), try parseMask("255.255.255.255"));
+}
+
+test "parseStaticRoutes: CIDR destination parsed and masked" {
+    // "10.10.10.5/24" → destination=10.10.10.0, prefix_len=24
+    const r = parseOneStaticRoute("10.10.10.5/24", "192.168.1.1");
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 10, 10, 0 }, &r.?.destination);
+    try std.testing.expectEqual(@as(u8, 24), r.?.prefix_len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &r.?.router);
+}
+
+test "parseStaticRoutes: plain IP = /32 host route" {
+    // No slash → prefix_len=32, destination unchanged
+    const r = parseOneStaticRoute("10.10.10.1", "192.168.1.254");
+    try std.testing.expect(r != null);
+    try std.testing.expectEqual(@as(u8, 32), r.?.prefix_len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 10, 10, 1 }, &r.?.destination);
+}
+
+test "parseStaticRoutes: /0 default route is rejected" {
+    const r = parseOneStaticRoute("0.0.0.0/0", "192.168.1.1");
+    try std.testing.expect(r == null);
 }

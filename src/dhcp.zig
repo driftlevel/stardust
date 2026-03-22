@@ -72,6 +72,7 @@ pub const OptionCode = enum(u8) {
     LogServer = 7,
     HostName = 12,
     DomainName = 15,
+    StaticRoutes = 33,           // RFC 2132 §3.3
     NtpServers = 42,
     RequestedIPAddress = 50,
     IPAddressLeaseTime = 51,
@@ -85,6 +86,7 @@ pub const OptionCode = enum(u8) {
     BootFileName = 67,
     RelayAgentInformation = 82,
     DomainSearch = 119,
+    ClasslessStaticRoutes = 121, // RFC 3442
     End = 255,
     _,
 };
@@ -221,6 +223,39 @@ fn encodeDnsSearchList(buf: []u8, domains: []const []const u8) usize {
         }
         buf[pos] = 0; // root label terminator
         pos += 1;
+    }
+    return pos;
+}
+
+/// Encode DHCP option 33 (Static Routes, RFC 2132 §3.3).
+/// Each route: 4-byte destination + 4-byte router = 8 bytes.
+/// Returns bytes written; stops early if dst is full.
+fn encodeStaticRoutes(dst: []u8, routes: []const config_mod.StaticRoute) usize {
+    var pos: usize = 0;
+    for (routes) |r| {
+        if (pos + 8 > dst.len) break;
+        @memcpy(dst[pos..][0..4], &r.destination);
+        pos += 4;
+        @memcpy(dst[pos..][0..4], &r.router);
+        pos += 4;
+    }
+    return pos;
+}
+
+/// Encode DHCP option 121 (Classless Static Routes, RFC 3442 §3).
+/// Each route: 1-byte prefix_len + ceil(prefix_len/8) destination bytes + 4-byte router.
+/// Returns bytes written; stops early if dst is full.
+fn encodeClasslessStaticRoutes(dst: []u8, routes: []const config_mod.StaticRoute) usize {
+    var pos: usize = 0;
+    for (routes) |r| {
+        const sig: usize = (r.prefix_len + 7) / 8; // ceil(prefix_len/8)
+        if (pos + 1 + sig + 4 > dst.len) break;
+        dst[pos] = r.prefix_len;
+        pos += 1;
+        @memcpy(dst[pos..][0..sig], r.destination[0..sig]);
+        pos += sig;
+        @memcpy(dst[pos..][0..4], &r.router);
+        pos += 4;
     }
     return pos;
 }
@@ -958,6 +993,31 @@ pub const DHCPServer = struct {
 
         // Option 67: Boot Filename
         appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
+
+        // Option 33: Static Routes (RFC 2132)
+        if (isRequested(prl, .StaticRoutes) and self.cfg.static_routes.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
+        // Option 121: Classless Static Routes (RFC 3442)
+        if (isRequested(prl, .ClasslessStaticRoutes) and self.cfg.static_routes.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
         // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
@@ -1195,6 +1255,31 @@ pub const DHCPServer = struct {
 
         // Option 67: Boot Filename
         appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
+
+        // Option 33: Static Routes (RFC 2132)
+        if (isRequested(prl, .StaticRoutes) and self.cfg.static_routes.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
+        // Option 121: Classless Static Routes (RFC 3442)
+        if (isRequested(prl, .ClasslessStaticRoutes) and self.cfg.static_routes.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
         // Option 12: Hostname override from reservation (so client adopts reservation hostname).
         if (res_hostname) |rh| {
             if (isRequested(prl, .HostName)) {
@@ -1545,6 +1630,31 @@ pub const DHCPServer = struct {
 
         // Option 67: Boot Filename
         appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
+
+        // Option 33: Static Routes (RFC 2132)
+        if (isRequested(prl, .StaticRoutes) and self.cfg.static_routes.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
+        // Option 121: Classless Static Routes (RFC 3442)
+        if (isRequested(prl, .ClasslessStaticRoutes) and self.cfg.static_routes.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
         // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
@@ -1892,6 +2002,7 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
     };
 }
 
@@ -2834,6 +2945,175 @@ test "encodeDnsSearchList: single and multiple domains" {
     try std.testing.expectEqual(@as(usize, 22), n3);
     try std.testing.expectEqualSlices(u8, &.{ 8, 's', 't', 'a', 'r', 'd', 'u', 's', 't', 3, 'l', 'a', 'n', 0 }, buf[0..14]);
     try std.testing.expectEqualSlices(u8, &.{ 5, 'l', 'o', 'c', 'a', 'l', 0 }, buf[14..21]);
+}
+
+test "encodeStaticRoutes: single route" {
+    var buf: [16]u8 = undefined;
+    const routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
+    };
+    const n = encodeStaticRoutes(&buf, &routes);
+    try std.testing.expectEqual(@as(usize, 8), n);
+    // [dest 4 bytes][router 4 bytes]
+    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 10, 0, 192, 168, 1, 1 }, buf[0..n]);
+}
+
+test "encodeStaticRoutes: multiple routes" {
+    var buf: [32]u8 = undefined;
+    const routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
+        .{ .destination = [4]u8{ 172, 16, 0, 0 }, .prefix_len = 12, .router = [4]u8{ 192, 168, 1, 254 } },
+    };
+    const n = encodeStaticRoutes(&buf, &routes);
+    try std.testing.expectEqual(@as(usize, 16), n);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 10, 0, 192, 168, 1, 1 }, buf[0..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 172, 16, 0, 0, 192, 168, 1, 254 }, buf[8..16]);
+}
+
+test "encodeClasslessStaticRoutes: /8 route" {
+    // /8: prefix_len=8, sig=1 → [8][d1][router] = 6 bytes
+    var buf: [16]u8 = undefined;
+    const routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 0, 0, 0 }, .prefix_len = 8, .router = [4]u8{ 192, 168, 1, 1 } },
+    };
+    const n = encodeClasslessStaticRoutes(&buf, &routes);
+    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 10, 192, 168, 1, 1 }, buf[0..n]);
+}
+
+test "encodeClasslessStaticRoutes: /24 route" {
+    // /24: sig=3 → [24][d1][d2][d3][router] = 8 bytes
+    var buf: [16]u8 = undefined;
+    const routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
+    };
+    const n = encodeClasslessStaticRoutes(&buf, &routes);
+    try std.testing.expectEqual(@as(usize, 8), n);
+    try std.testing.expectEqualSlices(u8, &.{ 24, 10, 10, 10, 192, 168, 1, 1 }, buf[0..n]);
+}
+
+test "encodeClasslessStaticRoutes: /32 host route" {
+    // /32: sig=4 → [32][d1][d2][d3][d4][router] = 9 bytes
+    var buf: [16]u8 = undefined;
+    const routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 1 }, .prefix_len = 32, .router = [4]u8{ 192, 168, 1, 1 } },
+    };
+    const n = encodeClasslessStaticRoutes(&buf, &routes);
+    try std.testing.expectEqual(@as(usize, 9), n);
+    try std.testing.expectEqualSlices(u8, &.{ 32, 10, 10, 10, 1, 192, 168, 1, 1 }, buf[0..n]);
+}
+
+test "encodeClasslessStaticRoutes: multiple routes" {
+    // /8 → 6 bytes, /24 → 8 bytes; total 14 bytes
+    var buf: [32]u8 = undefined;
+    const routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 0, 0, 0 }, .prefix_len = 8, .router = [4]u8{ 192, 168, 1, 1 } },
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 254 } },
+    };
+    const n = encodeClasslessStaticRoutes(&buf, &routes);
+    try std.testing.expectEqual(@as(usize, 14), n);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 10, 192, 168, 1, 1 }, buf[0..6]);
+    try std.testing.expectEqualSlices(u8, &.{ 24, 10, 10, 10, 192, 168, 1, 254 }, buf[6..14]);
+}
+
+test "OFFER includes option 33 when PRL requests it" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    // Add a static route to the config.
+    alloc.free(cfg.static_routes);
+    cfg.static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
+    });
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 1; buf[i+2] = 33; i += 3; // request option 33
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    const opt33 = DHCPServer.getOption(resp.?, .StaticRoutes);
+    try std.testing.expect(opt33 != null);
+    try std.testing.expectEqual(@as(usize, 8), opt33.?.len);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 10, 0, 192, 168, 1, 1 }, opt33.?);
+}
+
+test "OFFER includes option 121 when PRL requests it" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.static_routes);
+    cfg.static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
+    });
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223345;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 1; buf[i+2] = 121; i += 3; // request option 121
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    const opt121 = DHCPServer.getOption(resp.?, .ClasslessStaticRoutes);
+    try std.testing.expect(opt121 != null);
+    // /24: [24][d1][d2][d3][router] = 8 bytes
+    try std.testing.expectEqual(@as(usize, 8), opt121.?.len);
+    try std.testing.expectEqualSlices(u8, &.{ 24, 10, 10, 10, 192, 168, 1, 1 }, opt121.?);
+}
+
+test "OFFER omits static route options when not in PRL" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.static_routes);
+    cfg.static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
+    });
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223346;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x03 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+    // PRL with only subnet mask (1) and router (3) — no static routes
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 2; buf[i+2] = 1; buf[i+3] = 3; i += 4;
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expect(DHCPServer.getOption(resp.?, .StaticRoutes) == null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .ClasslessStaticRoutes) == null);
 }
 
 test "getOption: zero-length option value" {
