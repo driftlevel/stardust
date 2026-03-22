@@ -861,3 +861,214 @@ test "parseStaticRoutes: /0 default route is rejected" {
     const r = parseOneStaticRoute("0.0.0.0/0", "192.168.1.1");
     try std.testing.expect(r == null);
 }
+
+test "parseIpv4: empty string rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseIpv4(""));
+}
+
+test "parseIpv4: too many octets rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseIpv4("1.2.3.4.5"));
+}
+
+test "parseIpv4: trailing dot rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseIpv4("192.168.1."));
+}
+
+test "parseIpv4: leading dot rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseIpv4(".192.168.1.1"));
+}
+
+test "parseMask: empty string rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseMask(""));
+}
+
+test "parseMask: too few octets rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.255.0"));
+}
+
+test "parseMask: non-numeric characters rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.255.abc.0"));
+}
+
+test "parseMask: octet out of range rejected" {
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.256.0.0"));
+}
+
+test "parseStaticRoutes: invalid destination IP is skipped" {
+    const r = parseOneStaticRoute("not.an.ip/24", "192.168.1.1");
+    try std.testing.expect(r == null);
+}
+
+test "parseStaticRoutes: invalid router IP is skipped" {
+    const r = parseOneStaticRoute("10.0.0.0/8", "not.a.router");
+    try std.testing.expect(r == null);
+}
+
+test "parseStaticRoutes: prefix_len > 32 is rejected" {
+    const r = parseOneStaticRoute("10.0.0.0/33", "192.168.1.1");
+    try std.testing.expect(r == null);
+}
+
+// ---------------------------------------------------------------------------
+// computePoolHash tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal Config suitable for pool-hash tests. All allocated strings
+/// must be freed by calling cfg.deinit().
+fn makeHashTestConfig(alloc: std.mem.Allocator) Config {
+    return Config{
+        .allocator = alloc,
+        .listen_address = alloc.dupe(u8, "0.0.0.0") catch unreachable,
+        .subnet = alloc.dupe(u8, "192.168.1.0") catch unreachable,
+        .subnet_mask = 0xFFFFFF00,
+        .router = alloc.dupe(u8, "192.168.1.1") catch unreachable,
+        .dns_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .domain_name = alloc.dupe(u8, "") catch unreachable,
+        .domain_search = alloc.alloc([]const u8, 0) catch unreachable,
+        .time_offset = null,
+        .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
+        .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .lease_time = 3600,
+        .state_dir = alloc.dupe(u8, "/tmp") catch unreachable,
+        .pool_start = alloc.dupe(u8, "192.168.1.10") catch unreachable,
+        .pool_end = alloc.dupe(u8, "192.168.1.200") catch unreachable,
+        .log_level = .info,
+        .dns_update = .{
+            .enable = false,
+            .server = alloc.dupe(u8, "") catch unreachable,
+            .zone = alloc.dupe(u8, "") catch unreachable,
+            .key_name = alloc.dupe(u8, "") catch unreachable,
+            .key_file = alloc.dupe(u8, "") catch unreachable,
+            .lease_time = 3600,
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = alloc.alloc(Reservation, 0) catch unreachable,
+        .static_routes = alloc.alloc(StaticRoute, 0) catch unreachable,
+        .pool_allocation_random = false,
+        .sync = null,
+    };
+}
+
+test "computePoolHash: identical configs hash identically" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    try std.testing.expectEqualSlices(u8, &computePoolHash(&c1), &computePoolHash(&c2));
+}
+
+test "computePoolHash: different subnet produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c2.subnet);
+    c2.subnet = try alloc.dupe(u8, "10.0.0.0");
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different subnet_mask produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    c2.subnet_mask = 0xFFFF0000; // /16
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different pool_end produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c2.pool_end);
+    c2.pool_end = try alloc.dupe(u8, "192.168.1.150");
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different lease_time produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    c2.lease_time = 7200;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: adding a reservation changes the hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c2.reservations);
+    const res = try alloc.alloc(Reservation, 1);
+    res[0] = .{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = null,
+        .client_id = null,
+    };
+    c2.reservations = res;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: reservation insertion order does not affect hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c1.reservations);
+    const res1 = try alloc.alloc(Reservation, 2);
+    res1[0] = .{ .mac = "aa:bb:cc:dd:ee:01", .ip = "192.168.1.50", .hostname = null, .client_id = null };
+    res1[1] = .{ .mac = "aa:bb:cc:dd:ee:02", .ip = "192.168.1.51", .hostname = null, .client_id = null };
+    c1.reservations = res1;
+
+    alloc.free(c2.reservations);
+    const res2 = try alloc.alloc(Reservation, 2);
+    res2[0] = .{ .mac = "aa:bb:cc:dd:ee:02", .ip = "192.168.1.51", .hostname = null, .client_id = null };
+    res2[1] = .{ .mac = "aa:bb:cc:dd:ee:01", .ip = "192.168.1.50", .hostname = null, .client_id = null };
+    c2.reservations = res2;
+
+    try std.testing.expectEqualSlices(u8, &computePoolHash(&c1), &computePoolHash(&c2));
+}
+
+test "computePoolHash: adding a static route changes the hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c2.static_routes);
+    const routes = try alloc.alloc(StaticRoute, 1);
+    routes[0] = .{
+        .destination = .{ 10, 0, 0, 0 },
+        .prefix_len = 8,
+        .router = .{ 192, 168, 1, 254 },
+    };
+    c2.static_routes = routes;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}

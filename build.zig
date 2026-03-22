@@ -11,8 +11,7 @@ pub fn build(b: *std.Build) void {
     });
     const yaml_mod = yaml.module("yaml");
 
-    const exe = b.addExecutable(.{
-        .name = "stardust",
+    const main_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
@@ -48,7 +47,17 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = main_mod,
     });
+    if (b.option([]const u8, "test_filter", "Filter tests by name")) |f| {
+        unit_tests.filters = &.{f};
+    }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    // Check step (type-check without emitting a binary)
+    const check_exe = b.addExecutable(.{
+        .name = "check",
+        .root_module = main_mod,
+    });
+    const check_step = b.step("check", "Type-check the codebase");
+    check_step.dependOn(&check_exe.step);
 }

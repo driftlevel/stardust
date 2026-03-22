@@ -11,14 +11,6 @@ pub const Lease = struct {
     hostname: ?[]const u8,
     expires: i64,
     client_id: ?[]const u8,
-};
-
-pub const Lease = struct {
-    mac: []const u8,
-    ip: []const u8,
-    hostname: ?[]const u8,
-    expires: i64,
-    client_id: ?[]const u8,
     reserved: bool = false,
     last_modified: i64 = 0, // unix timestamp; 0 = unknown (old JSON records)
 };
@@ -541,4 +533,114 @@ test "getLeaseByIp returns null when expires equals current time" {
     try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", now);
 
     try std.testing.expect(store.getLeaseByIp("192.168.1.10") == null);
+}
+
+test "getLeaseByClientId returns lease with matching client_id" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try store.leases.put(
+        try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .{
+            .mac = try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .ip = try store.allocator.dupe(u8, "192.168.1.10"),
+            .hostname = null,
+            .expires = std.time.timestamp() + 3600,
+            .client_id = try store.allocator.dupe(u8, "01aabbccddeeff"),
+        },
+    );
+
+    const lease = store.getLeaseByClientId("01aabbccddeeff");
+    try std.testing.expect(lease != null);
+    try std.testing.expectEqualStrings("192.168.1.10", lease.?.ip);
+}
+
+test "getLeaseByClientId returns null for expired lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try store.leases.put(
+        try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .{
+            .mac = try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .ip = try store.allocator.dupe(u8, "192.168.1.10"),
+            .hostname = null,
+            .expires = std.time.timestamp() - 1,
+            .client_id = try store.allocator.dupe(u8, "01aabbccddeeff"),
+        },
+    );
+
+    try std.testing.expect(store.getLeaseByClientId("01aabbccddeeff") == null);
+}
+
+test "getLeaseByClientId returns null when no lease has matching client_id" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", std.time.timestamp() + 3600);
+
+    try std.testing.expect(store.getLeaseByClientId("01aabbccddeeff") == null);
+}
+
+test "getReservationByIp returns reservation for matching IP" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", 0, null);
+
+    const lease = store.getReservationByIp("192.168.1.50");
+    try std.testing.expect(lease != null);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", lease.?.mac);
+}
+
+test "getReservationByIp returns null for non-reserved lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", std.time.timestamp() + 3600);
+
+    try std.testing.expect(store.getReservationByIp("192.168.1.50") == null);
+}
+
+test "getReservationByIp returns null for unknown IP" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try std.testing.expect(store.getReservationByIp("192.168.1.99") == null);
+}
+
+test "listLeases returns all leases including expired and reserved" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    // active lease
+    try putLease(store, "aa:bb:cc:dd:ee:01", "192.168.1.10", std.time.timestamp() + 3600);
+    // expired lease
+    try putLease(store, "aa:bb:cc:dd:ee:02", "192.168.1.11", std.time.timestamp() - 1);
+    // reserved (expires=0)
+    try putReservation(store, "aa:bb:cc:dd:ee:03", "192.168.1.50", 0, null);
+
+    const list = try store.listLeases();
+    defer store.allocator.free(list);
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+}
+
+test "forceRemoveLease removes reserved lease unconditionally" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", 0, null);
+    try std.testing.expect(store.leases.contains("aa:bb:cc:dd:ee:ff"));
+
+    store.forceRemoveLease("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(!store.leases.contains("aa:bb:cc:dd:ee:ff"));
+}
+
+test "forceRemoveLease is no-op for unknown MAC" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    // Should not crash on a missing key.
+    store.forceRemoveLease("de:ad:be:ef:00:01");
+    try std.testing.expectEqual(@as(usize, 0), store.leases.count());
 }

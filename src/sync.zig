@@ -1060,3 +1060,239 @@ fn makeTestStateStore(alloc: std.mem.Allocator) !*state_mod.StateStore {
     };
     return store;
 }
+
+// ---------------------------------------------------------------------------
+// Additional tests: parseIpv4Local
+// ---------------------------------------------------------------------------
+
+test "parseIpv4Local: valid address parses correctly" {
+    const ip = try parseIpv4Local("192.168.1.1");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &ip);
+}
+
+test "parseIpv4Local: 0.0.0.0 parses correctly" {
+    const ip = try parseIpv4Local("0.0.0.0");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, &ip);
+}
+
+test "parseIpv4Local: 255.255.255.255 parses correctly" {
+    const ip = try parseIpv4Local("255.255.255.255");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 255, 255, 255, 255 }, &ip);
+}
+
+test "parseIpv4Local: rejects too few octets" {
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Local("192.168.1"));
+}
+
+test "parseIpv4Local: rejects empty string" {
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Local(""));
+}
+
+test "parseIpv4Local: rejects letters" {
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Local("not.an.ip.addr"));
+}
+
+test "parseIpv4Local: rejects octet out of range" {
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Local("256.0.0.1"));
+}
+
+test "parseIpv4Local: rejects too many octets" {
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Local("1.2.3.4.5"));
+}
+
+// ---------------------------------------------------------------------------
+// Additional tests: applyLeaseDelete
+// ---------------------------------------------------------------------------
+
+test "applyLeaseDelete: removes existing lease" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    try store.leases.put(
+        try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .{
+            .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .ip = try alloc.dupe(u8, "192.168.1.10"),
+            .hostname = null,
+            .expires = std.time.timestamp() + 3600,
+            .client_id = null,
+        },
+    );
+
+    const aes_key = SyncManager.deriveKey("delete-test");
+    var mgr = makeTestManagerWithStore(aes_key, store);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    mgr.applyLeaseDelete("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "applyLeaseDelete: no-op for unknown MAC" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("delete-noop-test");
+    var mgr = makeTestManagerWithStore(aes_key, store);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    // Should not crash.
+    mgr.applyLeaseDelete("de:ad:be:ef:00:01");
+    try std.testing.expectEqual(@as(usize, 0), store.leases.count());
+}
+
+test "applyLeaseDelete: empty plaintext is a no-op" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("delete-empty-test");
+    var mgr = makeTestManagerWithStore(aes_key, store);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    mgr.applyLeaseDelete("");
+    try std.testing.expectEqual(@as(usize, 0), store.leases.count());
+}
+
+// ---------------------------------------------------------------------------
+// Additional tests: computeLeaseHash edge cases
+// ---------------------------------------------------------------------------
+
+test "computeLeaseHash: reserved lease (expires=0) is included in hash" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reserved-hash-test");
+    var mgr = makeTestManagerWithStore(aes_key, store);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    const h_before = mgr.computeLeaseHash();
+
+    // Add a reservation with expires=0.
+    try store.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .{
+        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try alloc.dupe(u8, "192.168.1.50"),
+        .hostname = null,
+        .expires = 0,
+        .client_id = null,
+        .reserved = true,
+    });
+
+    const h_after = mgr.computeLeaseHash();
+    try std.testing.expect(!std.mem.eql(u8, &h_before, &h_after));
+}
+
+test "computeLeaseHash: expired lease is included in hash" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("expired-hash-test");
+    var mgr = makeTestManagerWithStore(aes_key, store);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    const h_before = mgr.computeLeaseHash();
+
+    // Add an already-expired lease (expires in the past).
+    try store.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .{
+        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try alloc.dupe(u8, "192.168.1.10"),
+        .hostname = null,
+        .expires = 1, // epoch + 1s, definitely expired
+        .client_id = null,
+    });
+
+    const h_after = mgr.computeLeaseHash();
+    try std.testing.expect(!std.mem.eql(u8, &h_before, &h_after));
+}
+
+// ---------------------------------------------------------------------------
+// Additional tests: encrypt edge cases
+// ---------------------------------------------------------------------------
+
+test "encrypt: buffer too small returns null" {
+    const aes_key = SyncManager.deriveKey("small-buf-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    // Buffer is smaller than overhead (42 bytes) + plaintext.
+    var tiny_buf: [10]u8 = undefined;
+    const result = mgr.encrypt(.keepalive, "hello", &tiny_buf);
+    try std.testing.expect(result == null);
+}
+
+test "encrypt: maximum message type values round-trip" {
+    const aes_key = SyncManager.deriveKey("msgtype-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    var buf: [256]u8 = undefined;
+    const n = mgr.encrypt(.lease_hash, "a" ** 32, &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [256]u8 = undefined;
+    const res = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.lease_hash, res.msg_type);
+    try std.testing.expectEqualStrings("a" ** 32, res.plaintext);
+}
+
+// ---------------------------------------------------------------------------
+// Additional tests: findOrAddPeer peer limit
+// ---------------------------------------------------------------------------
+
+test "findOrAddPeer: respects max_peers limit" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("peer-limit-test");
+    var mgr = makeTestManagerWithStore(aes_key, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Fill up to max_peers.
+    var i: u8 = 0;
+    while (i < SyncManager.max_peers) : (i += 1) {
+        const addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = 647,
+            .addr = std.mem.nativeToBig(u32, @as(u32, 0xC0A80100) + i),
+        };
+        _ = try mgr.findOrAddPeer(addr);
+    }
+    try std.testing.expectEqual(@as(usize, SyncManager.max_peers), mgr.peers.items.len);
+
+    // The next peer should be rejected.
+    const extra_addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = 647,
+        .addr = std.mem.nativeToBig(u32, 0xC0A80200),
+    };
+    try std.testing.expectError(error.TooManyPeers, mgr.findOrAddPeer(extra_addr));
+    // List length must not have grown.
+    try std.testing.expectEqual(@as(usize, SyncManager.max_peers), mgr.peers.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// Additional tests: decrypt rejects unknown protocol version
+// ---------------------------------------------------------------------------
+
+test "decrypt rejects unknown protocol version" {
+    const aes_key = SyncManager.deriveKey("version-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    var buf: [256]u8 = undefined;
+    const n = mgr.encrypt(.keepalive, "", &buf);
+    try std.testing.expect(n != null);
+
+    // Flip the version byte (buf[0]) to an unknown value.
+    buf[0] = 99;
+
+    var plain_buf: [256]u8 = undefined;
+    // Tag will fail because AD changed, but we want UnknownVersion from the
+    // version check. Either error is acceptable — the packet must be rejected.
+    const err = mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expect(err == error.UnknownVersion or err == error.AuthFailed);
+}

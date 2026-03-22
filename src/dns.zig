@@ -29,8 +29,6 @@ pub const TsigKey = struct {
     }
 };
 
-pub const Config = config_mod.DnsUpdateConfig;
-
 pub const DNSUpdater = struct {
     allocator: std.mem.Allocator,
     config: *const Config,
