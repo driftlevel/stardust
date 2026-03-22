@@ -9,6 +9,16 @@ pub const Error = error{
     OutOfMemory,
 };
 
+pub const SyncConfig = struct {
+    enable: bool,
+    group_name: []const u8,
+    key_file: []const u8,
+    port: u16,           // default 647
+    full_sync_interval: u32, // seconds, default 300
+    multicast: ?[]const u8,  // null if using peers mode
+    peers: [][]const u8,     // empty if using multicast mode
+};
+
 pub const Reservation = struct {
     mac: []const u8,
     ip: []const u8,
@@ -46,6 +56,8 @@ pub const Config = struct {
     log_level: std.log.Level,
     reservations: []Reservation,
     static_routes: []StaticRoute,
+    pool_allocation_random: bool, // false = sequential (existing behavior), true = random start offset
+    sync: ?SyncConfig,            // null if sync.enable = false or section absent
 
     /// Free all allocator-owned memory. Must be called when the Config is no
     /// longer needed.
@@ -87,6 +99,13 @@ pub const Config = struct {
         }
         self.allocator.free(self.reservations);
         self.allocator.free(self.static_routes);
+        if (self.sync) |*s| {
+            self.allocator.free(s.group_name);
+            self.allocator.free(s.key_file);
+            if (s.multicast) |m| self.allocator.free(m);
+            for (s.peers) |p| self.allocator.free(p);
+            self.allocator.free(s.peers);
+        }
     }
 };
 
@@ -200,6 +219,8 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = try allocator.alloc(Reservation, 0),
         .static_routes = try allocator.alloc(StaticRoute, 0),
+        .pool_allocation_random = false,
+        .sync = null,
     };
 
     if (raw.dns_servers) |servers| {
@@ -305,6 +326,18 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             if (root_map.get("static_routes")) |sr_val| {
                 if (sr_val.asList()) |sr_list| {
                     try parseStaticRoutes(allocator, &cfg, sr_list);
+                }
+            }
+
+            if (root_map.get("pool_allocation_random")) |par_val| {
+                if (par_val.asScalar()) |s| {
+                    if (std.mem.eql(u8, s, "true")) cfg.pool_allocation_random = true;
+                }
+            }
+
+            if (root_map.get("sync")) |sync_val| {
+                if (sync_val.asMap()) |sync_map| {
+                    cfg.sync = try parseSyncConfig(allocator, sync_map);
                 }
             }
         }
@@ -478,6 +511,185 @@ fn parseStaticRoutes(allocator: std.mem.Allocator, cfg: *Config, list: anytype) 
         cfg.static_routes[old_len + count] = route;
         count += 1;
     }
+}
+
+/// Parse the sync section from the untyped YAML map into a SyncConfig.
+fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig {
+    const enable_val = sync_map.get("enable") orelse return null;
+    const enable_str = enable_val.asScalar() orelse return null;
+    if (!std.mem.eql(u8, enable_str, "true")) return null;
+
+    const group_name = if (sync_map.get("group_name")) |v|
+        if (v.asScalar()) |s| try allocator.dupe(u8, s) else try allocator.dupe(u8, "default")
+    else
+        try allocator.dupe(u8, "default");
+    errdefer allocator.free(group_name);
+
+    const key_file = if (sync_map.get("key_file")) |v|
+        if (v.asScalar()) |s| try allocator.dupe(u8, s) else try allocator.dupe(u8, "")
+    else
+        try allocator.dupe(u8, "");
+    errdefer allocator.free(key_file);
+
+    var port: u16 = 647;
+    if (sync_map.get("port")) |v| {
+        if (v.asScalar()) |s| {
+            port = std.fmt.parseInt(u16, s, 10) catch 647;
+        }
+    }
+
+    var full_sync_interval: u32 = 300;
+    if (sync_map.get("full_sync_interval")) |v| {
+        if (v.asScalar()) |s| {
+            full_sync_interval = std.fmt.parseInt(u32, s, 10) catch 300;
+        }
+    }
+
+    var multicast: ?[]const u8 = null;
+    errdefer if (multicast) |m| allocator.free(m);
+    if (sync_map.get("multicast")) |v| {
+        if (v.asScalar()) |s| {
+            multicast = try allocator.dupe(u8, s);
+        }
+    }
+
+    var peers = try allocator.alloc([]const u8, 0);
+    errdefer {
+        for (peers) |p| allocator.free(p);
+        allocator.free(peers);
+    }
+    if (sync_map.get("peers")) |v| {
+        if (v.asList()) |list| {
+            peers = try allocator.realloc(peers, list.len);
+            var count: usize = 0;
+            for (list) |item| {
+                if (item.asScalar()) |s| {
+                    peers[count] = try allocator.dupe(u8, s);
+                    count += 1;
+                }
+            }
+            peers = allocator.realloc(peers, count) catch peers;
+        }
+    }
+
+    return SyncConfig{
+        .enable = true,
+        .group_name = group_name,
+        .key_file = key_file,
+        .port = port,
+        .full_sync_interval = full_sync_interval,
+        .multicast = multicast,
+        .peers = peers,
+    };
+}
+
+/// Compute a SHA-256 pool hash over the subnet, pool, lease_time, reservations,
+/// and static routes. Used by SyncManager to verify peer config compatibility.
+pub fn computePoolHash(cfg: *const Config) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+
+    const subnet_bytes = parseIpv4(cfg.subnet) catch [4]u8{ 0, 0, 0, 0 };
+    h.update(&subnet_bytes);
+
+    var mask_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &mask_bytes, cfg.subnet_mask, .big);
+    h.update(&mask_bytes);
+
+    // Pool start and end as network-order u32
+    const pool_start_bytes = if (cfg.pool_start.len > 0)
+        parseIpv4(cfg.pool_start) catch [4]u8{ 0, 0, 0, 0 }
+    else blk: {
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, subnet_int + 1, .big);
+        break :blk b;
+    };
+    h.update(&pool_start_bytes);
+
+    const pool_end_bytes = if (cfg.pool_end.len > 0)
+        parseIpv4(cfg.pool_end) catch [4]u8{ 255, 255, 255, 255 }
+    else blk: {
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        const broadcast_int = subnet_int | ~cfg.subnet_mask;
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, broadcast_int - 1, .big);
+        break :blk b;
+    };
+    h.update(&pool_end_bytes);
+
+    var lt_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lt_bytes, cfg.lease_time, .big);
+    h.update(&lt_bytes);
+
+    // Reservations count + sorted by MAC
+    var rc_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &rc_bytes, @intCast(cfg.reservations.len), .big);
+    h.update(&rc_bytes);
+
+    // Sort reservation indices by MAC string for deterministic order.
+    // Use a small stack buffer; if more than 256 reservations, heap would be needed.
+    var res_indices: [256]usize = undefined;
+    const res_count = @min(cfg.reservations.len, res_indices.len);
+    for (0..res_count) |i| res_indices[i] = i;
+    // Insertion sort — reservation counts are small in practice.
+    for (1..res_count) |i| {
+        const key = res_indices[i];
+        var j = i;
+        while (j > 0 and std.mem.lessThan(u8, cfg.reservations[key].mac, cfg.reservations[res_indices[j - 1]].mac)) {
+            res_indices[j] = res_indices[j - 1];
+            j -= 1;
+        }
+        res_indices[j] = key;
+    }
+    for (res_indices[0..res_count]) |ri| {
+        const r = &cfg.reservations[ri];
+        // MAC is "xx:xx:xx:xx:xx:xx" — parse to 6 bytes for compactness
+        var mac_bytes: [6]u8 = [_]u8{0} ** 6;
+        var bi: usize = 0;
+        var pos: usize = 0;
+        while (bi < 6 and pos + 1 < r.mac.len) : (bi += 1) {
+            const hi = std.fmt.charToDigit(r.mac[pos], 16) catch 0;
+            const lo = std.fmt.charToDigit(r.mac[pos + 1], 16) catch 0;
+            mac_bytes[bi] = (hi << 4) | lo;
+            pos += 3; // skip "xx:"
+        }
+        h.update(&mac_bytes);
+        const ip_bytes = parseIpv4(r.ip) catch [4]u8{ 0, 0, 0, 0 };
+        h.update(&ip_bytes);
+    }
+
+    // Static routes count + sorted by destination
+    var src_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &src_bytes, @intCast(cfg.static_routes.len), .big);
+    h.update(&src_bytes);
+
+    var sr_indices: [256]usize = undefined;
+    const sr_count = @min(cfg.static_routes.len, sr_indices.len);
+    for (0..sr_count) |i| sr_indices[i] = i;
+    for (1..sr_count) |i| {
+        const key = sr_indices[i];
+        var j = i;
+        while (j > 0) {
+            const a = &cfg.static_routes[key];
+            const b2 = &cfg.static_routes[sr_indices[j - 1]];
+            const dest_a = std.mem.readInt(u32, &a.destination, .big);
+            const dest_b = std.mem.readInt(u32, &b2.destination, .big);
+            if (dest_a >= dest_b) break;
+            sr_indices[j] = sr_indices[j - 1];
+            j -= 1;
+        }
+        sr_indices[j] = key;
+    }
+    for (sr_indices[0..sr_count]) |sri| {
+        const r = &cfg.static_routes[sri];
+        h.update(&r.destination);
+        h.update(&[1]u8{r.prefix_len});
+        h.update(&r.router);
+    }
+
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return digest;
 }
 
 /// Log warnings when pool_start/pool_end are misconfigured. Does not fail load().

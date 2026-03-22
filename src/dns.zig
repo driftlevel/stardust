@@ -17,14 +17,14 @@ pub const Config = struct {
     lease_time: u32,
 };
 
-const Algorithm = enum { hmac_sha256, hmac_md5 };
+pub const Algorithm = enum { hmac_sha256, hmac_md5 };
 
-const TsigKey = struct {
+pub const TsigKey = struct {
     algorithm: Algorithm,
     secret: []u8,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *TsigKey) void {
+    pub fn deinit(self: *TsigKey) void {
         self.allocator.free(self.secret);
     }
 };
@@ -463,7 +463,7 @@ fn sendUpdate(server: []const u8, msg: []const u8) !void {
 // TSIG key parser (BIND key file format)
 // ---------------------------------------------------------------------------
 
-fn parseTsigKey(allocator: std.mem.Allocator, path: []const u8) !TsigKey {
+pub fn parseTsigKey(allocator: std.mem.Allocator, path: []const u8) !TsigKey {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 

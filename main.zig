@@ -3,6 +3,7 @@ const dhcp = @import("./src/dhcp.zig");
 const config_mod = @import("./src/config.zig");
 const state_mod = @import("./src/state.zig");
 const dns = @import("./src/dns.zig");
+const sync_mod = @import("./src/sync.zig");
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -165,9 +166,26 @@ pub fn main() !void {
         std.log.info("DNS updater disabled", .{});
     }
 
+    // Initialize sync manager if enabled.
+    const pool_hash = config_mod.computePoolHash(cfg);
+    var sync_mgr: ?*sync_mod.SyncManager = null;
+    if (cfg.sync) |*sync_cfg| {
+        if (sync_cfg.enable) {
+            sync_mgr = sync_mod.SyncManager.init(allocator, sync_cfg, store, pool_hash) catch |err| blk: {
+                std.log.err("Failed to initialize sync manager ({s}); running without sync", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    }
+    defer if (sync_mgr) |s| s.deinit();
+
+    if (sync_mgr != null) {
+        std.log.info("Sync manager enabled", .{});
+    }
+
     // Create and run DHCP server. The server takes ownership of dns_updater
     // (cleans it up on deinit and recreates it on SIGHUP reload).
-    const dhcp_server = dhcp.create_server(allocator, cfg, cfg_path, store, dns_updater, &g_log_level) catch |err| {
+    const dhcp_server = dhcp.create_server(allocator, cfg, cfg_path, store, dns_updater, &g_log_level, sync_mgr) catch |err| {
         fatal("Failed to create DHCP server: {s}", .{@errorName(err)});
     };
     defer dhcp_server.deinit();

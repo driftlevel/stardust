@@ -20,6 +20,7 @@ pub const Lease = struct {
     expires: i64,
     client_id: ?[]const u8,
     reserved: bool = false,
+    last_modified: i64 = 0, // unix timestamp; 0 = unknown (old JSON records)
 };
 
 pub const StateStore = struct {
@@ -85,6 +86,7 @@ pub const StateStore = struct {
             .expires = lease.expires,
             .client_id = client_id,
             .reserved = lease.reserved,
+            .last_modified = std.time.timestamp(),
         });
 
         store.save() catch |err| {
@@ -113,6 +115,7 @@ pub const StateStore = struct {
         if (store.leases.getPtr(mac)) |lease_ptr| {
             if (lease_ptr.reserved) {
                 lease_ptr.expires = 0;
+                lease_ptr.last_modified = std.time.timestamp();
                 store.save() catch |err| {
                     std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
                 };
@@ -464,6 +467,43 @@ test "removeLease on reserved lease zeros expiry, keeps entry" {
     try std.testing.expect(entry != null);
     try std.testing.expectEqual(@as(i64, 0), entry.?.expires);
     try std.testing.expect(entry.?.reserved);
+}
+
+test "addLease sets last_modified to current time" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    const before = std.time.timestamp();
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.10",
+        .hostname = null,
+        .expires = before + 3600,
+        .client_id = null,
+    });
+    const after = std.time.timestamp();
+
+    const entry = store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(entry != null);
+    try std.testing.expect(entry.?.last_modified >= before);
+    try std.testing.expect(entry.?.last_modified <= after);
+}
+
+test "removeLease on reserved sets last_modified" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", std.time.timestamp() + 3600, null);
+
+    const before = std.time.timestamp();
+    store.removeLease("aa:bb:cc:dd:ee:ff");
+    const after = std.time.timestamp();
+
+    const entry = store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqual(@as(i64, 0), entry.?.expires);
+    try std.testing.expect(entry.?.last_modified >= before);
+    try std.testing.expect(entry.?.last_modified <= after);
 }
 
 test "addReservation preserves expiry of existing lease" {

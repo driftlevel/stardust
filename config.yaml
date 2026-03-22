@@ -65,3 +65,24 @@ dns_update:
 # dhcp_options:
 #   "42": "192.168.1.1"  # NTP server
 dhcp_options: {}
+
+# Lease sync (redundant server group) — share lease state between multiple DHCP servers.
+# Requires a BIND TSIG key file (same format as dns_update.key_file).
+# All group members must have identical subnet/pool/reservation configuration.
+# sync:
+#   enable: true
+#   group_name: "dhcp-cluster-1"
+#   key_file: "dhcp-sync.key"    # BIND TSIG key file
+#   port: 647                    # optional, default 647
+#   full_sync_interval: 300      # optional, seconds between full lease-hash checks (default 300)
+#   # Discovery — choose exactly one:
+#   multicast: "239.255.0.67"    # site-local multicast (TTL=1, link-local only)
+#   # peers:                     # unicast mode (use for peers across routers)
+#   #   - "192.168.1.2"
+#   #   - "192.168.1.3"
+
+# Randomize IP allocation order within the pool (reduces split-brain collision risk
+# when running multiple active-active DHCP servers with sync enabled).
+# false (default) = sequential from pool_start, preserving existing behavior.
+# true = random starting offset, then sequential wrap-around.
+# pool_allocation_random: false
