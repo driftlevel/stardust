@@ -11,7 +11,8 @@ pub fn build(b: *std.Build) void {
     });
     const yaml_mod = yaml.module("yaml");
 
-    const main_mod = b.createModule(.{
+    const exe = b.addExecutable(.{
+        .name = "stardust",
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,

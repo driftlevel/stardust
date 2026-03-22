@@ -1,4 +1,6 @@
 const std = @import("std");
+const state_mod = @import("./state.zig");
+const config_mod = @import("./config.zig");
 
 pub const Error = error{
     InvalidConfig,
@@ -26,6 +28,8 @@ const TsigKey = struct {
         self.allocator.free(self.secret);
     }
 };
+
+pub const Config = config_mod.DnsUpdateConfig;
 
 pub const DNSUpdater = struct {
     allocator: std.mem.Allocator,

@@ -65,7 +65,6 @@ pub const dhcp_client_port: u16 = 68;
 pub const OptionCode = enum(u8) {
     Pad = 0,
     SubnetMask = 1,
-    TimeOffset = 2,
     Router = 3,
     TimeServer = 4,
     DomainNameServer = 6,
@@ -341,6 +340,10 @@ const DeclineRecord = struct {
     window_start: i64,
     cooldown_until: i64, // 0 = not in cooldown
 };
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
 
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,

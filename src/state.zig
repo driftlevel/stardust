@@ -2,6 +2,15 @@ const std = @import("std");
 
 pub const Error = error{
     IoError,
+    OutOfMemory,
+};
+
+pub const Lease = struct {
+    mac: []const u8,
+    ip: []const u8,
+    hostname: ?[]const u8,
+    expires: i64,
+    client_id: ?[]const u8,
 };
 
 pub const Lease = struct {

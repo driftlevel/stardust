@@ -6,6 +6,7 @@ pub const Error = error{
     ConfigNotFound,
     InvalidConfig,
     IoError,
+    OutOfMemory,
 };
 
 pub const Reservation = struct {
@@ -120,8 +121,31 @@ const RawConfig = struct {
     } = null,
 };
 
+// ---------------------------------------------------------------------------
+// Minimal YAML-subset parser
+//
+// Handles the flat key: value and nested key:\n  subkey: value structure
+// present in config.yaml. Sequences are parsed for dns_servers.
+// This avoids an external yaml dependency while remaining compatible with
+// the existing config.yaml format.
+// ---------------------------------------------------------------------------
+
+const ParseState = struct {
+    allocator: std.mem.Allocator,
+    lines: [][]const u8,
+    pos: usize,
+    cfg: *Config,
+    // Accumulate dns servers before writing to cfg
+    dns_list: std.ArrayList([]const u8),
+};
+
+/// Load and parse a YAML config file from `path`.
+/// Caller must call `cfg.deinit()` when done.
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        if (err == error.FileNotFound) return Error.ConfigNotFound;
+        return Error.IoError;
+    };
     defer file.close();
 
     const file_size = (try file.stat()).size;
