@@ -77,6 +77,7 @@ pub const OptionCode = enum(u8) {
     RenewalTimeValue = 58,
     RebindingTimeValue = 59,
     ClientID = 61,
+    RelayAgentInformation = 82,
     End = 255,
     _,
 };
@@ -173,6 +174,20 @@ fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     const copy_len = @min(s.len, dst.len);
     @memcpy(dst[0..copy_len], s[0..copy_len]);
     return dst[0..copy_len];
+}
+
+/// Returns true if `code` appears in the Parameter Request List, or true if no PRL was sent.
+/// Per RFC 2132 §9.8, options 53 (MessageType) and 54 (ServerIdentifier) are always included.
+fn isRequestedCode(prl: ?[]const u8, code: u8) bool {
+    const list = prl orelse return true;
+    for (list) |c| {
+        if (c == code) return true;
+    }
+    return false;
+}
+
+fn isRequested(prl: ?[]const u8, code: OptionCode) bool {
+    return isRequestedCode(prl, @intFromEnum(code));
 }
 
 // Per-MAC decline rate-limiting: after decline_threshold declines within decline_window_secs,
@@ -596,6 +611,9 @@ pub const DHCPServer = struct {
             break :blk null;
         } orelse return null;
 
+        logRelayAgentInfo(request);
+
+        const prl = getOption(request, .ParameterRequestList);
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
         const router_ip = try config_mod.parseIpv4(self.cfg.router);
@@ -607,50 +625,60 @@ pub const DHCPServer = struct {
         var opts_buf: [512]u8 = undefined;
         var opts_len: usize = 0;
 
-        // Option 53: DHCPOFFER
+        // Option 53: DHCPOFFER — always required
         opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
         opts_buf[opts_len + 1] = 1;
         opts_buf[opts_len + 2] = @intFromEnum(MessageType.DHCPOFFER);
         opts_len += 3;
 
-        // Option 54: Server Identifier
+        // Option 54: Server Identifier — always required
         opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
         opts_buf[opts_len + 1] = 4;
         @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
         opts_len += 6;
 
         // Option 51: IP Address Lease Time
-        opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
-        opts_len += 6;
+        if (isRequested(prl, .IPAddressLeaseTime)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
+            opts_len += 6;
+        }
 
         // Option 58: Renewal Time
-        opts_buf[opts_len] = @intFromEnum(OptionCode.RenewalTimeValue);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &renewal_time);
-        opts_len += 6;
+        if (isRequested(prl, .RenewalTimeValue)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.RenewalTimeValue);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &renewal_time);
+            opts_len += 6;
+        }
 
         // Option 59: Rebinding Time
-        opts_buf[opts_len] = @intFromEnum(OptionCode.RebindingTimeValue);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &rebind_time);
-        opts_len += 6;
+        if (isRequested(prl, .RebindingTimeValue)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.RebindingTimeValue);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &rebind_time);
+            opts_len += 6;
+        }
 
         // Option 1: Subnet Mask
-        opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
-        opts_len += 6;
+        if (isRequested(prl, .SubnetMask)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
+            opts_len += 6;
+        }
 
         // Option 3: Router
-        opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
-        opts_len += 6;
+        if (isRequested(prl, .Router)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
+            opts_len += 6;
+        }
 
         // Option 6: DNS Servers (up to 4)
-        if (self.cfg.dns_servers.len > 0) {
+        if (isRequested(prl, .DomainNameServer) and self.cfg.dns_servers.len > 0) {
             const count = @min(self.cfg.dns_servers.len, 4);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
             opts_buf[opts_len + 1] = @intCast(count * 4);
@@ -663,7 +691,7 @@ pub const DHCPServer = struct {
         }
 
         // Option 15: Domain Name
-        if (self.cfg.domain_name.len > 0) {
+        if (isRequested(prl, .DomainName) and self.cfg.domain_name.len > 0) {
             const dn_len = @min(self.cfg.domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
@@ -671,10 +699,11 @@ pub const DHCPServer = struct {
             opts_len += 2 + dn_len;
         }
 
-        // Inject operator-defined options from config
+        // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            if (!isRequestedCode(prl, code)) continue;
             const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
             if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
             opts_buf[opts_len] = code;
@@ -774,54 +803,68 @@ pub const DHCPServer = struct {
         // Notify DNS updater
         if (self.dns_updater) |du| du.notifyLeaseAdded(ip_str, hostname);
 
+        logRelayAgentInfo(request);
+
+        const prl = getOption(request, .ParameterRequestList);
+
         // Build options
         var opts_buf: [512]u8 = undefined;
         var opts_len: usize = 0;
 
-        // Option 53: DHCPACK
+        // Option 53: DHCPACK — always required
         opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
         opts_buf[opts_len + 1] = 1;
         opts_buf[opts_len + 2] = @intFromEnum(MessageType.DHCPACK);
         opts_len += 3;
 
-        // Option 54: Server Identifier
+        // Option 54: Server Identifier — always required
         opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
         opts_buf[opts_len + 1] = 4;
         @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
         opts_len += 6;
 
         // Option 51: IP Address Lease Time
-        opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
-        opts_len += 6;
+        if (isRequested(prl, .IPAddressLeaseTime)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
+            opts_len += 6;
+        }
 
         // Option 58: Renewal Time
-        opts_buf[opts_len] = @intFromEnum(OptionCode.RenewalTimeValue);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &renewal_time);
-        opts_len += 6;
+        if (isRequested(prl, .RenewalTimeValue)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.RenewalTimeValue);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &renewal_time);
+            opts_len += 6;
+        }
 
         // Option 59: Rebinding Time
-        opts_buf[opts_len] = @intFromEnum(OptionCode.RebindingTimeValue);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &rebind_time);
-        opts_len += 6;
+        if (isRequested(prl, .RebindingTimeValue)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.RebindingTimeValue);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &rebind_time);
+            opts_len += 6;
+        }
 
         // Option 1: Subnet Mask
-        opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
-        opts_len += 6;
+        if (isRequested(prl, .SubnetMask)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
+            opts_len += 6;
+        }
 
         // Option 3: Router
-        opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
-        opts_len += 6;
+        if (isRequested(prl, .Router)) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
+            opts_len += 6;
+        }
 
         // Option 6: DNS Servers (up to 4)
-        if (self.cfg.dns_servers.len > 0) {
+        if (isRequested(prl, .DomainNameServer) and self.cfg.dns_servers.len > 0) {
             const count = @min(self.cfg.dns_servers.len, 4);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
             opts_buf[opts_len + 1] = @intCast(count * 4);
@@ -834,7 +877,7 @@ pub const DHCPServer = struct {
         }
 
         // Option 15: Domain Name
-        if (self.cfg.domain_name.len > 0) {
+        if (isRequested(prl, .DomainName) and self.cfg.domain_name.len > 0) {
             const dn_len = @min(self.cfg.domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
@@ -842,10 +885,11 @@ pub const DHCPServer = struct {
             opts_len += 2 + dn_len;
         }
 
-        // Inject operator-defined options from config
+        // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            if (!isRequestedCode(prl, code)) continue;
             const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
             if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
             opts_buf[opts_len] = code;
@@ -1006,6 +1050,25 @@ pub const DHCPServer = struct {
         return val;
     }
 
+    /// Log sub-options from Relay Agent Information (option 82) at debug level.
+    /// No-op if the option is absent.
+    fn logRelayAgentInfo(packet: []const u8) void {
+        const val = getOption(packet, .RelayAgentInformation) orelse return;
+        var i: usize = 0;
+        while (i + 1 < val.len) {
+            const sub_code = val[i];
+            const sub_len = val[i + 1];
+            if (i + 2 + sub_len > val.len) break;
+            const sub_data = val[i + 2 .. i + 2 + sub_len];
+            switch (sub_code) {
+                1 => std.log.debug("Option 82 circuit-id: {}", .{std.fmt.fmtSliceHexLower(sub_data)}),
+                2 => std.log.debug("Option 82 remote-id: {}", .{std.fmt.fmtSliceHexLower(sub_data)}),
+                else => std.log.debug("Option 82 sub-option {d}: {} ({d}B)", .{ sub_code, std.fmt.fmtSliceHexLower(sub_data), sub_len }),
+            }
+            i += 2 + sub_len;
+        }
+    }
+
     /// Returns true if `ip` is a valid host address in our subnet that is either
     /// unleased or already leased to this client (matched by mac_str or client_id_hex).
     fn isIpValid(self: *Self, ip: [4]u8, mac_str: []const u8, client_id_hex: ?[]const u8) bool {
@@ -1049,37 +1112,45 @@ pub const DHCPServer = struct {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
         const server_ip = self.server_ip;
 
+        logRelayAgentInfo(request);
+
+        const prl = getOption(request, .ParameterRequestList);
+
         var opts_buf: [512]u8 = undefined;
         var opts_len: usize = 0;
 
-        // Option 53: DHCPACK
+        // Option 53: DHCPACK — always required
         opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
         opts_buf[opts_len + 1] = 1;
         opts_buf[opts_len + 2] = @intFromEnum(MessageType.DHCPACK);
         opts_len += 3;
 
-        // Option 54: Server Identifier
+        // Option 54: Server Identifier — always required
         opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
         opts_buf[opts_len + 1] = 4;
         @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
         opts_len += 6;
 
         // Option 1: Subnet Mask
-        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
-        opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
-        opts_len += 6;
+        if (isRequested(prl, .SubnetMask)) {
+            const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
+            opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
+            opts_len += 6;
+        }
 
         // Option 3: Router
-        const router_ip = try config_mod.parseIpv4(self.cfg.router);
-        opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
-        opts_buf[opts_len + 1] = 4;
-        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
-        opts_len += 6;
+        if (isRequested(prl, .Router)) {
+            const router_ip = try config_mod.parseIpv4(self.cfg.router);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
+            opts_buf[opts_len + 1] = 4;
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
+            opts_len += 6;
+        }
 
         // Option 6: DNS Servers (up to 4)
-        if (self.cfg.dns_servers.len > 0) {
+        if (isRequested(prl, .DomainNameServer) and self.cfg.dns_servers.len > 0) {
             const count = @min(self.cfg.dns_servers.len, 4);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
             opts_buf[opts_len + 1] = @intCast(count * 4);
@@ -1092,7 +1163,7 @@ pub const DHCPServer = struct {
         }
 
         // Option 15: Domain Name
-        if (self.cfg.domain_name.len > 0) {
+        if (isRequested(prl, .DomainName) and self.cfg.domain_name.len > 0) {
             const dn_len = @min(self.cfg.domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
@@ -1100,10 +1171,11 @@ pub const DHCPServer = struct {
             opts_len += 2 + dn_len;
         }
 
-        // Inject operator-defined options from config
+        // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            if (!isRequestedCode(prl, code)) continue;
             const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
             if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
             opts_buf[opts_len] = code;
@@ -2012,6 +2084,55 @@ test "allocateIp reuses lease when client_id matches different MAC" {
     try std.testing.expect(ip != null);
     // Should reuse the existing lease IP, not allocate a new one.
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 42 }, &ip.?);
+}
+
+test "isRequestedCode returns true when no PRL" {
+    try std.testing.expect(isRequestedCode(null, 1));
+    try std.testing.expect(isRequestedCode(null, 255));
+}
+
+test "isRequestedCode filters correctly" {
+    const prl = [_]u8{ 1, 3, 6, 15 };
+    try std.testing.expect(isRequestedCode(&prl, 1));
+    try std.testing.expect(isRequestedCode(&prl, 6));
+    try std.testing.expect(!isRequestedCode(&prl, 51)); // lease time not in PRL
+    try std.testing.expect(!isRequestedCode(&prl, 42)); // NTP not in PRL
+}
+
+test "createOffer omits options not in PRL" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+    // PRL with only subnet mask (1) and router (3) — no DNS (6), no lease time (51)
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 2; buf[i+2] = 1; buf[i+3] = 3; i += 4;
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // Subnet mask and router should be present (requested)
+    try std.testing.expect(DHCPServer.getOption(resp.?, .SubnetMask) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .Router) != null);
+    // DNS and lease time should be absent (not requested)
+    try std.testing.expect(DHCPServer.getOption(resp.?, .DnsServer) == null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .LeaseTime) == null);
+    // MessageType and ServerIdentifier always present
+    try std.testing.expect(DHCPServer.getOption(resp.?, .MessageType) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .ServerIdentifier) != null);
 }
 
 test "handleInform returns DHCPACK with yiaddr=0" {

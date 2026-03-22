@@ -170,7 +170,51 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         }
     }
 
+    validatePoolRange(&cfg);
+
     return cfg;
+}
+
+/// Log warnings when pool_start/pool_end are misconfigured. Does not fail load().
+fn validatePoolRange(cfg: *const Config) void {
+    const subnet_bytes = parseIpv4(cfg.subnet) catch return;
+    const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+    const broadcast_int = subnet_int | ~cfg.subnet_mask;
+    const valid_start = subnet_int + 1;
+    const valid_end = broadcast_int - 1;
+
+    var start_int: u32 = valid_start;
+    var end_int: u32 = valid_end;
+    var has_start = false;
+    var has_end = false;
+
+    if (cfg.pool_start.len > 0) {
+        const b = parseIpv4(cfg.pool_start) catch {
+            std.log.warn("config: pool_start '{s}' is not a valid IP address", .{cfg.pool_start});
+            return;
+        };
+        start_int = std.mem.readInt(u32, &b, .big);
+        has_start = true;
+        if (start_int < valid_start or start_int > valid_end) {
+            std.log.warn("config: pool_start {s} is outside subnet {s}", .{ cfg.pool_start, cfg.subnet });
+        }
+    }
+
+    if (cfg.pool_end.len > 0) {
+        const b = parseIpv4(cfg.pool_end) catch {
+            std.log.warn("config: pool_end '{s}' is not a valid IP address", .{cfg.pool_end});
+            return;
+        };
+        end_int = std.mem.readInt(u32, &b, .big);
+        has_end = true;
+        if (end_int < valid_start or end_int > valid_end) {
+            std.log.warn("config: pool_end {s} is outside subnet {s}", .{ cfg.pool_end, cfg.subnet });
+        }
+    }
+
+    if (has_start and has_end and start_int > end_int) {
+        std.log.warn("config: pool_start {s} > pool_end {s}: pool is empty", .{ cfg.pool_start, cfg.pool_end });
+    }
 }
 
 fn parseLogLevel(s: []const u8) std.log.Level {
@@ -201,6 +245,10 @@ fn parseMask(s: []const u8) !u32 {
     }
     if (dots != 3) return error.InvalidConfig;
     result = (result << 8) | octet;
+    // Validate contiguous CIDR prefix: no 0→1 bit transition reading MSB→LSB.
+    // Equivalently, ~mask must be of the form 0x00...0FF...F (a power-of-two minus 1 or 0).
+    const inverted = ~result;
+    if (inverted != 0 and (inverted & (inverted +% 1)) != 0) return error.InvalidConfig;
     return result;
 }
 
@@ -260,4 +308,17 @@ test "parseLogLevel" {
     try std.testing.expectEqual(std.log.Level.err, parseLogLevel("error"));
     try std.testing.expectEqual(std.log.Level.info, parseLogLevel("info"));
     try std.testing.expectEqual(std.log.Level.info, parseLogLevel("unknown"));
+}
+
+test "parseMask rejects non-CIDR masks" {
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.0.255.0"));
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.128.255.0"));
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.255.255.1"));
+}
+
+test "parseMask accepts valid CIDR edge cases" {
+    // /0 — all wildcard
+    try std.testing.expectEqual(@as(u32, 0x00000000), try parseMask("0.0.0.0"));
+    // /32 — host route
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), try parseMask("255.255.255.255"));
 }

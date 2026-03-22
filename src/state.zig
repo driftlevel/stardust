@@ -165,15 +165,23 @@ pub const StateStore = struct {
         const path = try store.leasesPath();
         defer store.allocator.free(path);
 
+        const tmp_path = try std.fmt.allocPrint(store.allocator, "{s}.tmp", .{path});
+        defer store.allocator.free(tmp_path);
+
         const list = try store.listLeases();
         defer store.allocator.free(list);
 
         const json_str = try std.json.Stringify.valueAlloc(store.allocator, list, .{});
         defer store.allocator.free(json_str);
 
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer file.close();
+        // Write to a temp file then atomically rename into place.
+        // Prevents corruption if the process is killed mid-write.
+        const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
         try file.writeAll(json_str);
+        file.close();
+
+        try std.fs.rename(std.fs.cwd(), tmp_path, std.fs.cwd(), path);
     }
 
     fn load(store: *StateStore) !void {

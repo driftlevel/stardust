@@ -2,35 +2,31 @@
 
 ## Pending
 
-### Low — edge cases and nice-to-have
-
-**Option 55 (Parameter Request List) ignored** (RFC 2132 §9.8)
-Server sends the same set of options in every response regardless of what
-the client requested. RFC says SHOULD filter to only those requested.
-
-**Option 82 (Relay Agent Information) not parsed** (RFC 3046)
-When a relay agent is detected the relay's circuit information in option 82
-is ignored. Not required for basic operation but useful for per-circuit
-policy and logging.
-
-**Pool range not validated against subnet** — no check that `pool_start` ≤
-`pool_end` or that both fall within the configured subnet. Silent defaults
-applied on parse failure can lead to confusing behaviour.
-
-**Subnet mask not validated as a proper CIDR mask** — `parseMask` accepts
-any 32-bit value; a non-contiguous mask such as `255.0.255.0` is silently
-used.
-
-**State file not atomically written** — `state.zig` truncates the JSON file
-in place. A crash mid-write can corrupt `leases.json`. Fix: write to a
-temp file and rename into place.
-
-**`CLAUDE.md` is outdated** — describes `state.zig` and `dns.zig` as
-"currently stub" but both are fully implemented.
-
 ---
 
 ## Completed
+
+**Option 55 (Parameter Request List) filtering** ✓ (RFC 2132 §9.8)
+`isRequestedCode(prl, code)` and `isRequested(prl, OptionCode)` helpers gate
+every optional option in `createOffer`, `createAck`, and `handleInform`.
+Options 53 (MessageType) and 54 (ServerIdentifier) are always included per RFC.
+
+**Option 82 (Relay Agent Information) logged** ✓ (RFC 3046)
+`logRelayAgentInfo()` parses sub-options 1 (circuit-id) and 2 (remote-id)
+and logs them at DEBUG level. Called from `createOffer`, `createAck`, and `handleInform`.
+
+**Pool range validated against subnet** ✓
+`validatePoolRange()` in `config.zig` logs warnings when `pool_start`/`pool_end`
+are outside the subnet, are invalid IPs, or when `pool_start > pool_end`. Called
+at end of `load()`.
+
+**Subnet mask validated as a proper CIDR mask** ✓
+`parseMask()` now checks that `~mask & (~mask + 1) == 0` (contiguous prefix
+property). Non-CIDR masks like `255.0.255.0` are rejected with `error.InvalidConfig`.
+
+**State file atomically written** ✓
+`save()` in `state.zig` writes to `<path>.tmp` then uses `std.fs.rename` to
+atomically replace the file. Prevents corruption on mid-write crash.
 
 **DHCPINFORM handled** ✓
 `handleInform()` replies with DHCPACK, `yiaddr=0`, includes all config
