@@ -87,10 +87,14 @@ pub const OptionCode = enum(u8) {
 // ---------------------------------------------------------------------------
 
 var g_running: ?*std.atomic.Value(bool) = null;
+var g_reload: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn handleSignal(sig: c_int) callconv(.c) void {
-    _ = sig;
-    if (g_running) |r| r.store(false, .seq_cst);
+    if (sig == std.posix.SIG.HUP) {
+        g_reload.store(true, .seq_cst);
+    } else {
+        if (g_running) |r| r.store(false, .seq_cst);
+    }
 }
 
 /// UDP connect trick: connecting a datagram socket to an external address causes
@@ -218,9 +222,10 @@ const DeclineRecord = struct {
 
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
-    cfg: *const Config,
+    cfg: *Config,
     store: *StateStore,
     dns_updater: ?*dns_mod.DNSUpdater,
+    log_level: *std.log.Level,
     running: std.atomic.Value(bool),
     last_prune: i64,
     server_ip: [4]u8,
@@ -235,9 +240,10 @@ pub const DHCPServer = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
-        cfg: *const Config,
+        cfg: *Config,
         store: *StateStore,
         dns_updater: ?*dns_mod.DNSUpdater,
+        log_level: *std.log.Level,
     ) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
@@ -245,6 +251,7 @@ pub const DHCPServer = struct {
             .cfg = cfg,
             .store = store,
             .dns_updater = dns_updater,
+            .log_level = log_level,
             .running = std.atomic.Value(bool).init(false),
             .last_prune = 0,
             // Pre-populate from listen_address so callers that don't call run() still
@@ -259,8 +266,45 @@ pub const DHCPServer = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.dns_updater) |u| u.cleanup();
         self.decline_records.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Seed static reservations from config into the state store.
+    /// Skips entries already present (so existing active leases are undisturbed).
+    pub fn seedReservations(self: *Self) void {
+        for (self.cfg.reservations) |r| {
+            if (self.store.getReservationByMac(r.mac) != null) continue;
+            self.store.addReservation(r.mac, r.ip, r.hostname, r.client_id) catch |err| {
+                std.log.warn("Failed to seed reservation for {s}: {s}", .{ r.mac, @errorName(err) });
+                continue;
+            };
+            std.log.info("Seeded reservation: {s} -> {s}", .{ r.mac, r.ip });
+        }
+    }
+
+    /// Reload config.yaml in-place. Called from the run loop on SIGHUP.
+    fn reloadConfig(self: *Self) void {
+        std.log.info("Reloading configuration...", .{});
+        const new_cfg = config_mod.load(self.allocator, "config.yaml") catch |err| {
+            std.log.err("Config reload failed ({s}), keeping existing config", .{@errorName(err)});
+            return;
+        };
+        // Replace the config in-place so the dns_updater pointer remains valid.
+        self.cfg.deinit();
+        self.cfg.* = new_cfg;
+        self.log_level.* = self.cfg.log_level;
+
+        // Recreate the DNS updater to pick up any key_file / server changes.
+        if (self.dns_updater) |old| old.cleanup();
+        self.dns_updater = dns_mod.create_updater(self.allocator, &self.cfg.dns_update) catch |err| blk: {
+            std.log.err("Failed to recreate DNS updater on reload ({s}); DNS updates disabled", .{@errorName(err)});
+            break :blk null;
+        };
+
+        self.seedReservations();
+        std.log.info("Configuration reloaded successfully", .{});
     }
 
     /// Main server loop. Binds a UDP socket on port 67 and processes packets.
@@ -279,6 +323,7 @@ pub const DHCPServer = struct {
         };
         std.posix.sigaction(std.posix.SIG.INT, &sig_action, null);
         std.posix.sigaction(std.posix.SIG.TERM, &sig_action, null);
+        std.posix.sigaction(std.posix.SIG.HUP, &sig_action, null);
 
         // Parse listen address
         const listen_ip = try config_mod.parseIpv4(self.cfg.listen_address);
@@ -364,6 +409,11 @@ pub const DHCPServer = struct {
         var src_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
 
         while (self.running.load(.seq_cst)) {
+            if (g_reload.load(.seq_cst)) {
+                self.reloadConfig();
+                g_reload.store(false, .seq_cst);
+            }
+
             const n = std.posix.recvfrom(
                 sock_fd,
                 &buf,
@@ -1324,16 +1374,19 @@ pub const DHCPServer = struct {
 
 pub fn create_server(
     allocator: std.mem.Allocator,
-    cfg: *const Config,
+    cfg: *Config,
     store: *StateStore,
     dns_updater: ?*dns_mod.DNSUpdater,
+    log_level: *std.log.Level,
 ) !*DHCPServer {
-    return DHCPServer.create(allocator, cfg, store, dns_updater);
+    return DHCPServer.create(allocator, cfg, store, dns_updater, log_level);
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+var test_log_level: std.log.Level = .info;
 
 test "resolveDestination: giaddr set -> relay at giaddr:67" {
     var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
@@ -1601,7 +1654,7 @@ test "createAck returns null when option 54 does not match our IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1622,7 +1675,7 @@ test "createAck sends DHCPNAK for IP outside subnet" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1645,7 +1698,7 @@ test "createAck stores hostname from option 12" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1673,7 +1726,7 @@ test "createAck returns DHCPACK for valid request without option 54" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1724,7 +1777,7 @@ test "allocateIp skips addresses before pool_start" {
     cfg.pool_start = try alloc.dupe(u8, "192.168.1.100");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
@@ -1744,7 +1797,7 @@ test "isIpValid rejects IP outside pool range" {
     cfg.pool_end = try alloc.dupe(u8, "192.168.1.200");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Below pool_start
@@ -1761,7 +1814,7 @@ test "handleDecline quarantines declined IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1782,7 +1835,7 @@ test "handleDecline removes MAC lease" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Pre-populate a lease for the MAC.
@@ -1809,7 +1862,7 @@ test "createOffer uses server_ip not listen_address" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Override server_ip to something different from listen_address
@@ -1849,7 +1902,7 @@ test "createAck checks server_ip for option 54" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     server.server_ip = [4]u8{ 192, 168, 1, 5 };
@@ -1892,7 +1945,7 @@ test "dhcp_options injected into OFFER packet" {
 
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Send a DISCOVER
@@ -1944,7 +1997,7 @@ test "handleDecline rate-limits MAC after threshold declines" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     const mac = [6]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01 };
@@ -1981,7 +2034,7 @@ test "quarantine period is max(lease_time/10, 300)" {
         cfg.lease_time = 3600;
         const store = try makeTestStore(alloc);
         defer store.deinit();
-        const server = try DHCPServer.create(alloc, &cfg, store, null);
+        const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
         defer server.deinit();
 
         var buf = [_]u8{0} ** 512;
@@ -2003,7 +2056,7 @@ test "quarantine period is max(lease_time/10, 300)" {
         cfg.lease_time = 600;
         const store = try makeTestStore(alloc);
         defer store.deinit();
-        const server = try DHCPServer.create(alloc, &cfg, store, null);
+        const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
         defer server.deinit();
 
         var buf = [_]u8{0} ** 512;
@@ -2025,7 +2078,7 @@ test "global decline rate limit drops excess declines" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Force the window to be current so counts don't reset.
@@ -2063,7 +2116,7 @@ test "hops is echoed in OFFER and ACK responses" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Build a DISCOVER with hops=3
@@ -2103,7 +2156,7 @@ test "createAck stores client_id from option 61" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     const mac = [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
@@ -2140,7 +2193,7 @@ test "allocateIp reuses lease when client_id matches different MAC" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Pre-populate a lease with a client_id for one MAC.
@@ -2180,7 +2233,7 @@ test "createOffer omits options not in PRL" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2216,7 +2269,7 @@ test "handleInform returns DHCPACK with yiaddr=0" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2282,7 +2335,7 @@ test "isIpValid rejects router IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // makeTestConfig sets router = "192.168.1.1"
@@ -2296,7 +2349,7 @@ test "DHCPREQUEST for router IP results in DHCPNAK" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2345,7 +2398,7 @@ test "allocateIp returns reserved IP for matching MAC" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
@@ -2366,7 +2419,7 @@ test "allocateIp skips reserved IP for non-matching client" {
     cfg.pool_end = try alloc.dupe(u8, "192.168.1.50");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Reserve .50 for a specific MAC.
@@ -2383,7 +2436,7 @@ test "isIpValid rejects reserved IP for non-matching MAC" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
@@ -2400,7 +2453,7 @@ test "createAck: reserved client gets reserved IP and option 12 hostname" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "printer");
@@ -2446,7 +2499,7 @@ test "DHCPNAK: non-matching client denied reserved IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
@@ -2471,7 +2524,7 @@ test "removeLease on reserved lease keeps entry with expires=0 (RELEASE)" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    const server = try DHCPServer.create(alloc, &cfg, store, null, &test_log_level);
     defer server.deinit();
 
     // Seed an active reservation.

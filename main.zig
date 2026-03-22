@@ -97,13 +97,18 @@ pub fn main() !void {
 
     std.log.info("Starting Stardust DHCP Server...", .{});
 
-    // Load configuration
-    var cfg = config_mod.load(allocator, "config.yaml") catch |err| {
+    // Load configuration into a heap allocation so the DHCP server can reload
+    // it in-place on SIGHUP without disturbing the pointer it holds.
+    const cfg = try allocator.create(config_mod.Config);
+    cfg.* = config_mod.load(allocator, "config.yaml") catch |err| {
         fatal("Failed to load config: {s}", .{@errorName(err)});
     };
-    defer cfg.deinit();
+    defer {
+        cfg.deinit();
+        allocator.destroy(cfg);
+    }
 
-    // Apply log level from config
+    // Apply log level from config (updated in-place via &g_log_level on SIGHUP reload).
     g_log_level = cfg.log_level;
 
     // Format subnet mask as dotted-decimal for display
@@ -130,20 +135,10 @@ pub fn main() !void {
 
     std.log.info("State store initialized", .{});
 
-    // Seed static reservations into the state store.
-    for (cfg.reservations) |r| {
-        if (store.getReservationByMac(r.mac) != null) continue; // already seeded from leases.json
-        store.addReservation(r.mac, r.ip, r.hostname, r.client_id) catch |err| {
-            std.log.warn("Failed to seed reservation for {s}: {s}", .{ r.mac, @errorName(err) });
-        };
-        std.log.info("Seeded reservation: {s} -> {s}", .{ r.mac, r.ip });
-    }
-
-    // Initialize DNS updater
+    // Initialize DNS updater (ownership transferred to dhcp_server below).
     const dns_updater = dns.create_updater(allocator, &cfg.dns_update) catch |err| {
         fatal("Failed to initialize DNS updater: {s}", .{@errorName(err)});
     };
-    defer dns_updater.cleanup();
 
     if (cfg.dns_update.enable) {
         std.log.info("DNS updater enabled (server: {s}, zone: {s})", .{
@@ -153,11 +148,15 @@ pub fn main() !void {
         std.log.info("DNS updater disabled", .{});
     }
 
-    // Create and run DHCP server
-    const dhcp_server = dhcp.create_server(allocator, &cfg, store, dns_updater) catch |err| {
+    // Create and run DHCP server. The server takes ownership of dns_updater
+    // (cleans it up on deinit and recreates it on SIGHUP reload).
+    const dhcp_server = dhcp.create_server(allocator, cfg, store, dns_updater, &g_log_level) catch |err| {
         fatal("Failed to create DHCP server: {s}", .{@errorName(err)});
     };
     defer dhcp_server.deinit();
+
+    // Seed static reservations. On SIGHUP the server calls seedReservations() again.
+    dhcp_server.seedReservations();
 
     std.log.info("Starting DHCP server...", .{});
     dhcp_server.run() catch |err| {
