@@ -16,6 +16,12 @@ dns_servers:
 
 domain_name: "stardust.lan"
 
+# Domain search list (option 119, RFC 3397) — sent to clients so short
+# hostnames are resolved against these domains in order.
+# domain_search:
+#   - "stardust.lan"
+#   - "local"
+
 # State storage
 state_dir: "/var/lib/stardust"
 

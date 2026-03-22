@@ -23,6 +23,7 @@ pub const Config = struct {
     router: []const u8,
     dns_servers: [][]const u8,
     domain_name: []const u8,
+    domain_search: [][]const u8,
     lease_time: u32,
     state_dir: []const u8,
     pool_start: []const u8, // "" = use subnet start
@@ -43,6 +44,8 @@ pub const Config = struct {
         for (self.dns_servers) |s| self.allocator.free(s);
         self.allocator.free(self.dns_servers);
         self.allocator.free(self.domain_name);
+        for (self.domain_search) |s| self.allocator.free(s);
+        self.allocator.free(self.domain_search);
         self.allocator.free(self.state_dir);
         self.allocator.free(self.dns_update.server);
         self.allocator.free(self.dns_update.zone);
@@ -74,6 +77,7 @@ const RawConfig = struct {
     router: ?[]const u8 = null,
     dns_servers: ?[][]const u8 = null,
     domain_name: ?[]const u8 = null,
+    domain_search: ?[][]const u8 = null,
     lease_time: ?u32 = null,
     state_dir: ?[]const u8 = null,
     pool_start: ?[]const u8 = null,
@@ -121,6 +125,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .router = try allocator.dupe(u8, raw.router orelse "192.168.1.1"),
         .dns_servers = try allocator.alloc([]const u8, 0),
         .domain_name = try allocator.dupe(u8, raw.domain_name orelse ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
         .lease_time = lease_time_val,
         .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
         .pool_start = try allocator.dupe(u8, raw.pool_start orelse ""),
@@ -144,6 +149,15 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         for (cfg.dns_servers) |*s| s.* = ""; // safe deinit if we error partway
         for (servers, 0..) |s, i| {
             cfg.dns_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (raw.domain_search) |domains| {
+        allocator.free(cfg.domain_search);
+        cfg.domain_search = try allocator.alloc([]const u8, domains.len);
+        for (cfg.domain_search) |*s| s.* = ""; // safe deinit if we error partway
+        for (domains, 0..) |s, i| {
+            cfg.domain_search[i] = try allocator.dupe(u8, s);
         }
     }
 

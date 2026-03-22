@@ -78,6 +78,7 @@ pub const OptionCode = enum(u8) {
     RebindingTimeValue = 59,
     ClientID = 61,
     RelayAgentInformation = 82,
+    DomainSearch = 119,
     End = 255,
     _,
 };
@@ -182,6 +183,40 @@ fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     const copy_len = @min(s.len, dst.len);
     @memcpy(dst[0..copy_len], s[0..copy_len]);
     return dst[0..copy_len];
+}
+
+/// Encode a list of domain names in DNS wire format (RFC 1035 §3.1) as required
+/// by DHCP option 119 (RFC 3397). Each name is encoded as length-prefixed labels
+/// terminated by a zero byte; names are concatenated. No compression is applied.
+/// Returns the number of bytes written into buf.
+fn encodeDnsSearchList(buf: []u8, domains: []const []const u8) usize {
+    var pos: usize = 0;
+    for (domains) |domain| {
+        // Strip optional trailing dot.
+        var rem = if (domain.len > 0 and domain[domain.len - 1] == '.') domain[0 .. domain.len - 1] else domain;
+        const domain_start = pos;
+        var valid = true;
+        while (rem.len > 0) {
+            const dot = std.mem.indexOfScalar(u8, rem, '.') orelse rem.len;
+            const label = rem[0..dot];
+            if (label.len == 0 or label.len > 63 or pos + 1 + label.len >= buf.len) {
+                valid = false;
+                break;
+            }
+            buf[pos] = @intCast(label.len);
+            pos += 1;
+            @memcpy(buf[pos .. pos + label.len], label);
+            pos += label.len;
+            rem = if (dot < rem.len) rem[dot + 1 ..] else "";
+        }
+        if (!valid or pos >= buf.len) {
+            pos = domain_start; // rewind — skip malformed or overflowing domain
+            continue;
+        }
+        buf[pos] = 0; // root label terminator
+        pos += 1;
+    }
+    return pos;
 }
 
 /// Returns true if `code` appears in the Parameter Request List, or true if no PRL was sent.
@@ -828,6 +863,18 @@ pub const DHCPServer = struct {
             opts_len += 2 + dn_len;
         }
 
+        // Option 119: Domain Search List (RFC 3397)
+        if (isRequested(prl, .DomainSearch) and self.cfg.domain_search.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], self.cfg.domain_search);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
+        }
+
         // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
@@ -1025,6 +1072,18 @@ pub const DHCPServer = struct {
             opts_buf[opts_len + 1] = @intCast(dn_len);
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
+        }
+
+        // Option 119: Domain Search List (RFC 3397)
+        if (isRequested(prl, .DomainSearch) and self.cfg.domain_search.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], self.cfg.domain_search);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
         }
 
         // Option 12: Hostname override from reservation (so client adopts reservation hostname).
@@ -1337,6 +1396,18 @@ pub const DHCPServer = struct {
             opts_buf[opts_len + 1] = @intCast(dn_len);
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
+        }
+
+        // Option 119: Domain Search List (RFC 3397)
+        if (isRequested(prl, .DomainSearch) and self.cfg.domain_search.len > 0) {
+            if (opts_len + 2 < opts_buf.len) {
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], self.cfg.domain_search);
+                if (data_len > 0 and data_len <= 255) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
+                    opts_buf[opts_len + 1] = @intCast(data_len);
+                    opts_len += 2 + data_len;
+                }
+            }
         }
 
         // Inject operator-defined options from config (filtered by PRL)
@@ -1664,6 +1735,7 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .router = try allocator.dupe(u8, "192.168.1.1"),
         .dns_servers = try allocator.alloc([]const u8, 0),
         .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
         .lease_time = 3600,
         .state_dir = try allocator.dupe(u8, "/tmp"),
         .pool_start = try allocator.dupe(u8, ""),
@@ -2596,4 +2668,29 @@ test "removeLease on reserved lease keeps entry with expires=0 (RELEASE)" {
     try std.testing.expect(entry != null);
     try std.testing.expectEqual(@as(i64, 0), entry.?.expires);
     try std.testing.expect(entry.?.reserved);
+}
+
+test "encodeDnsSearchList: single and multiple domains" {
+    var buf: [128]u8 = undefined;
+
+    // Single domain: "example.com" → \x07example\x03com\x00
+    const domains1 = [_][]const u8{"example.com"};
+    const n1 = encodeDnsSearchList(&buf, &domains1);
+    try std.testing.expectEqual(@as(usize, 13), n1);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 }, buf[0..n1]);
+
+    // Trailing dot stripped: "local." same as "local"
+    const domains2 = [_][]const u8{"local."};
+    const n2 = encodeDnsSearchList(&buf, &domains2);
+    try std.testing.expectEqual(@as(usize, 7), n2);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 'l', 'o', 'c', 'a', 'l', 0 }, buf[0..n2]);
+
+    // Multiple domains concatenated: ["stardust.lan", "local"]
+    const domains3 = [_][]const u8{ "stardust.lan", "local" };
+    const n3 = encodeDnsSearchList(&buf, &domains3);
+    // "stardust.lan" → \x08stardust\x03lan\x00 = 15 bytes
+    // "local"        → \x05local\x00            = 7 bytes
+    try std.testing.expectEqual(@as(usize, 22), n3);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 's', 't', 'a', 'r', 'd', 'u', 's', 't', 3, 'l', 'a', 'n', 0 }, buf[0..14]);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 'l', 'o', 'c', 'a', 'l', 0 }, buf[14..21]);
 }
