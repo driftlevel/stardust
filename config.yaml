@@ -14,7 +14,26 @@ dns_servers:
   - "8.8.8.8"
   - "8.8.4.4"
 
-domain_name: "example.com"
+domain_name: "stardust.lan"
+
+# Domain search list (option 119, RFC 3397) — sent to clients so short
+# hostnames are resolved against these domains in order.
+# domain_search:
+#   - "stardust.lan"
+#   - "local"
+
+# Time configuration
+# time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000 = UTC-5, 3600 = UTC+1
+# time_servers:         # RFC 868 time servers (option 4); legacy protocol
+#   - "192.168.1.1"
+# ntp_servers:          # NTP servers (option 42); preferred over time_servers for modern clients
+#   - "192.168.1.1"
+# log_servers:          # Log servers / syslog (option 7)
+#   - "192.168.1.1"
+
+# PXE / TFTP network boot (options 66 and 67)
+# tftp_server_name: "192.168.1.1"   # TFTP server hostname or IP
+# boot_filename: "pxelinux.0"       # boot file; use "ipxe.efi" for UEFI PXE
 
 # State storage
 state_dir: "/var/lib/stardust"
@@ -23,10 +42,26 @@ state_dir: "/var/lib/stardust"
 dns_update:
   enable: false
   server: "127.0.0.1"
-  zone: "example.com"
+  zone: "stardust.lan"
   key_name: "dhcp-update"
-  key_file: "/etc/bind/key.dhcp-update.key"
+  key_file: "dhcp-update.key"
 
-# Additional DHCP options
-dhcp_options:
-  # option_name: value
+# Static routes (options 33 and 121) — sent per client PRL request.
+# Use the top-level 'router' option for the default gateway (0.0.0.0/0 is not allowed here).
+# static_routes:
+#   - destination: "10.10.10.0/24"
+#     router: "192.168.1.1"
+#   - destination: "172.16.0.0/12"
+#     router: "192.168.1.254"
+
+# Static reservations — pin a MAC (or client_id) to a specific IP
+# reservations:
+#   - mac: "aa:bb:cc:dd:ee:ff"
+#     ip: "192.168.1.50"
+#     hostname: "printer"           # optional; sent to client via option 12
+#     client_id: "01aabbccddeeff"  # optional; hex string matching option 61
+
+# Additional DHCP options (use numeric option codes as keys)
+# dhcp_options:
+#   "42": "192.168.1.1"  # NTP server
+dhcp_options: {}

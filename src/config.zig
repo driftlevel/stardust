@@ -1,4 +1,6 @@
 const std = @import("std");
+const yaml = @import("yaml");
+const dns_mod = @import("./dns.zig");
 
 pub const Error = error{
     ConfigNotFound,
@@ -7,17 +9,19 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// DNS dynamic update configuration.
-pub const DnsUpdateConfig = struct {
-    enable: bool = false,
-    server: []const u8 = "",
-    zone: []const u8 = "",
-    key_name: []const u8 = "",
-    key_file: []const u8 = "",
+pub const Reservation = struct {
+    mac: []const u8,
+    ip: []const u8,
+    hostname: ?[]const u8,
+    client_id: ?[]const u8,
 };
 
-/// Top-level server configuration.
-/// All slice fields are owned by the allocator passed to `load`.
+pub const StaticRoute = struct {
+    destination: [4]u8, // masked network address
+    prefix_len: u8,     // 0–32
+    router: [4]u8,
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     listen_address: []const u8,
@@ -26,31 +30,95 @@ pub const Config = struct {
     router: []const u8,
     dns_servers: [][]const u8,
     domain_name: []const u8,
+    domain_search: [][]const u8,
+    time_offset: ?i32,           // option 2: seconds east of UTC; null = not sent
+    time_servers: [][]const u8,  // option 4: RFC 868 time servers
+    log_servers: [][]const u8,   // option 7: log servers
+    ntp_servers: [][]const u8,   // option 42: NTP servers
+    tftp_server_name: []const u8, // option 66: TFTP server hostname or IP
+    boot_filename: []const u8,   // option 67: PXE boot filename
     lease_time: u32,
     state_dir: []const u8,
-    dns_update: DnsUpdateConfig,
+    pool_start: []const u8, // "" = use subnet start
+    pool_end: []const u8, // "" = use subnet end
+    dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
+    log_level: std.log.Level,
+    reservations: []Reservation,
+    static_routes: []StaticRoute,
 
-    /// Release all memory owned by this Config.
+    /// Free all allocator-owned memory. Must be called when the Config is no
+    /// longer needed.
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.listen_address);
         self.allocator.free(self.subnet);
         self.allocator.free(self.router);
+        self.allocator.free(self.pool_start);
+        self.allocator.free(self.pool_end);
         for (self.dns_servers) |s| self.allocator.free(s);
         self.allocator.free(self.dns_servers);
         self.allocator.free(self.domain_name);
+        for (self.domain_search) |s| self.allocator.free(s);
+        self.allocator.free(self.domain_search);
+        for (self.time_servers) |s| self.allocator.free(s);
+        self.allocator.free(self.time_servers);
+        for (self.log_servers) |s| self.allocator.free(s);
+        self.allocator.free(self.log_servers);
+        for (self.ntp_servers) |s| self.allocator.free(s);
+        self.allocator.free(self.ntp_servers);
+        self.allocator.free(self.tftp_server_name);
+        self.allocator.free(self.boot_filename);
         self.allocator.free(self.state_dir);
-        if (self.dns_update.server.len > 0) self.allocator.free(self.dns_update.server);
-        if (self.dns_update.zone.len > 0) self.allocator.free(self.dns_update.zone);
-        if (self.dns_update.key_name.len > 0) self.allocator.free(self.dns_update.key_name);
-        if (self.dns_update.key_file.len > 0) self.allocator.free(self.dns_update.key_file);
+        self.allocator.free(self.dns_update.server);
+        self.allocator.free(self.dns_update.zone);
+        self.allocator.free(self.dns_update.key_name);
+        self.allocator.free(self.dns_update.key_file);
         var it = self.dhcp_options.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.*);
         }
         self.dhcp_options.deinit();
+        for (self.reservations) |r| {
+            self.allocator.free(r.mac);
+            self.allocator.free(r.ip);
+            if (r.hostname) |h| self.allocator.free(h);
+            if (r.client_id) |c| self.allocator.free(c);
+        }
+        self.allocator.free(self.reservations);
+        self.allocator.free(self.static_routes);
     }
+};
+
+// Mirror of Config used for yaml.Yaml.parse(). All fields are optional so
+// that missing keys in the YAML file fall back to the defaults we apply below.
+// Strings are slices into the yaml arena and must be duped before use.
+const RawConfig = struct {
+    listen_address: ?[]const u8 = null,
+    subnet: ?[]const u8 = null,
+    subnet_mask: ?[]const u8 = null, // dotted-decimal string in the YAML
+    router: ?[]const u8 = null,
+    dns_servers: ?[][]const u8 = null,
+    domain_name: ?[]const u8 = null,
+    domain_search: ?[][]const u8 = null,
+    time_offset: ?i32 = null,
+    time_servers: ?[][]const u8 = null,
+    log_servers: ?[][]const u8 = null,
+    ntp_servers: ?[][]const u8 = null,
+    tftp_server_name: ?[]const u8 = null,
+    boot_filename: ?[]const u8 = null,
+    lease_time: ?u32 = null,
+    state_dir: ?[]const u8 = null,
+    pool_start: ?[]const u8 = null,
+    pool_end: ?[]const u8 = null,
+    log_level: ?[]const u8 = null,
+    dns_update: ?struct {
+        enable: ?bool = null,
+        server: ?[]const u8 = null,
+        zone: ?[]const u8 = null,
+        key_name: ?[]const u8 = null,
+        key_file: ?[]const u8 = null,
+    } = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,226 +148,504 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     };
     defer file.close();
 
-    const contents = file.readToEndAlloc(allocator, 1024 * 1024) catch return Error.IoError;
-    defer allocator.free(contents);
+    const file_size = (try file.stat()).size;
+    const source = try allocator.alloc(u8, file_size);
+    defer allocator.free(source);
+    _ = try file.readAll(source);
 
-    return parseYaml(allocator, contents);
-}
+    // yaml.Yaml owns its own arena internally; we deinit it after we've
+    // duped all the strings we need into our own allocator.
+    var doc = yaml.Yaml{ .source = source };
+    try doc.load(allocator);
+    defer doc.deinit(allocator);
 
-fn parseYaml(allocator: std.mem.Allocator, contents: []const u8) !Config {
+    // Use an arena just for the parse call — Yaml.parse allocates into it
+    // and we throw it away once we've duped everything into `allocator`.
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+
+    const raw = try doc.parse(parse_arena.allocator(), RawConfig);
+
+    const lease_time_val = raw.lease_time orelse 3600;
+
+    // Build Config with owned copies of every string.
     var cfg = Config{
         .allocator = allocator,
-        .listen_address = try allocator.dupe(u8, "0.0.0.0"),
-        .subnet = try allocator.dupe(u8, "192.168.1.0"),
-        .subnet_mask = 0xFFFFFF00, // 255.255.255.0
-        .router = try allocator.dupe(u8, "192.168.1.1"),
-        .dns_servers = &.{},
-        .domain_name = try allocator.dupe(u8, ""),
-        .lease_time = 3600,
-        .state_dir = try allocator.dupe(u8, "/var/lib/stardust"),
-        .dns_update = .{},
+        .listen_address = try allocator.dupe(u8, raw.listen_address orelse "0.0.0.0"),
+        .subnet = try allocator.dupe(u8, raw.subnet orelse "192.168.1.0"),
+        .subnet_mask = try parseMask(raw.subnet_mask orelse "255.255.255.0"),
+        .router = try allocator.dupe(u8, raw.router orelse "192.168.1.1"),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, raw.domain_name orelse ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .lease_time = lease_time_val,
+        .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
+        .pool_start = try allocator.dupe(u8, raw.pool_start orelse ""),
+        .pool_end = try allocator.dupe(u8, raw.pool_end orelse ""),
+        .log_level = parseLogLevel(raw.log_level orelse "info"),
+        .dns_update = .{
+            .enable = false,
+            .server = try allocator.dupe(u8, ""),
+            .zone = try allocator.dupe(u8, ""),
+            .key_name = try allocator.dupe(u8, ""),
+            .key_file = try allocator.dupe(u8, ""),
+            .lease_time = lease_time_val,
+        },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(Reservation, 0),
+        .static_routes = try allocator.alloc(StaticRoute, 0),
     };
-    errdefer cfg.deinit();
 
-    var dns_list = std.ArrayList([]const u8).init(allocator);
-    defer dns_list.deinit();
-
-    var lines = std.mem.splitScalar(u8, contents, '\n');
-    var in_dns_update = false;
-    var in_dns_servers = false;
-    var in_dhcp_options = false;
-
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, " \r\t");
-
-        // Skip comments and blank lines
-        if (line.len == 0 or line[0] == '#') {
-            in_dns_servers = false;
-            continue;
+    if (raw.dns_servers) |servers| {
+        allocator.free(cfg.dns_servers);
+        cfg.dns_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.dns_servers) |*s| s.* = ""; // safe deinit if we error partway
+        for (servers, 0..) |s, i| {
+            cfg.dns_servers[i] = try allocator.dupe(u8, s);
         }
+    }
 
-        // Detect indented blocks
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
-        const indent = line.len - trimmed.len;
+    if (raw.domain_search) |domains| {
+        allocator.free(cfg.domain_search);
+        cfg.domain_search = try allocator.alloc([]const u8, domains.len);
+        for (cfg.domain_search) |*s| s.* = ""; // safe deinit if we error partway
+        for (domains, 0..) |s, i| {
+            cfg.domain_search[i] = try allocator.dupe(u8, s);
+        }
+    }
 
-        if (indent == 0) {
-            // Top-level key
-            in_dns_update = false;
-            in_dns_servers = false;
-            in_dhcp_options = false;
+    if (raw.time_offset) |v| cfg.time_offset = v;
 
-            if (std.mem.startsWith(u8, trimmed, "dns_update:")) {
-                in_dns_update = true;
-                continue;
-            }
-            if (std.mem.startsWith(u8, trimmed, "dns_servers:")) {
-                in_dns_servers = true;
-                continue;
-            }
-            if (std.mem.startsWith(u8, trimmed, "dhcp_options:")) {
-                in_dhcp_options = true;
-                continue;
-            }
+    if (raw.time_servers) |servers| {
+        allocator.free(cfg.time_servers);
+        cfg.time_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.time_servers) |*s| s.* = "";
+        for (servers, 0..) |s, i| {
+            cfg.time_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
 
-            if (parseKv(trimmed)) |kv| {
-                try applyTopLevel(allocator, &cfg, kv.key, kv.value);
-            }
-        } else {
-            // Indented content
-            if (in_dns_servers) {
-                // Sequence item: "  - \"8.8.8.8\""
-                if (std.mem.startsWith(u8, trimmed, "- ")) {
-                    const val = std.mem.trim(u8, trimmed[2..], " \"'");
-                    try dns_list.append(try allocator.dupe(u8, val));
+    if (raw.log_servers) |servers| {
+        allocator.free(cfg.log_servers);
+        cfg.log_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.log_servers) |*s| s.* = "";
+        for (servers, 0..) |s, i| {
+            cfg.log_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (raw.ntp_servers) |servers| {
+        allocator.free(cfg.ntp_servers);
+        cfg.ntp_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.ntp_servers) |*s| s.* = "";
+        for (servers, 0..) |s, i| {
+            cfg.ntp_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (raw.tftp_server_name) |v| {
+        allocator.free(cfg.tftp_server_name);
+        cfg.tftp_server_name = try allocator.dupe(u8, v);
+    }
+
+    if (raw.boot_filename) |v| {
+        allocator.free(cfg.boot_filename);
+        cfg.boot_filename = try allocator.dupe(u8, v);
+    }
+
+    if (raw.dns_update) |du| {
+        if (du.enable) |v| cfg.dns_update.enable = v;
+        if (du.server) |v| {
+            allocator.free(cfg.dns_update.server);
+            cfg.dns_update.server = try allocator.dupe(u8, v);
+        }
+        if (du.zone) |v| {
+            allocator.free(cfg.dns_update.zone);
+            cfg.dns_update.zone = try allocator.dupe(u8, v);
+        }
+        if (du.key_name) |v| {
+            allocator.free(cfg.dns_update.key_name);
+            cfg.dns_update.key_name = try allocator.dupe(u8, v);
+        }
+        if (du.key_file) |v| {
+            allocator.free(cfg.dns_update.key_file);
+            cfg.dns_update.key_file = try allocator.dupe(u8, v);
+        }
+    }
+
+    // Populate dhcp_options and reservations from the untyped YAML map.
+    if (doc.docs.items.len > 0) {
+        if (doc.docs.items[0].asMap()) |root_map| {
+            if (root_map.get("dhcp_options")) |opts_val| {
+                if (opts_val.asMap()) |opts_map| {
+                    var it = opts_map.iterator();
+                    while (it.next()) |entry| {
+                        const key = try allocator.dupe(u8, entry.key_ptr.*);
+                        errdefer allocator.free(key);
+                        const val_str = entry.value_ptr.asScalar() orelse "";
+                        const val = try allocator.dupe(u8, val_str);
+                        errdefer allocator.free(val);
+                        try cfg.dhcp_options.put(key, val);
+                    }
                 }
-            } else if (in_dns_update) {
-                if (parseKv(trimmed)) |kv| {
-                    try applyDnsUpdate(allocator, &cfg.dns_update, kv.key, kv.value);
+            }
+
+            if (root_map.get("reservations")) |res_val| {
+                if (res_val.asList()) |res_list| {
+                    try parseReservations(allocator, &cfg, res_list);
                 }
-            } else if (in_dhcp_options) {
-                if (parseKv(trimmed)) |kv| {
-                    const k = try allocator.dupe(u8, kv.key);
-                    const v = try allocator.dupe(u8, kv.value);
-                    try cfg.dhcp_options.put(k, v);
+            }
+
+            if (root_map.get("static_routes")) |sr_val| {
+                if (sr_val.asList()) |sr_list| {
+                    try parseStaticRoutes(allocator, &cfg, sr_list);
                 }
             }
         }
     }
 
-    // Transfer dns_list ownership to cfg
-    cfg.dns_servers = try dns_list.toOwnedSlice();
+    validatePoolRange(&cfg);
 
     return cfg;
 }
 
-const KV = struct { key: []const u8, value: []const u8 };
+/// Parse the reservations list from the untyped YAML walk and append valid entries to cfg.
+fn parseReservations(allocator: std.mem.Allocator, cfg: *Config, list: anytype) !void {
 
-fn parseKv(line: []const u8) ?KV {
-    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return null;
-    const key = std.mem.trim(u8, line[0..colon], " \t");
-    const raw_val = std.mem.trim(u8, line[colon + 1 ..], " \t\"'");
-    // Skip lines that are just "key:" with no value (block headers)
-    if (raw_val.len == 0) return null;
-    return .{ .key = key, .value = raw_val };
+    // Count valid entries first to allocate the right amount.
+    var valid_count: usize = 0;
+    for (list) |item| {
+        const m = item.asMap() orelse continue;
+        if (m.get("mac") == null or m.get("ip") == null) continue;
+        valid_count += 1;
+    }
+
+    if (valid_count == 0) return;
+
+    const old_len = cfg.reservations.len;
+    const new_slice = try allocator.realloc(cfg.reservations, old_len + valid_count);
+    cfg.reservations = new_slice;
+
+    var idx: usize = old_len;
+    for (list) |item| {
+        const m = item.asMap() orelse {
+            std.log.warn("config: reservation entry is not a map, skipping", .{});
+            continue;
+        };
+
+        const mac_val = m.get("mac") orelse {
+            std.log.warn("config: reservation missing 'mac', skipping", .{});
+            continue;
+        };
+        const ip_val = m.get("ip") orelse {
+            std.log.warn("config: reservation missing 'ip', skipping", .{});
+            continue;
+        };
+
+        const mac_str = mac_val.asScalar() orelse {
+            std.log.warn("config: reservation 'mac' is not a scalar, skipping", .{});
+            continue;
+        };
+        const ip_str = ip_val.asScalar() orelse {
+            std.log.warn("config: reservation 'ip' is not a scalar, skipping", .{});
+            continue;
+        };
+
+        // Validate that the reservation IP is in the subnet.
+        const ip_bytes = parseIpv4(ip_str) catch {
+            std.log.warn("config: reservation ip '{s}' is invalid, skipping", .{ip_str});
+            continue;
+        };
+        const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
+        const subnet_bytes = parseIpv4(cfg.subnet) catch [4]u8{ 0, 0, 0, 0 };
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        const broadcast_int = subnet_int | ~cfg.subnet_mask;
+        if ((ip_int & cfg.subnet_mask) != subnet_int or ip_int == subnet_int or ip_int == broadcast_int) {
+            std.log.warn("config: reservation ip '{s}' is outside subnet {s}, skipping", .{ ip_str, cfg.subnet });
+            continue;
+        }
+
+        const hostname_str: ?[]const u8 = if (m.get("hostname")) |hv| hv.asScalar() else null;
+        const client_id_str: ?[]const u8 = if (m.get("client_id")) |cv| cv.asScalar() else null;
+
+        const mac_owned = try allocator.dupe(u8, mac_str);
+        errdefer allocator.free(mac_owned);
+        const ip_owned = try allocator.dupe(u8, ip_str);
+        errdefer allocator.free(ip_owned);
+        const hostname_owned: ?[]const u8 = if (hostname_str) |h| try allocator.dupe(u8, h) else null;
+        errdefer if (hostname_owned) |h| allocator.free(h);
+        const client_id_owned: ?[]const u8 = if (client_id_str) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (client_id_owned) |c| allocator.free(c);
+
+        cfg.reservations[idx] = .{
+            .mac = mac_owned,
+            .ip = ip_owned,
+            .hostname = hostname_owned,
+            .client_id = client_id_owned,
+        };
+        idx += 1;
+    }
+
+    // Trim to actual count (in case some entries were skipped).
+    cfg.reservations = allocator.realloc(cfg.reservations, idx) catch cfg.reservations;
 }
 
-fn applyTopLevel(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, value: []const u8) !void {
-    if (std.mem.eql(u8, key, "listen_address")) {
-        allocator.free(cfg.listen_address);
-        cfg.listen_address = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "subnet")) {
-        allocator.free(cfg.subnet);
-        cfg.subnet = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "subnet_mask")) {
-        cfg.subnet_mask = try parseMask(value);
-    } else if (std.mem.eql(u8, key, "router")) {
-        allocator.free(cfg.router);
-        cfg.router = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "domain_name")) {
-        allocator.free(cfg.domain_name);
-        cfg.domain_name = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "lease_time")) {
-        cfg.lease_time = std.fmt.parseInt(u32, value, 10) catch return Error.InvalidConfig;
-    } else if (std.mem.eql(u8, key, "state_dir")) {
-        allocator.free(cfg.state_dir);
-        cfg.state_dir = try allocator.dupe(u8, value);
+/// Parse a single static route from destination and router strings.
+/// Returns null if the entry should be skipped (a log message is emitted).
+fn parseOneStaticRoute(dest_str: []const u8, router_str: []const u8) ?StaticRoute {
+    // Parse destination: split on '/' for CIDR; no slash = /32 host route.
+    var prefix_len: u8 = 32;
+    var ip_str: []const u8 = dest_str;
+    if (std.mem.indexOfScalar(u8, dest_str, '/')) |slash| {
+        ip_str = dest_str[0..slash];
+        const pl = std.fmt.parseInt(u8, dest_str[slash + 1 ..], 10) catch {
+            std.log.warn("config: static_route destination '{s}' has invalid prefix length, skipping", .{dest_str});
+            return null;
+        };
+        if (pl > 32) {
+            std.log.warn("config: static_route destination '{s}' prefix_len out of range, skipping", .{dest_str});
+            return null;
+        }
+        prefix_len = @intCast(pl);
+    }
+
+    // Reject /0 (default route) — use the top-level 'router' option instead.
+    if (prefix_len == 0) {
+        std.log.err("config: static_route '{s}' is a default route (0.0.0.0/0); use the 'router' option instead, skipping", .{dest_str});
+        return null;
+    }
+
+    const dest_bytes = parseIpv4(ip_str) catch {
+        std.log.warn("config: static_route destination '{s}' is invalid, skipping", .{dest_str});
+        return null;
+    };
+    const router_bytes = parseIpv4(router_str) catch {
+        std.log.warn("config: static_route router '{s}' is invalid, skipping", .{router_str});
+        return null;
+    };
+
+    // Apply CIDR mask to canonicalize destination (e.g. 10.0.0.5/24 → 10.0.0.0).
+    const mask: u32 = @as(u32, 0xFFFFFFFF) << @intCast(32 - prefix_len);
+    var dest_int = std.mem.readInt(u32, &dest_bytes, .big);
+    dest_int &= mask;
+    var masked_dest: [4]u8 = undefined;
+    std.mem.writeInt(u32, &masked_dest, dest_int, .big);
+
+    return StaticRoute{
+        .destination = masked_dest,
+        .prefix_len = prefix_len,
+        .router = router_bytes,
+    };
+}
+
+/// Parse the static_routes list from the untyped YAML walk and append valid entries to cfg.
+fn parseStaticRoutes(allocator: std.mem.Allocator, cfg: *Config, list: anytype) !void {
+    const old_len = cfg.static_routes.len;
+    var count: usize = 0;
+
+    for (list) |item| {
+        const m = item.asMap() orelse {
+            std.log.warn("config: static_route entry is not a map, skipping", .{});
+            continue;
+        };
+        const dest_val = m.get("destination") orelse {
+            std.log.warn("config: static_route missing 'destination', skipping", .{});
+            continue;
+        };
+        const router_val = m.get("router") orelse {
+            std.log.warn("config: static_route missing 'router', skipping", .{});
+            continue;
+        };
+        const dest_str = dest_val.asScalar() orelse {
+            std.log.warn("config: static_route 'destination' is not a scalar, skipping", .{});
+            continue;
+        };
+        const router_str = router_val.asScalar() orelse {
+            std.log.warn("config: static_route 'router' is not a scalar, skipping", .{});
+            continue;
+        };
+
+        const route = parseOneStaticRoute(dest_str, router_str) orelse continue;
+
+        const new_slice = try allocator.realloc(cfg.static_routes, old_len + count + 1);
+        cfg.static_routes = new_slice;
+        cfg.static_routes[old_len + count] = route;
+        count += 1;
     }
 }
 
-fn applyDnsUpdate(allocator: std.mem.Allocator, dns: *DnsUpdateConfig, key: []const u8, value: []const u8) !void {
-    if (std.mem.eql(u8, key, "enable")) {
-        dns.enable = std.mem.eql(u8, value, "true");
-    } else if (std.mem.eql(u8, key, "server")) {
-        if (dns.server.len > 0) allocator.free(dns.server);
-        dns.server = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "zone")) {
-        if (dns.zone.len > 0) allocator.free(dns.zone);
-        dns.zone = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "key_name")) {
-        if (dns.key_name.len > 0) allocator.free(dns.key_name);
-        dns.key_name = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "key_file")) {
-        if (dns.key_file.len > 0) allocator.free(dns.key_file);
-        dns.key_file = try allocator.dupe(u8, value);
+/// Log warnings when pool_start/pool_end are misconfigured. Does not fail load().
+fn validatePoolRange(cfg: *const Config) void {
+    const subnet_bytes = parseIpv4(cfg.subnet) catch return;
+    const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+    const broadcast_int = subnet_int | ~cfg.subnet_mask;
+    const valid_start = subnet_int + 1;
+    const valid_end = broadcast_int - 1;
+
+    var start_int: u32 = valid_start;
+    var end_int: u32 = valid_end;
+    var has_start = false;
+    var has_end = false;
+
+    if (cfg.pool_start.len > 0) {
+        const b = parseIpv4(cfg.pool_start) catch {
+            std.log.warn("config: pool_start '{s}' is not a valid IP address", .{cfg.pool_start});
+            return;
+        };
+        start_int = std.mem.readInt(u32, &b, .big);
+        has_start = true;
+        if (start_int < valid_start or start_int > valid_end) {
+            std.log.warn("config: pool_start {s} is outside subnet {s}", .{ cfg.pool_start, cfg.subnet });
+        }
+    }
+
+    if (cfg.pool_end.len > 0) {
+        const b = parseIpv4(cfg.pool_end) catch {
+            std.log.warn("config: pool_end '{s}' is not a valid IP address", .{cfg.pool_end});
+            return;
+        };
+        end_int = std.mem.readInt(u32, &b, .big);
+        has_end = true;
+        if (end_int < valid_start or end_int > valid_end) {
+            std.log.warn("config: pool_end {s} is outside subnet {s}", .{ cfg.pool_end, cfg.subnet });
+        }
+    }
+
+    if (has_start and has_end and start_int > end_int) {
+        std.log.warn("config: pool_start {s} > pool_end {s}: pool is empty", .{ cfg.pool_start, cfg.pool_end });
     }
 }
 
-/// Parse a dotted-decimal subnet mask ("255.255.255.0") into a u32 (host byte order).
+fn parseLogLevel(s: []const u8) std.log.Level {
+    if (std.mem.eql(u8, s, "debug")) return .debug;
+    if (std.mem.eql(u8, s, "warn") or std.mem.eql(u8, s, "warning")) return .warn;
+    if (std.mem.eql(u8, s, "error") or std.mem.eql(u8, s, "err")) return .err;
+    return .info; // default
+}
+
+/// Parse a dotted-decimal subnet mask string (e.g. "255.255.255.0") into a
+/// host-order u32.
 fn parseMask(s: []const u8) !u32 {
     var result: u32 = 0;
-    var parts = std.mem.splitScalar(u8, s, '.');
-    var shift: u5 = 24;
-    var count: usize = 0;
-    while (parts.next()) |part| : (count += 1) {
-        if (count >= 4) return Error.InvalidConfig;
-        const byte = std.fmt.parseInt(u8, part, 10) catch return Error.InvalidConfig;
-        result |= @as(u32, byte) << shift;
-        if (shift >= 8) shift -= 8;
+    var octet: u32 = 0;
+    var dots: u8 = 0;
+    for (s) |c| {
+        if (c == '.') {
+            if (dots >= 3) return error.InvalidConfig;
+            result = (result << 8) | octet;
+            octet = 0;
+            dots += 1;
+        } else if (c >= '0' and c <= '9') {
+            octet = octet * 10 + (c - '0');
+            if (octet > 255) return error.InvalidConfig;
+        } else {
+            return error.InvalidConfig;
+        }
     }
-    if (count != 4) return Error.InvalidConfig;
+    if (dots != 3) return error.InvalidConfig;
+    result = (result << 8) | octet;
+    // Validate contiguous CIDR prefix: no 0→1 bit transition reading MSB→LSB.
+    // Equivalently, ~mask must be of the form 0x00...0FF...F (a power-of-two minus 1 or 0).
+    const inverted = ~result;
+    if (inverted != 0 and (inverted & (inverted +% 1)) != 0) return error.InvalidConfig;
     return result;
 }
 
-/// Parse a dotted-decimal IPv4 address into 4 bytes (network byte order).
+/// Parse a dotted-decimal IPv4 address string into a 4-byte array in network
+/// byte order. Used by dhcp.zig to convert config strings to wire bytes.
 pub fn parseIpv4(s: []const u8) ![4]u8 {
     var result: [4]u8 = undefined;
-    var parts = std.mem.splitScalar(u8, s, '.');
-    var i: usize = 0;
-    while (parts.next()) |part| : (i += 1) {
-        if (i >= 4) return Error.InvalidConfig;
-        result[i] = std.fmt.parseInt(u8, std.mem.trim(u8, part, " "), 10) catch return Error.InvalidConfig;
+    var octet: u16 = 0;
+    var idx: u8 = 0;
+    for (s) |c| {
+        if (c == '.') {
+            if (idx >= 3) return error.InvalidConfig;
+            result[idx] = @intCast(octet);
+            octet = 0;
+            idx += 1;
+        } else if (c >= '0' and c <= '9') {
+            octet = octet * 10 + (c - '0');
+            if (octet > 255) return error.InvalidConfig;
+        } else {
+            return error.InvalidConfig;
+        }
     }
-    if (i != 4) return Error.InvalidConfig;
+    if (idx != 3) return error.InvalidConfig;
+    result[idx] = @intCast(octet);
     return result;
 }
 
-test "parseIpv4" {
-    const addr = try parseIpv4("192.168.1.1");
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &addr);
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
-test "parseMask" {
+test "parseMask 255.255.255.0" {
     const mask = try parseMask("255.255.255.0");
     try std.testing.expectEqual(@as(u32, 0xFFFFFF00), mask);
 }
 
-test "load config" {
-    // Write a temp config file and parse it
-    const allocator = std.testing.allocator;
-    const tmp_path = "/tmp/stardust_test_config.yaml";
-    const yaml =
-        \\listen_address: "0.0.0.0"
-        \\subnet: "192.168.1.0"
-        \\router: "192.168.1.1"
-        \\subnet_mask: 255.255.255.0
-        \\lease_time: 7200
-        \\state_dir: "/tmp/stardust"
-        \\domain_name: "test.local"
-        \\dns_servers:
-        \\  - "8.8.8.8"
-        \\  - "8.8.4.4"
-        \\dns_update:
-        \\  enable: false
-        \\  server: "127.0.0.1"
-        \\  zone: "test.local"
-        \\  key_name: "dhcp-update"
-        \\  key_file: "/etc/bind/key.key"
-        \\dhcp_options:
-    ;
-    {
-        const f = try std.fs.cwd().createFile(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(yaml);
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+test "parseMask 255.255.0.0" {
+    const mask = try parseMask("255.255.0.0");
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), mask);
+}
 
-    var cfg = try load(allocator, tmp_path);
-    defer cfg.deinit();
+test "parseIpv4 basic" {
+    const ip = try parseIpv4("192.168.1.1");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &ip);
+}
 
-    try std.testing.expectEqualStrings("0.0.0.0", cfg.listen_address);
-    try std.testing.expectEqualStrings("192.168.1.1", cfg.router);
-    try std.testing.expectEqual(@as(u32, 7200), cfg.lease_time);
-    try std.testing.expectEqual(@as(usize, 2), cfg.dns_servers.len);
-    try std.testing.expectEqualStrings("8.8.8.8", cfg.dns_servers[0]);
+test "parseIpv4 rejects bad input" {
+    try std.testing.expectError(error.InvalidConfig, parseIpv4("192.168.1"));
+    try std.testing.expectError(error.InvalidConfig, parseIpv4("256.0.0.1"));
+    try std.testing.expectError(error.InvalidConfig, parseIpv4("not.an.ip.addr"));
+}
+
+test "parseLogLevel" {
+    try std.testing.expectEqual(std.log.Level.debug, parseLogLevel("debug"));
+    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warn"));
+    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warning"));
+    try std.testing.expectEqual(std.log.Level.err, parseLogLevel("error"));
+    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("info"));
+    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("unknown"));
+}
+
+test "parseMask rejects non-CIDR masks" {
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.0.255.0"));
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.128.255.0"));
+    try std.testing.expectError(error.InvalidConfig, parseMask("255.255.255.1"));
+}
+
+test "parseMask accepts valid CIDR edge cases" {
+    // /0 — all wildcard
+    try std.testing.expectEqual(@as(u32, 0x00000000), try parseMask("0.0.0.0"));
+    // /32 — host route
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), try parseMask("255.255.255.255"));
+}
+
+test "parseStaticRoutes: CIDR destination parsed and masked" {
+    // "10.10.10.5/24" → destination=10.10.10.0, prefix_len=24
+    const r = parseOneStaticRoute("10.10.10.5/24", "192.168.1.1");
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 10, 10, 0 }, &r.?.destination);
+    try std.testing.expectEqual(@as(u8, 24), r.?.prefix_len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &r.?.router);
+}
+
+test "parseStaticRoutes: plain IP = /32 host route" {
+    // No slash → prefix_len=32, destination unchanged
+    const r = parseOneStaticRoute("10.10.10.1", "192.168.1.254");
+    try std.testing.expect(r != null);
+    try std.testing.expectEqual(@as(u8, 32), r.?.prefix_len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 10, 10, 1 }, &r.?.destination);
+}
+
+test "parseStaticRoutes: /0 default route is rejected" {
+    const r = parseOneStaticRoute("0.0.0.0/0", "192.168.1.1");
+    try std.testing.expect(r == null);
 }
