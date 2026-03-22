@@ -13,6 +13,9 @@ pub const std_options: std.Options = .{
 };
 
 var g_log_level: std.log.Level = .info;
+// Set to true when stderr is connected to the systemd journal (JOURNAL_STREAM is set).
+// sd-daemon priority prefixes (<N>) are only emitted in that case.
+var g_journal_stream: bool = false;
 
 fn logFn(
     comptime level: std.log.Level,
@@ -36,7 +39,11 @@ fn logFn(
     };
     var ts_buf: [20]u8 = undefined;
     const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
-    std.debug.print(sd_prefix ++ "{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
+    if (g_journal_stream) {
+        std.debug.print(sd_prefix ++ "{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
+    } else {
+        std.debug.print("{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
+    }
 }
 
 fn fmtTimestamp(buf: *[20]u8, ts: i64) []const u8 {
@@ -85,6 +92,8 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    g_journal_stream = std.posix.getenv("JOURNAL_STREAM") != null;
 
     std.log.info("Starting Stardust DHCP Server...", .{});
 
