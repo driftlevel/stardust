@@ -1,286 +1,137 @@
 # AGENTS.md
 
-This file serves as a guide for agentic coding assistants working in this repository. It contains information about build commands, testing, code style, and conventions.
+Guide for agentic coding assistants working in this repository.
 
-## Build and Development Commands
+## Project
 
-This repository is a Zig project. Before running any commands, ensure you have Zig installed on your system.
+Stardust is a DHCP server (RFC 2131/2132) written in **Zig 0.15.x**. It
+manages IP leases, integrates with RFC 2136 dynamic DNS updates, and supports
+active-active redundancy via UDP lease synchronisation. Configuration is YAML.
 
-### Building the Project
-
-```bash
-zig build
-```
-
-This compiles the project using the build.zig build configuration and runs the default target (typically a release build).
-
-### Development Builds
+## Commands
 
 ```bash
-zig build -Doptimize=Debug
+zig build                                   # build (release)
+zig build -Doptimize=Debug                  # build (debug)
+zig build test                              # run all tests
+zig build test -Dtest_filter="test name"    # run one test by name substring
+zig fmt .                                   # format all Zig files
+zig build check                             # type-check without emitting binary
 ```
 
-Build with debug symbols for development and testing.
+Always run `zig build test` after changes. All tests must pass before committing.
 
-### Running Tests
+## Architecture
 
-```bash
-zig build test
+```
+main.zig
+  ├── src/config.zig   — YAML config loading (uses zig-yaml)
+  ├── src/state.zig    — Lease store; persists to leases.json
+  ├── src/dns.zig      — RFC 2136 DNS UPDATE with TSIG auth
+  ├── src/dhcp.zig     — Core DHCP server (UDP port 67, poll-based loop)
+  ├── src/sync.zig     — Lease sync protocol (UDP, AES-256-GCM, port 647)
+  └── src/probe.zig    — Pre-offer conflict detection (ARP/ICMP)
 ```
 
-Run all tests in the project.
+- `config.zig` imports `dns.zig` for `dns_mod.Config`; **`dns.zig` must not
+  import `config.zig`** — circular dependency.
+- `std_options` / `logFn` must live in `main.zig` (root module only).
+- `sync.zig` reuses `dns_mod.parseTsigKey`, `TsigKey`, and `Algorithm` (all
+  declared `pub` in `dns.zig`).
 
-### Running a Single Test
+## Zig 0.15.x API — common pitfalls
 
-Use the test filter option to run a specific test:
+These APIs differ from older Zig versions and from what most LLM training data
+reflects. Get these right.
 
-```bash
-zig build test -Dtest_filter="test_name"
-```
-
-Replace `test_name` with the actual name of the test you want to run.
-
-### Formatting and Linting
-
-Zig has built-in formatting:
-
-```bash
-zig fmt .
-```
-
-This will format all Zig files in the current directory and its subdirectories.
-
-### Checking Style
-
-There's no separate linter in Zig yet, but you can use the build system's `check` command:
-
-```bash
-zig build check
-```
-
-## Code Style Guidelines
-
-### General Principles
-
-- Follow standard Zig conventions and idioms
-- Keep code clear and readable over clever optimizations
-- Use descriptive names for variables, functions, and types
-- Prefer explicit over implicit
-
-### Imports
-
-- Import only what you need
-- Group imports in this order:
-  1. Zig standard library imports
-  2. External dependencies
-  3. Local module imports
-
-Example:
+**ArrayList is now unmanaged** — no `init(allocator)`:
 ```zig
-const std = @import("std");
-const some_external = @import("some_external");
-const local_module = @import("./local_module.zig");
+// WRONG (old API):
+var list = std.ArrayList(T).init(allocator);
+list.append(item);
+list.deinit();
+
+// CORRECT (0.15.x):
+var list = std.ArrayList(T){};
+try list.append(allocator, item);
+list.deinit(allocator);
 ```
 
-### Formatting
-
-- Use 4-space indentation (or tabs if the project prefers)
-- Limit lines to 80-100 characters where reasonable
-- Follow zig fmt output for all formatting decisions
-- No trailing whitespace
-- One blank line between function definitions
-- Blank line after imports before first function/type definition
-
-### Types and Naming
-
-- Use PascalCase for type names (structs, enums, unions, error sets)
-- Use camelCase for variables and functions
-- Use snake_case for constants
-- Use ALL_CAPS for global constants that are truly constant
-
-Examples:
+**JSON stringify** — `stringifyAlloc` was removed:
 ```zig
-const PI = 3.14159;
-const MAX_SIZE = 1024;
-
-pub const MyStruct = struct {
-    pub fn myFunction() void {
-        const localVar = 42;
-    }
-};
+// WRONG:  std.json.stringifyAlloc(allocator, value, .{})
+// CORRECT:
+const s = try std.json.Stringify.valueAlloc(allocator, value, .{});
 ```
 
-### Error Handling
-
-- Zig's error union approach is preferred:
+**HKDF** — `extract` returns the PRK, does not write to a pointer:
 ```zig
-pub fn divide(a: i32, b: i32) !i32 {
-    if (b == 0) return error.DivisionByZero;
-    return a / b;
+// WRONG:  HkdfSha256.extract(&prk, salt, ikm);
+// CORRECT:
+const prk = HkdfSha256.extract(salt, ikm);
+```
+
+**AES-GCM** — the `tag` parameter is `*[tag_length]u8`, not `[]u8`. Getting a
+pointer-to-fixed-array from a runtime offset requires the two-step slice:
+```zig
+// WRONG:  buf[start .. start + 16]          → type []u8
+// CORRECT:
+buf[start..][0..16]                          // → type *[16]u8
+```
+
+**`std.posix.timeval`** fields: `.sec` and `.usec` (not `.tv_sec`/`.tv_usec`).
+
+**`nosuspend`** does not exist in 0.15.x — remove it if encountered.
+
+**`build.zig`** must use the module API, not `root_source_file:`:
+```zig
+const mod = b.createModule(.{ .root_source_file = b.path("main.zig"), ... });
+mod.addImport("yaml", yaml_mod);
+const exe = b.addExecutable(.{ .name = "stardust", .root_module = mod });
+```
+
+## Dependencies
+
+Single external dep: `zig-yaml` v0.2.0. It is declared in `build.zig.zon` and
+passed to the main module in `build.zig`. If you add a new module that needs
+YAML, follow the same `addImport` pattern in `build.zig`.
+
+**zig-yaml untyped walk pattern** (typed parse does not support StringHashMap):
+```zig
+const root = doc.docs.items[0].asMap() orelse return;
+if (root.get("key")) |val| {
+    if (val.asScalar()) |s| { ... }
+    if (val.asList()) |list| { for (list) |item| { ... } }
+    if (val.asMap()) |m| { ... }
 }
 ```
 
-- Define custom error sets for your module:
-```zig
-const Error = error{
-    InvalidInput,
-    OutOfRange,
-    NotFound,
-};
-```
+## Naming conventions
 
-- When calling functions that return errors, handle them appropriately:
-```zig
-const result = try someFunction();
-// or
-const result = someFunction() catch |err| {
-    return err;
-};
-```
+| Kind | Style |
+|---|---|
+| Types (struct, enum, error set) | `PascalCase` |
+| Functions, variables | `camelCase` |
+| Constants | `snake_case` or `ALL_CAPS` |
+| Test names | plain English, `"verb: subject detail"` |
 
-- For APIs that should not fail, use `unreachable` where appropriate
+## Key design patterns
 
-### Memory Management
+**Config parsing** (`src/config.zig`): two-phase — untyped YAML walk into a
+`Config` struct with allocated strings; callers call `cfg.deinit()` to free.
 
-- Use Zig's allocators consistently
-- Prefer stack allocation when possible
-- Use ArenaAllocator for temporary allocations
-- Always check allocation results
-- Use proper ownership semantics
+**State store** (`src/state.zig`): `addLease()` dupes all strings; the store
+owns them. `removeLease()` on a reserved lease zeroes `expires` rather than
+deleting. `forceRemoveLease()` deletes unconditionally (used by sync).
 
-Example:
-```zig
-const allocator = std.heap.page_allocator;
-const buffer = try allocator.alloc(u8, 1024);
-defer allocator.free(buffer);
-```
+**Lease fields**: `reserved: bool = false` and `last_modified: i64 = 0` both
+default to zero for JSON backward-compatibility.
 
-### Functions
+**Sync crypto**: HKDF-SHA-256 derives a 32-byte AES-256-GCM key from the TSIG
+secret. Every datagram has a 26-byte authenticated-data header (version, type,
+timestamp, nonce, payload_len) followed by ciphertext and a 16-byte AEAD tag.
+Anti-replay window: ±300 s on the timestamp field.
 
-- Keep functions small and focused (preferably under 50 lines)
-- Document preconditions and postconditions in comments
-- Use clear parameter names
-- Try to keep function signatures on one line when possible
-- Use multiple lines for complex signatures
-
-### Comments
-
-- Use /// for documentation comments (visible to zig doc)
-- Use // for implementation comments
-- Explain WHY, not WHAT
-- Don't comment obvious code
-- Keep line comments short
-
-Documentation comment example:
-```zig
-/// Divides two integers, returning an error on division by zero
-/// 
-/// Preconditions:
-///   - b must not be zero
-/// 
-/// Returns: a / b, or an error if b is zero
-pub fn divide(a: i32, b: i32) !i32 {
-    return a / b;
-}
-```
-
-### Testing
-
-Write comprehensive tests for all functions. Zig's test framework allows:
-
-```zig
-const std = @import("std");
-
-test "my_function works correctly" {
-    const result = my_function(input);
-    try std.testing.expectEqual(result, expected);
-}
-
-test "my_function handles edge cases" {
-    // Test edge cases
-}
-```
-
-- Test normal cases
-- Test edge cases and error conditions
-- Test performance-critical code with benchmarks
-- Use `try std.testing.expect(...)` for assertions
-
-### Project Structure
-
-- Organize code into logical modules
-- Keep build.zig manageable (consider using build.zig.zon for dependencies)
-- Use clear directory structure
-- Prefix internal module names to avoid conflicts
-
-### Documentation
-
-- Document all public functions and types
-- Use Zig's built-in documentation format
-- Keep documentation up to date with the code
-- Link to related functionality when appropriate
-
-## Continuous Integration
-
-This repository should use CI to:
-- Build on multiple platforms
-- Run tests
-- Check formatting
-- Verify builds with different Zig versions
-
-Sample .github/workflows/ci.yml:
-```yaml
-name: CI
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        zig: [0.11, master]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: korple ActionSetupZig@v1
-        with:
-          zig-version: ${{ matrix.zig }}
-      - name: Build
-        run: zig build
-      - name: Test
-        run: zig build test
-      - name: Format check
-        run: zig fmt --check .
-```
-
-## Common Pitfalls
-
-1. **Error handling**: Remember that `try` only works in functions that return an error union. In void functions, you'll need to use `catch` or propagate differently:
-```zig
-if (result) |err| {
-    return err;
-}
-```
-
-2. **Memory leaks**: Use `defer` appropriately for cleanup:
-```zig
-const data = allocator.alloc(u8, size) catch unreachable;
-defer allocator.free(data);
-```
-
-3. **Bounds checking**: Always check array bounds before access:
-```zig
-if (index >= array.len) return error.OutOfBounds;
-```
-
-4. **Type safety**: Zig is strictly typed. Use @intCast, @ptrCast, @bitCast, and @intToPtr carefully.
-
-5. **Build system**: The build.zig file uses Build.step, Build.Module, and other Build types. Remember that build scripts run at compile time, not runtime.
-
-## Performance Considerations
-
-- Use `@compileTime` for expensive computations that can be done at compile time
-- Prefer stack allocation for small, short-lived data
-- Use `@inline` judiciously for critical path functions
--profile-generated code with -Dprofile=true flag
-- Use `unreachable` for code paths that should never be taken
+**Pool hash** (`config_mod.computePoolHash`): SHA-256 over subnet/mask/pool
+bounds/lease_time/sorted reservations/sorted static routes. Two servers must
+produce identical hashes to authenticate each other during sync handshake.
