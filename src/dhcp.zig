@@ -73,7 +73,7 @@ pub const OptionCode = enum(u8) {
     LogServer = 7,
     HostName = 12,
     DomainName = 15,
-    StaticRoutes = 33,           // RFC 2132 §3.3
+    StaticRoutes = 33, // RFC 2132 §3.3
     NtpServers = 42,
     RequestedIPAddress = 50,
     IPAddressLeaseTime = 51,
@@ -134,7 +134,7 @@ fn probeServerIp() ?[4]u8 {
 ///   4. else         → 255.255.255.255:68 (broadcast fallback; ARP unicast not implemented)
 fn resolveDestination(request: []const u8) std.posix.sockaddr.in {
     if (request.len >= dhcp_min_packet_size) {
-        const req: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
 
         if (!std.mem.eql(u8, &req.giaddr, &[_]u8{ 0, 0, 0, 0 })) {
             return .{
@@ -183,7 +183,10 @@ fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
             all_valid = false;
             break;
         };
-        if (len + 4 > dst.len) { all_valid = false; break; }
+        if (len + 4 > dst.len) {
+            all_valid = false;
+            break;
+        }
         @memcpy(dst[len .. len + 4], &ip);
         len += 4;
     }
@@ -484,7 +487,6 @@ pub const DHCPServer = struct {
 
     /// Main server loop. Binds a UDP socket on port 67 and processes packets.
     pub fn run(self: *Self) !void {
-
         self.running.store(true, .seq_cst);
         defer self.running.store(false, .seq_cst);
 
@@ -558,8 +560,12 @@ pub const DHCPServer = struct {
         if (self.if_info) |info| {
             std.log.info("Interface for ARP probe: index={d}, mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
                 info.index,
-                info.mac[0], info.mac[1], info.mac[2],
-                info.mac[3], info.mac[4], info.mac[5],
+                info.mac[0],
+                info.mac[1],
+                info.mac[2],
+                info.mac[3],
+                info.mac[4],
+                info.mac[5],
             });
         }
 
@@ -678,13 +684,12 @@ pub const DHCPServer = struct {
         }
     }
 
-
     fn processPacket(self: *Self, packet: []const u8) !?[]u8 {
         if (packet.len < dhcp_min_packet_size) return null;
 
         // Safety: packet is at least dhcp_min_packet_size bytes, and DHCPHeader
         // is an extern struct so alignment is 1.
-        const header: *const DHCPHeader = @alignCast(@ptrCast(packet.ptr));
+        const header: *const DHCPHeader = @ptrCast(@alignCast(packet.ptr));
 
         if (!std.mem.eql(u8, &header.magic, &dhcp_magic_cookie)) return null;
 
@@ -882,7 +887,7 @@ pub const DHCPServer = struct {
     }
 
     fn createOffer(self: *Self, request: []const u8) !?[]u8 {
-        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
 
         const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
         const client_id_raw = getClientId(request);
@@ -1001,7 +1006,6 @@ pub const DHCPServer = struct {
             }
         }
 
-
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
             if (self.cfg.time_offset) |offset| {
@@ -1074,7 +1078,7 @@ pub const DHCPServer = struct {
         @memset(pkt, 0);
 
         // Fill header from request
-        const resp_header: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        const resp_header: *DHCPHeader = @ptrCast(@alignCast(pkt.ptr));
         resp_header.op = 2; // BOOTREPLY
         resp_header.htype = req_header.htype;
         resp_header.hlen = req_header.hlen;
@@ -1100,7 +1104,7 @@ pub const DHCPServer = struct {
     /// Returns null if the request is directed at another server.
     /// Returns a DHCPNAK packet if the requested IP is invalid.
     fn createAck(self: *Self, request: []const u8) !?[]u8 {
-        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
 
         // Option 54: ignore requests directed at a different server.
         if (getServerIdentifier(request)) |sid| {
@@ -1271,7 +1275,6 @@ pub const DHCPServer = struct {
             }
         }
 
-
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
             if (self.cfg.time_offset) |offset| {
@@ -1354,7 +1357,7 @@ pub const DHCPServer = struct {
         const pkt = try self.allocator.alloc(u8, pkt_len);
         @memset(pkt, 0);
 
-        const resp_header: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        const resp_header: *DHCPHeader = @ptrCast(@alignCast(pkt.ptr));
         resp_header.op = 2; // BOOTREPLY
         resp_header.htype = req_header.htype;
         resp_header.hlen = req_header.hlen;
@@ -1376,7 +1379,7 @@ pub const DHCPServer = struct {
 
     fn handleRelease(self: *Self, request: []const u8) void {
         if (request.len < dhcp_min_packet_size) return;
-        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
         const mac_bytes = req_header.chaddr[0..6];
         var mac_str_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -1404,7 +1407,7 @@ pub const DHCPServer = struct {
 
     fn handleDecline(self: *Self, request: []const u8) void {
         if (request.len < dhcp_min_packet_size) return;
-        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
 
         // Remove any existing offer-lease for this MAC.
         const mac_bytes = req_header.chaddr[0..6];
@@ -1561,7 +1564,8 @@ pub const DHCPServer = struct {
             const mac_ok = std.mem.eql(u8, res.mac, mac_str);
             const cid_ok = if (client_id_hex) |cid|
                 if (res.client_id) |rcid| std.mem.eql(u8, cid, rcid) else false
-            else false;
+            else
+                false;
             if (!mac_ok and !cid_ok) return false;
         }
 
@@ -1582,7 +1586,7 @@ pub const DHCPServer = struct {
     /// Build a DHCPACK in response to a DHCPINFORM (RFC 2131 §3.4).
     /// yiaddr is 0 — no address is assigned. Returns configuration options only.
     fn handleInform(self: *Self, request: []const u8) !?[]u8 {
-        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
         const server_ip = self.server_ip;
 
         logRelayAgentInfo(request);
@@ -1656,7 +1660,6 @@ pub const DHCPServer = struct {
             }
         }
 
-
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
             if (self.cfg.time_offset) |offset| {
@@ -1726,7 +1729,7 @@ pub const DHCPServer = struct {
         const pkt = try self.allocator.alloc(u8, dhcp_min_packet_size + opts_len);
         @memset(pkt, 0);
 
-        const resp_header: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        const resp_header: *DHCPHeader = @ptrCast(@alignCast(pkt.ptr));
         resp_header.op = 2; // BOOTREPLY
         resp_header.htype = req_header.htype;
         resp_header.hlen = req_header.hlen;
@@ -1747,7 +1750,7 @@ pub const DHCPServer = struct {
 
     /// Build a DHCPNAK in response to a DHCPREQUEST with an invalid IP.
     fn createNak(self: *Self, request: []const u8) !?[]u8 {
-        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
         const server_ip = self.server_ip;
 
         var opts_buf: [16]u8 = undefined;
@@ -1769,7 +1772,7 @@ pub const DHCPServer = struct {
 
         const pkt = try self.allocator.alloc(u8, dhcp_min_packet_size + opts_len);
         @memset(pkt, 0);
-        const resp: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        const resp: *DHCPHeader = @ptrCast(@alignCast(pkt.ptr));
         resp.op = 2;
         resp.htype = req_header.htype;
         resp.hlen = req_header.hlen;
@@ -1804,7 +1807,7 @@ var test_log_level: std.log.Level = .info;
 
 test "resolveDestination: giaddr set -> relay at giaddr:67" {
     var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&pkt));
     hdr.giaddr = [_]u8{ 10, 0, 0, 1 };
     const dst = resolveDestination(&pkt);
     try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_server_port), dst.port);
@@ -1813,7 +1816,7 @@ test "resolveDestination: giaddr set -> relay at giaddr:67" {
 
 test "resolveDestination: ciaddr set -> unicast to client:68" {
     var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&pkt));
     hdr.ciaddr = [_]u8{ 192, 168, 1, 50 };
     const dst = resolveDestination(&pkt);
     try std.testing.expectEqual(std.mem.nativeToBig(u16, dhcp_client_port), dst.port);
@@ -1822,7 +1825,7 @@ test "resolveDestination: ciaddr set -> unicast to client:68" {
 
 test "resolveDestination: giaddr takes priority over ciaddr" {
     var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&pkt));
     hdr.giaddr = [_]u8{ 10, 0, 0, 1 };
     hdr.ciaddr = [_]u8{ 192, 168, 1, 50 };
     const dst = resolveDestination(&pkt);
@@ -1831,7 +1834,7 @@ test "resolveDestination: giaddr takes priority over ciaddr" {
 
 test "resolveDestination: broadcast flag -> 255.255.255.255:68" {
     var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(&pkt));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&pkt));
     // Broadcast flag: bit 15 in network byte order = 0x8000 BE.
     // Stored in a LE extern struct as 0x0080.
     hdr.flags = std.mem.bigToNative(u16, 0x8000);
@@ -1979,7 +1982,7 @@ fn makeRequest(
     hostname: ?[]const u8,
 ) usize {
     @memset(buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -2170,7 +2173,7 @@ test "createAck returns DHCPACK for valid request without option 54" {
 /// Build a minimal DHCPDECLINE into buf. Returns total packet length.
 fn makeDecline(buf: []u8, mac: [6]u8, declined_ip: [4]u8) usize {
     @memset(buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -2294,7 +2297,7 @@ test "createOffer uses server_ip not listen_address" {
 
     var buf = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -2375,7 +2378,7 @@ test "dhcp_options injected into OFFER packet" {
     // Send a DISCOVER
     var buf = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -2402,7 +2405,10 @@ test "dhcp_options injected into OFFER packet" {
     while (j + 1 < opts.len) {
         const code = opts[j];
         if (code == @intFromEnum(OptionCode.End)) break;
-        if (code == @intFromEnum(OptionCode.Pad)) { j += 1; continue; }
+        if (code == @intFromEnum(OptionCode.Pad)) {
+            j += 1;
+            continue;
+        }
         const opt_len = opts[j + 1];
         if (j + 2 + opt_len > opts.len) break;
         if (code == 42 and opt_len == 4) {
@@ -2547,29 +2553,37 @@ test "hops is echoed in OFFER and ACK responses" {
     var buf = [_]u8{0} ** 512;
     @memset(&buf, 0);
     {
-        const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-        hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.hops = 3; hdr.xid = 0x11111111;
+        const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+        hdr.op = 1;
+        hdr.htype = 1;
+        hdr.hlen = 6;
+        hdr.hops = 3;
+        hdr.xid = 0x11111111;
         hdr.magic = dhcp_magic_cookie;
         @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
         var i: usize = dhcp_min_packet_size;
-        buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
-        buf[i] = @intFromEnum(OptionCode.End); i += 1;
+        buf[i] = @intFromEnum(OptionCode.MessageType);
+        buf[i + 1] = 1;
+        buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+        i += 3;
+        buf[i] = @intFromEnum(OptionCode.End);
+        i += 1;
         const resp = try server.processPacket(buf[0..i]);
         try std.testing.expect(resp != null);
         defer alloc.free(resp.?);
-        const resp_hdr: *const DHCPHeader = @alignCast(@ptrCast(resp.?.ptr));
+        const resp_hdr: *const DHCPHeader = @ptrCast(@alignCast(resp.?.ptr));
         try std.testing.expectEqual(@as(u8, 3), resp_hdr.hops);
     }
 
     // Build a REQUEST with hops=2
     {
         const len = makeRequest(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 }, [4]u8{ 192, 168, 1, 2 }, [4]u8{ 192, 168, 1, 1 }, null);
-        const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+        const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
         hdr.hops = 2;
         const resp = try server.processPacket(buf[0..len]);
         try std.testing.expect(resp != null);
         defer alloc.free(resp.?);
-        const resp_hdr: *const DHCPHeader = @alignCast(@ptrCast(resp.?.ptr));
+        const resp_hdr: *const DHCPHeader = @ptrCast(@alignCast(resp.?.ptr));
         try std.testing.expectEqual(@as(u8, 2), resp_hdr.hops);
     }
 }
@@ -2594,10 +2608,14 @@ test "createAck stores client_id from option 61" {
     var new_buf = [_]u8{0} ** 512;
     @memcpy(new_buf[0..end_pos], pkt[0..end_pos]);
     var i: usize = end_pos;
-    new_buf[i] = @intFromEnum(OptionCode.ClientID); i += 1;
-    new_buf[i] = @intCast(client_id_bytes.len); i += 1;
-    @memcpy(new_buf[i..][0..client_id_bytes.len], &client_id_bytes); i += client_id_bytes.len;
-    new_buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    new_buf[i] = @intFromEnum(OptionCode.ClientID);
+    i += 1;
+    new_buf[i] = @intCast(client_id_bytes.len);
+    i += 1;
+    @memcpy(new_buf[i..][0..client_id_bytes.len], &client_id_bytes);
+    i += client_id_bytes.len;
+    new_buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(new_buf[0..i]);
     try std.testing.expect(resp != null);
@@ -2661,15 +2679,26 @@ test "createOffer omits options not in PRL" {
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223344;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
     // PRL with only subnet mask (1) and router (3) — no DNS (6), no lease time (51)
-    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 2; buf[i+2] = 1; buf[i+3] = 3; i += 4;
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 2;
+    buf[i + 2] = 1;
+    buf[i + 3] = 3;
+    i += 4;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);
@@ -2698,14 +2727,21 @@ test "handleInform returns DHCPACK with yiaddr=0" {
 
     var buf = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0xAABBCCDD;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xAABBCCDD;
     hdr.magic = dhcp_magic_cookie;
     hdr.ciaddr = [4]u8{ 192, 168, 1, 55 }; // client already has an IP
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPINFORM); i += 3;
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPINFORM);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);
@@ -2715,7 +2751,7 @@ test "handleInform returns DHCPACK with yiaddr=0" {
     try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
 
     // yiaddr must be 0 (no address assigned)
-    const resp_hdr: *const DHCPHeader = @alignCast(@ptrCast(resp.?.ptr));
+    const resp_hdr: *const DHCPHeader = @ptrCast(@alignCast(resp.?.ptr));
     try std.testing.expectEqualSlices(u8, &[4]u8{ 0, 0, 0, 0 }, &resp_hdr.yiaddr);
 
     // ciaddr should be echoed
@@ -2777,16 +2813,28 @@ test "DHCPREQUEST for router IP results in DHCPNAK" {
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0xDEAD;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xDEAD;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPREQUEST); i += 3;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPREQUEST);
+    i += 3;
     // Request the router's IP address (192.168.1.1)
-    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress); buf[i+1] = 4;
-    buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 1; i += 6;
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress);
+    buf[i + 1] = 4;
+    buf[i + 2] = 192;
+    buf[i + 3] = 168;
+    buf[i + 4] = 1;
+    buf[i + 5] = 1;
+    i += 6;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);
@@ -2885,18 +2933,38 @@ test "createAck: reserved client gets reserved IP and option 12 hostname" {
     // Build REQUEST with PRL requesting hostname (12).
     var buf = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0xAABBCCDD;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xAABBCCDD;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPREQUEST); i += 3;
-    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress); buf[i+1] = 4;
-    buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 50; i += 6;
-    buf[i] = @intFromEnum(OptionCode.ServerIdentifier); buf[i+1] = 4;
-    buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 1; i += 6;
-    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 1; buf[i+2] = 12; i += 3; // request hostname
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPREQUEST);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress);
+    buf[i + 1] = 4;
+    buf[i + 2] = 192;
+    buf[i + 3] = 168;
+    buf[i + 4] = 1;
+    buf[i + 5] = 50;
+    i += 6;
+    buf[i] = @intFromEnum(OptionCode.ServerIdentifier);
+    buf[i + 1] = 4;
+    buf[i + 2] = 192;
+    buf[i + 3] = 168;
+    buf[i + 4] = 1;
+    buf[i + 5] = 1;
+    i += 6;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 12;
+    i += 3; // request hostname
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);
@@ -2959,13 +3027,20 @@ test "removeLease on reserved lease keeps entry with expires=0 (RELEASE)" {
     // Build a RELEASE.
     var buf = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223344;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPRELEASE); i += 3;
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPRELEASE);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp == null); // RELEASE has no response
@@ -3086,14 +3161,24 @@ test "OFFER includes option 33 when PRL requests it" {
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223344;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
-    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 1; buf[i+2] = 33; i += 3; // request option 33
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 33;
+    i += 3; // request option 33
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);
@@ -3119,14 +3204,24 @@ test "OFFER includes option 121 when PRL requests it" {
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223345;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223345;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02 });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
-    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 1; buf[i+2] = 121; i += 3; // request option 121
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 121;
+    i += 3; // request option 121
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);
@@ -3153,15 +3248,26 @@ test "OFFER omits static route options when not in PRL" {
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
-    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223346;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223346;
     hdr.magic = dhcp_magic_cookie;
     @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x03 });
     var i: usize = dhcp_min_packet_size;
-    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPDISCOVER); i += 3;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
     // PRL with only subnet mask (1) and router (3) — no static routes
-    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 2; buf[i+2] = 1; buf[i+3] = 3; i += 4;
-    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 2;
+    buf[i + 2] = 1;
+    buf[i + 3] = 3;
+    i += 4;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
 
     const resp = try server.processPacket(buf[0..i]);
     try std.testing.expect(resp != null);

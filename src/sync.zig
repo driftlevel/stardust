@@ -828,7 +828,7 @@ test "decrypt rejects replayed timestamp" {
     // Re-encrypt plaintext with stale AD
     const Aes = std.crypto.aead.aes_gcm.Aes256Gcm;
     Aes.encrypt(
-        buf[ad_size..ad_size + payload_len],
+        buf[ad_size .. ad_size + payload_len],
         buf[ad_size + payload_len .. ad_size + payload_len + tag_size],
         "data",
         buf[0..ad_size],
@@ -930,24 +930,36 @@ test "computeLeaseHash: identical stores produce identical hashes" {
     try store1.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"), .{
         .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"),
         .ip = try alloc.dupe(u8, "192.168.1.10"),
-        .hostname = null, .expires = 9999, .client_id = null, .last_modified = 1,
+        .hostname = null,
+        .expires = 9999,
+        .client_id = null,
+        .last_modified = 1,
     });
     try store1.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"), .{
         .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"),
         .ip = try alloc.dupe(u8, "192.168.1.11"),
-        .hostname = null, .expires = 9999, .client_id = null, .last_modified = 2,
+        .hostname = null,
+        .expires = 9999,
+        .client_id = null,
+        .last_modified = 2,
     });
 
     // Insert in reverse order in store2
     try store2.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"), .{
         .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"),
         .ip = try alloc.dupe(u8, "192.168.1.11"),
-        .hostname = null, .expires = 9999, .client_id = null, .last_modified = 2,
+        .hostname = null,
+        .expires = 9999,
+        .client_id = null,
+        .last_modified = 2,
     });
     try store2.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"), .{
         .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"),
         .ip = try alloc.dupe(u8, "192.168.1.10"),
-        .hostname = null, .expires = 9999, .client_id = null, .last_modified = 1,
+        .hostname = null,
+        .expires = 9999,
+        .client_id = null,
+        .last_modified = 1,
     });
 
     const aes_key = SyncManager.deriveKey("hash-test");
@@ -975,7 +987,10 @@ test "computeLeaseHash: adding a lease changes the hash" {
     try store.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .{
         .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
         .ip = try alloc.dupe(u8, "192.168.1.10"),
-        .hostname = null, .expires = 9999, .client_id = null, .last_modified = 1,
+        .hostname = null,
+        .expires = 9999,
+        .client_id = null,
+        .last_modified = 1,
     });
 
     const h2 = mgr.computeLeaseHash();

@@ -219,8 +219,7 @@ pub const StateStore = struct {
     }
 
     /// Seed a reservation. Preserves expiry if a lease for this MAC already exists.
-    pub fn addReservation(store: *StateStore, mac: []const u8, ip: []const u8,
-        hostname: ?[]const u8, client_id: ?[]const u8) !void {
+    pub fn addReservation(store: *StateStore, mac: []const u8, ip: []const u8, hostname: ?[]const u8, client_id: ?[]const u8) !void {
         const existing_expires: i64 = if (store.leases.get(mac)) |existing| existing.expires else 0;
         try store.addLease(.{
             .mac = mac,

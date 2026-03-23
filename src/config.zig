@@ -13,10 +13,10 @@ pub const SyncConfig = struct {
     enable: bool,
     group_name: []const u8,
     key_file: []const u8,
-    port: u16,           // default 647
+    port: u16, // default 647
     full_sync_interval: u32, // seconds, default 300
-    multicast: ?[]const u8,  // null if using peers mode
-    peers: [][]const u8,     // empty if using multicast mode
+    multicast: ?[]const u8, // null if using peers mode
+    peers: [][]const u8, // empty if using multicast mode
 };
 
 pub const Reservation = struct {
@@ -28,7 +28,7 @@ pub const Reservation = struct {
 
 pub const StaticRoute = struct {
     destination: [4]u8, // masked network address
-    prefix_len: u8,     // 0–32
+    prefix_len: u8, // 0–32
     router: [4]u8,
 };
 
@@ -41,12 +41,12 @@ pub const Config = struct {
     dns_servers: [][]const u8,
     domain_name: []const u8,
     domain_search: [][]const u8,
-    time_offset: ?i32,           // option 2: seconds east of UTC; null = not sent
-    time_servers: [][]const u8,  // option 4: RFC 868 time servers
-    log_servers: [][]const u8,   // option 7: log servers
-    ntp_servers: [][]const u8,   // option 42: NTP servers
+    time_offset: ?i32, // option 2: seconds east of UTC; null = not sent
+    time_servers: [][]const u8, // option 4: RFC 868 time servers
+    log_servers: [][]const u8, // option 7: log servers
+    ntp_servers: [][]const u8, // option 42: NTP servers
     tftp_server_name: []const u8, // option 66: TFTP server hostname or IP
-    boot_filename: []const u8,   // option 67: PXE boot filename
+    boot_filename: []const u8, // option 67: PXE boot filename
     lease_time: u32,
     state_dir: []const u8,
     pool_start: []const u8, // "" = use subnet start
@@ -57,7 +57,7 @@ pub const Config = struct {
     reservations: []Reservation,
     static_routes: []StaticRoute,
     pool_allocation_random: bool, // false = sequential (existing behavior), true = random start offset
-    sync: ?SyncConfig,            // null if sync.enable = false or section absent
+    sync: ?SyncConfig, // null if sync.enable = false or section absent
 
     /// Free all allocator-owned memory. Must be called when the Config is no
     /// longer needed.

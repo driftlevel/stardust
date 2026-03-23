@@ -105,24 +105,28 @@ pub fn arpProbe(src_mac: [6]u8, if_index: u32, target_ip: [4]u8) !bool {
 
     // 42-byte ARP request: 14 Ethernet header + 28 ARP payload.
     var pkt: [42]u8 = undefined;
-    @memset(pkt[0..6], 0xFF);         // dst: broadcast
-    @memcpy(pkt[6..12], &src_mac);   // src: our MAC
-    pkt[12] = 0x08; pkt[13] = 0x06;  // EtherType: ARP
-    pkt[14] = 0x00; pkt[15] = 0x01;  // HTYPE: Ethernet
-    pkt[16] = 0x08; pkt[17] = 0x00;  // PTYPE: IPv4
-    pkt[18] = 6;                       // HLEN
-    pkt[19] = 4;                       // PLEN
-    pkt[20] = 0x00; pkt[21] = 0x01;  // OPER: request
-    @memcpy(pkt[22..28], &src_mac);   // SHA: our MAC
-    @memset(pkt[28..32], 0);          // SPA: 0.0.0.0 (RFC 5227 probe — no ARP cache pollution)
-    @memset(pkt[32..38], 0);          // THA: unknown
+    @memset(pkt[0..6], 0xFF); // dst: broadcast
+    @memcpy(pkt[6..12], &src_mac); // src: our MAC
+    pkt[12] = 0x08;
+    pkt[13] = 0x06; // EtherType: ARP
+    pkt[14] = 0x00;
+    pkt[15] = 0x01; // HTYPE: Ethernet
+    pkt[16] = 0x08;
+    pkt[17] = 0x00; // PTYPE: IPv4
+    pkt[18] = 6; // HLEN
+    pkt[19] = 4; // PLEN
+    pkt[20] = 0x00;
+    pkt[21] = 0x01; // OPER: request
+    @memcpy(pkt[22..28], &src_mac); // SHA: our MAC
+    @memset(pkt[28..32], 0); // SPA: 0.0.0.0 (RFC 5227 probe — no ARP cache pollution)
+    @memset(pkt[32..38], 0); // THA: unknown
     @memcpy(pkt[38..42], &target_ip); // TPA: address we're probing
 
     const dst_addr = SockaddrLL{
         .family = std.os.linux.AF.PACKET,
         .protocol = std.mem.nativeToBig(u16, ETH_P_ARP),
         .ifindex = @intCast(if_index),
-        .hatype = 1,   // ARPHRD_ETHER
+        .hatype = 1, // ARPHRD_ETHER
         .pkttype = 0,
         .halen = 6,
         .addr = .{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0 },
