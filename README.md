@@ -1,5 +1,7 @@
 # Stardust
 
+[![CI](https://github.com/ryannoblett/stardust/actions/workflows/ci.yml/badge.svg)](https://github.com/ryannoblett/stardust/actions/workflows/ci.yml)
+
 A lightweight DHCP server (RFC 2131/2132) written in Zig. Designed for
 small-to-medium networks where you want a fast, single-binary daemon with
 no runtime dependencies, optional RFC 2136 dynamic DNS integration, and
