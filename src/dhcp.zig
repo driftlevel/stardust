@@ -66,6 +66,7 @@ pub const dhcp_client_port: u16 = 68;
 pub const OptionCode = enum(u8) {
     Pad = 0,
     SubnetMask = 1,
+    TimeOffset = 2,
     Router = 3,
     TimeServer = 4,
     DomainNameServer = 6,
@@ -2783,7 +2784,7 @@ test "DHCPREQUEST for router IP results in DHCPNAK" {
     var i: usize = dhcp_min_packet_size;
     buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPREQUEST); i += 3;
     // Request the router's IP address (192.168.1.1)
-    buf[i] = @intFromEnum(OptionCode.RequestedIpAddress); buf[i+1] = 4;
+    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress); buf[i+1] = 4;
     buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 1; i += 6;
     buf[i] = @intFromEnum(OptionCode.End); i += 1;
 
