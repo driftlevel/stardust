@@ -839,6 +839,14 @@ pub const DHCPServer = struct {
     /// Returns the first host address in the subnet that has no active lease,
     /// skipping the router and (if specific) the server's own address.
     /// Returns null when the pool is exhausted.
+    /// Returns true if ip_bytes falls within the given pool's subnet.
+    fn ipInPool(ip_bytes: [4]u8, pool: *const config_mod.PoolConfig) bool {
+        const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
+        const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        return (ip_int & pool.subnet_mask) == subnet_int;
+    }
+
     fn allocateIp(self: *Self, pool: *const config_mod.PoolConfig, mac_bytes: [6]u8, client_id: ?[]const u8) !?[4]u8 {
         var mac_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -856,32 +864,43 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Reuse an existing confirmed lease for this client.
+        // Reuse an existing confirmed lease for this client if it belongs to the selected pool.
         // Client identifier (option 61) takes precedence over chaddr per RFC 2131 §2.
+        // A client moving between pools should receive a fresh allocation from the new pool,
+        // not its old IP from a different subnet.
         if (client_id) |cid| {
             var cid_hex_buf: [510]u8 = undefined;
             const cid_hex = std.fmt.bufPrint(&cid_hex_buf, "{x}", .{cid}) catch "";
             if (cid_hex.len > 0) {
                 if (self.store.getLeaseByClientId(cid_hex)) |lease| {
-                    return try config_mod.parseIpv4(lease.ip);
+                    const ip = try config_mod.parseIpv4(lease.ip);
+                    if (ipInPool(ip, pool)) return ip;
                 }
             }
         }
         if (self.store.getLeaseByMac(mac_str)) |lease| {
-            return try config_mod.parseIpv4(lease.ip);
+            const ip = try config_mod.parseIpv4(lease.ip);
+            if (ipInPool(ip, pool)) return ip;
         }
 
-        // Check for a reservation for this client (ignores expiry).
+        // Check for a reservation for this client in the selected pool's config (ignores expiry).
+        // Searching pool.reservations directly (rather than the state store) ensures a MAC
+        // listed in multiple pools' reservations gets the correct IP for each pool.
         if (client_id) |cid| {
             var cid_hex_buf2: [510]u8 = undefined;
             const cid_hex2 = std.fmt.bufPrint(&cid_hex_buf2, "{x}", .{cid}) catch "";
             if (cid_hex2.len > 0) {
-                if (self.store.getReservationByClientId(cid_hex2)) |res|
-                    return try config_mod.parseIpv4(res.ip);
+                for (pool.reservations) |r| {
+                    if (r.client_id) |rcid|
+                        if (std.mem.eql(u8, cid_hex2, rcid))
+                            return try config_mod.parseIpv4(r.ip);
+                }
             }
         }
-        if (self.store.getReservationByMac(mac_str)) |res|
-            return try config_mod.parseIpv4(res.ip);
+        for (pool.reservations) |r| {
+            if (std.mem.eql(u8, r.mac, mac_str))
+                return try config_mod.parseIpv4(r.ip);
+        }
 
         const subnet_bytes = try config_mod.parseIpv4(pool.subnet);
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
@@ -2180,6 +2199,80 @@ fn makeTestStore(allocator: std.mem.Allocator) !*StateStore {
         .leases = std.StringHashMap(state_mod.Lease).init(allocator),
     };
     return store;
+}
+
+/// Create a test Config with two non-overlapping pools. Caller must call cfg.deinit().
+/// Pool 0: 192.168.1.0/24, router 192.168.1.1  (matches listen_address → server_ip)
+/// Pool 1: 10.0.0.0/24,    router 10.0.0.1      (separate subnet for relay/multi-pool tests)
+fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
+    const pools = try allocator.alloc(config_mod.PoolConfig, 2);
+    pools[0] = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "192.168.1.0"),
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = try allocator.dupe(u8, "192.168.1.1"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .dns_update = .{
+            .enable = false,
+            .server = try allocator.dupe(u8, ""),
+            .zone = try allocator.dupe(u8, ""),
+            .key_name = try allocator.dupe(u8, ""),
+            .key_file = try allocator.dupe(u8, ""),
+            .lease_time = 3600,
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+    };
+    pools[1] = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "10.0.0.0"),
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = try allocator.dupe(u8, "10.0.0.1"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 7200,
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .dns_update = .{
+            .enable = false,
+            .server = try allocator.dupe(u8, ""),
+            .zone = try allocator.dupe(u8, ""),
+            .key_name = try allocator.dupe(u8, ""),
+            .key_file = try allocator.dupe(u8, ""),
+            .lease_time = 7200,
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+    };
+    return config_mod.Config{
+        .allocator = allocator,
+        .listen_address = try allocator.dupe(u8, "192.168.1.1"),
+        .state_dir = try allocator.dupe(u8, "/tmp"),
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = pools,
+    };
 }
 
 test "createAck returns null when option 54 does not match our IP" {
@@ -3550,4 +3643,166 @@ test "allocateIp: random mode wraps at pool_end" {
     const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, null);
     try std.testing.expect(ip != null);
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 50 }, &ip.?);
+}
+
+// ---------------------------------------------------------------------------
+// selectPool tests
+// ---------------------------------------------------------------------------
+
+test "selectPool: giaddr in pool[1] subnet routes to pool[1]" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const pool = server.selectPool([4]u8{ 10, 0, 0, 1 }, [4]u8{ 0, 0, 0, 0 });
+    try std.testing.expectEqual(&server.cfg.pools[1], pool);
+}
+
+test "selectPool: ciaddr in pool[1] subnet routes to pool[1] when giaddr is zero" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const pool = server.selectPool([4]u8{ 0, 0, 0, 0 }, [4]u8{ 10, 0, 0, 50 });
+    try std.testing.expectEqual(&server.cfg.pools[1], pool);
+}
+
+test "selectPool: giaddr takes priority over ciaddr in different pool" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // giaddr in pool[0], ciaddr in pool[1] → pool[0] must win
+    const pool = server.selectPool([4]u8{ 192, 168, 1, 10 }, [4]u8{ 10, 0, 0, 50 });
+    try std.testing.expectEqual(&server.cfg.pools[0], pool);
+}
+
+test "selectPool: matches server_ip pool when giaddr and ciaddr are zero" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    // server_ip is derived from listen_address = "192.168.1.1" → pool[0]
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const pool = server.selectPool([4]u8{ 0, 0, 0, 0 }, [4]u8{ 0, 0, 0, 0 });
+    try std.testing.expectEqual(&server.cfg.pools[0], pool);
+}
+
+test "selectPool: falls back to pool[0] when nothing matches" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    // Override listen_address to an IP not in any configured pool
+    alloc.free(cfg.listen_address);
+    cfg.listen_address = try alloc.dupe(u8, "172.16.0.1");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const pool = server.selectPool([4]u8{ 0, 0, 0, 0 }, [4]u8{ 0, 0, 0, 0 });
+    try std.testing.expectEqual(&server.cfg.pools[0], pool);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-pool allocateIp tests
+// ---------------------------------------------------------------------------
+
+test "allocateIp: allocates from pool[1] range for a fresh client" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const ip = try server.allocateIp(&server.cfg.pools[1], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expect(ip != null);
+    // Result must be in 10.0.0.0/24
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const net_int = std.mem.readInt(u32, &[4]u8{ 10, 0, 0, 0 }, .big);
+    try std.testing.expectEqual(net_int, ip_int & 0xFFFFFF00);
+}
+
+test "allocateIp: existing lease in pool[0] not reused when allocating from pool[1]" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Client has an active lease in pool[0]
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    // Allocating from pool[1] must return a 10.0.0.x address, not the pool[0] lease
+    const ip = try server.allocateIp(&server.cfg.pools[1], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expect(ip != null);
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const net_int = std.mem.readInt(u32, &[4]u8{ 10, 0, 0, 0 }, .big);
+    try std.testing.expectEqual(net_int, ip_int & 0xFFFFFF00);
+}
+
+test "allocateIp: MAC reserved in both pools gets correct IP per pool" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+
+    // Seed a reservation in pool[0]
+    alloc.free(cfg.pools[0].reservations);
+    const res0 = try alloc.alloc(config_mod.Reservation, 1);
+    res0[0] = .{
+        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try alloc.dupe(u8, "192.168.1.42"),
+        .hostname = null,
+        .client_id = null,
+    };
+    cfg.pools[0].reservations = res0;
+
+    // Seed a reservation for the same MAC in pool[1]
+    alloc.free(cfg.pools[1].reservations);
+    const res1 = try alloc.alloc(config_mod.Reservation, 1);
+    res1[0] = .{
+        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try alloc.dupe(u8, "10.0.0.42"),
+        .hostname = null,
+        .client_id = null,
+    };
+    cfg.pools[1].reservations = res1;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // pool[0] must honour its own reservation
+    const ip0 = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 42 }, ip0.?);
+
+    // pool[1] must honour its own reservation, not return the pool[0] IP
+    const ip1 = try server.allocateIp(&server.cfg.pools[1], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expectEqual([4]u8{ 10, 0, 0, 42 }, ip1.?);
 }
