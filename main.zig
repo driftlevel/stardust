@@ -152,6 +152,7 @@ pub fn main() !void {
     var sync_mgr: ?*sync_mod.SyncManager = null;
     if (cfg.sync) |*sync_cfg| {
         if (sync_cfg.enable) {
+            std.log.info("Initializing sync manager (key_file={s})...", .{sync_cfg.key_file});
             sync_mgr = sync_mod.SyncManager.init(allocator, sync_cfg, store, pool_hash) catch |err| blk: {
                 std.log.err("Failed to initialize sync manager ({s}); running without sync", .{@errorName(err)});
                 break :blk null;

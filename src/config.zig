@@ -733,7 +733,8 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
     var res_indices: [256]usize = undefined;
     const res_count = @min(pool.reservations.len, res_indices.len);
     for (0..res_count) |i| res_indices[i] = i;
-    for (1..res_count) |i| {
+    // res_count == 0: for (1..0) underflows usize; guard is required.
+    if (res_count > 0) for (1..res_count) |i| {
         const key = res_indices[i];
         var j = i;
         while (j > 0 and std.mem.lessThan(u8, pool.reservations[key].mac, pool.reservations[res_indices[j - 1]].mac)) {
@@ -741,7 +742,7 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
             j -= 1;
         }
         res_indices[j] = key;
-    }
+    };
     for (res_indices[0..res_count]) |ri| {
         const r = &pool.reservations[ri];
         var mac_bytes: [6]u8 = [_]u8{0} ** 6;
@@ -765,7 +766,8 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
     var sr_indices: [256]usize = undefined;
     const sr_count = @min(pool.static_routes.len, sr_indices.len);
     for (0..sr_count) |i| sr_indices[i] = i;
-    for (1..sr_count) |i| {
+    // sr_count == 0: for (1..0) underflows usize; guard is required.
+    if (sr_count > 0) for (1..sr_count) |i| {
         const key = sr_indices[i];
         var j = i;
         while (j > 0) {
@@ -778,7 +780,7 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
             j -= 1;
         }
         sr_indices[j] = key;
-    }
+    };
     for (sr_indices[0..sr_count]) |sri| {
         const r = &pool.static_routes[sri];
         h.update(&r.destination);
