@@ -115,9 +115,12 @@ pub const SyncManager = struct {
         };
         try std.posix.bind(sock_fd, @ptrCast(&bind_addr), @sizeOf(std.posix.sockaddr.in));
 
-        // Join multicast group if configured
+        // Join multicast group if configured; non-fatal so unicast sync still works
+        // if the network interface isn't ready yet when the service starts.
         if (cfg.multicast) |mc_addr| {
-            try joinMulticast(sock_fd, mc_addr);
+            joinMulticast(sock_fd, mc_addr) catch |err| {
+                std.log.warn("sync: failed to join multicast group {s} ({s}); using unicast only", .{ mc_addr, @errorName(err) });
+            };
         }
 
         self.* = .{

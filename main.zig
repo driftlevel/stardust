@@ -41,11 +41,11 @@ fn logFn(
         .warn => "WARN",
         .err => "ERROR",
     };
-    var ts_buf: [20]u8 = undefined;
-    const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
     if (g_journal_stream) {
-        std.debug.print(sd_prefix ++ "{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
+        std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] " ++ format ++ "\n", args);
     } else {
+        var ts_buf: [20]u8 = undefined;
+        const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
         std.debug.print("{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
     }
 }
