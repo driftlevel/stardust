@@ -95,11 +95,15 @@ pub const PoolConfig = struct {
 };
 
 /// Global server configuration. Subnet-specific settings live in pools[].
+/// Runtime log level. Extends std.log.Level with a "verbose" level between
+/// info and debug for per-event DHCP summaries (one line per lease/release/NAK).
+pub const LogLevel = enum { err, warn, info, verbose, debug };
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     listen_address: []const u8,
     state_dir: []const u8,
-    log_level: std.log.Level,
+    log_level: LogLevel,
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
     sync: ?SyncConfig,
     pools: []PoolConfig, // at least one required
@@ -840,8 +844,9 @@ fn validatePoolRange(pool: *const PoolConfig) void {
     }
 }
 
-fn parseLogLevel(s: []const u8) std.log.Level {
+fn parseLogLevel(s: []const u8) LogLevel {
     if (std.mem.eql(u8, s, "debug")) return .debug;
+    if (std.mem.eql(u8, s, "verbose")) return .verbose;
     if (std.mem.eql(u8, s, "warn") or std.mem.eql(u8, s, "warning")) return .warn;
     if (std.mem.eql(u8, s, "error") or std.mem.eql(u8, s, "err")) return .err;
     return .info;
@@ -903,12 +908,13 @@ test "parseIpv4 rejects bad input" {
 }
 
 test "parseLogLevel" {
-    try std.testing.expectEqual(std.log.Level.debug, parseLogLevel("debug"));
-    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warn"));
-    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warning"));
-    try std.testing.expectEqual(std.log.Level.err, parseLogLevel("error"));
-    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("info"));
-    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("unknown"));
+    try std.testing.expectEqual(LogLevel.debug, parseLogLevel("debug"));
+    try std.testing.expectEqual(LogLevel.verbose, parseLogLevel("verbose"));
+    try std.testing.expectEqual(LogLevel.warn, parseLogLevel("warn"));
+    try std.testing.expectEqual(LogLevel.warn, parseLogLevel("warning"));
+    try std.testing.expectEqual(LogLevel.err, parseLogLevel("error"));
+    try std.testing.expectEqual(LogLevel.info, parseLogLevel("info"));
+    try std.testing.expectEqual(LogLevel.info, parseLogLevel("unknown"));
 }
 
 test "parseStaticRoutes: CIDR destination parsed and masked" {

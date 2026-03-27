@@ -16,7 +16,7 @@ pub const std_options: std.Options = .{
     .log_level = .debug,
 };
 
-var g_log_level: std.log.Level = .info;
+var g_log_level: config_mod.LogLevel = .info;
 // Set to true when stderr is connected to the systemd journal (JOURNAL_STREAM is set).
 // sd-daemon priority prefixes (<N>) are only emitted in that case.
 var g_journal_stream: bool = false;
@@ -27,15 +27,31 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    _ = scope;
-    if (@intFromEnum(level) > @intFromEnum(g_log_level)) return;
-    const sd_prefix = comptime switch (level) {
+    // Verbose messages are emitted as std.log.debug with scope .verbose.
+    // Map (level, scope) to our 5-level LogLevel for runtime filtering.
+    const is_verbose = comptime (scope == .verbose and level == .debug);
+    const effective_level: u8 = if (is_verbose) 3 else switch (level) {
+        .err => 0,
+        .warn => 1,
+        .info => 2,
+        .debug => 4,
+    };
+    const threshold: u8 = switch (g_log_level) {
+        .err => 0,
+        .warn => 1,
+        .info => 2,
+        .verbose => 3,
+        .debug => 4,
+    };
+    if (effective_level > threshold) return;
+
+    const sd_prefix = comptime if (is_verbose) "<7>" else switch (level) {
         .debug => "<7>",
         .info => "<6>",
         .warn => "<5>",
         .err => "<3>",
     };
-    const level_str = comptime switch (level) {
+    const level_str = comptime if (is_verbose) "VERBOSE" else switch (level) {
         .debug => "DEBUG",
         .info => "INFO",
         .warn => "WARN",

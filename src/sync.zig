@@ -16,6 +16,8 @@ const config_mod = @import("./config.zig");
 const state_mod = @import("./state.zig");
 const dns_mod = @import("./dns.zig");
 
+const log_v = std.log.scoped(.verbose);
+
 // ---------------------------------------------------------------------------
 // Wire format constants
 // ---------------------------------------------------------------------------
@@ -276,16 +278,28 @@ pub const SyncManager = struct {
     pub fn notifyLeaseUpdate(self: *Self, lease: state_mod.Lease) void {
         const json = std.json.Stringify.valueAlloc(self.allocator, lease, .{}) catch return;
         defer self.allocator.free(json);
+        var sent: usize = 0;
         for (self.peers.items) |*p| {
-            if (p.authenticated) self.sendMsg(p.addr, .lease_update, json);
+            if (p.authenticated) {
+                self.sendMsg(p.addr, .lease_update, json);
+                sent += 1;
+            }
         }
+        if (sent > 0) log_v.debug("sync: sent lease update {s} ({s}) to {d} peer(s)", .{
+            lease.ip, lease.mac, sent,
+        });
     }
 
     /// Notify all authenticated peers that a lease was deleted (by MAC string).
     pub fn notifyLeaseDelete(self: *Self, mac: []const u8) void {
+        var sent: usize = 0;
         for (self.peers.items) |*p| {
-            if (p.authenticated) self.sendMsg(p.addr, .lease_delete, mac);
+            if (p.authenticated) {
+                self.sendMsg(p.addr, .lease_delete, mac);
+                sent += 1;
+            }
         }
+        if (sent > 0) log_v.debug("sync: sent lease delete {s} to {d} peer(s)", .{ mac, sent });
     }
 
     // -----------------------------------------------------------------------
@@ -589,13 +603,16 @@ pub const SyncManager = struct {
 
         self.store.addLease(incoming) catch |err| {
             std.log.warn("sync: failed to apply received lease update: {s}", .{@errorName(err)});
+            return;
         };
+        log_v.debug("sync: received lease update {s} ({s})", .{ incoming.ip, incoming.mac });
     }
 
     fn applyLeaseDelete(self: *Self, plaintext: []const u8) void {
         // plaintext is the MAC string (17 bytes "xx:xx:xx:xx:xx:xx")
         if (plaintext.len == 0) return;
         self.store.removeLease(plaintext);
+        log_v.debug("sync: received lease delete {s}", .{plaintext});
     }
 
     fn fullSyncToPeer(self: *Self, peer: *Peer) void {
@@ -606,6 +623,10 @@ pub const SyncManager = struct {
             defer self.allocator.free(json);
             self.sendMsg(peer.addr, .lease_update, json);
         }
+        const octets = peerIpOctets(peer);
+        log_v.debug("sync: full dump sent to {d}.{d}.{d}.{d}: {d} lease(s)", .{
+            octets[0], octets[1], octets[2], octets[3], list.len,
+        });
     }
 
     // -----------------------------------------------------------------------

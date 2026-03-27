@@ -8,6 +8,11 @@ const sync_mod = @import("./sync.zig");
 pub const Config = config_mod.Config;
 pub const StateStore = state_mod.StateStore;
 
+// Scoped logger for verbose DHCP event summaries (one line per lease/release/NAK).
+// Emitted at std.log.debug level; logFn in main.zig routes .verbose scope to the
+// "verbose" log level, which sits between info and debug in the runtime filter.
+const log_v = std.log.scoped(.verbose);
+
 pub const Error = error{
     SocketError,
     IoError,
@@ -357,7 +362,7 @@ pub const DHCPServer = struct {
     store: *StateStore,
     /// One DNS updater per pool (indexed parallel to cfg.pools). Null if pool has DNS disabled.
     dns_updaters: []?*dns_mod.DNSUpdater,
-    log_level: *std.log.Level,
+    log_level: *config_mod.LogLevel,
     running: std.atomic.Value(bool),
     last_prune: i64,
     server_ip: [4]u8,
@@ -377,7 +382,7 @@ pub const DHCPServer = struct {
         cfg: *Config,
         cfg_path: []const u8,
         store: *StateStore,
-        log_level: *std.log.Level,
+        log_level: *config_mod.LogLevel,
         sync_mgr: ?*sync_mod.SyncManager,
     ) !*Self {
         const dns_updaters = try createDnsUpdaters(allocator, cfg);
@@ -1210,6 +1215,12 @@ pub const DHCPServer = struct {
 
         @memcpy(pkt[dhcp_min_packet_size .. dhcp_min_packet_size + opts_len], opts_buf[0..opts_len]);
 
+        log_v.debug("DHCPOFFER {d}.{d}.{d}.{d} to {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            offered_ip[0], offered_ip[1], offered_ip[2], offered_ip[3],
+            mac_bytes[0],  mac_bytes[1],  mac_bytes[2],  mac_bytes[3],
+            mac_bytes[4],  mac_bytes[5],
+        });
+
         return pkt;
     }
 
@@ -1286,6 +1297,12 @@ pub const DHCPServer = struct {
         self.store.addLease(new_lease) catch |err| {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
         };
+
+        log_v.debug("DHCPACK {s} to {s}{s}{s} lease={d}s", .{
+            ip_str,                                           mac_str,
+            if (effective_hostname != null) " host=" else "", effective_hostname orelse "",
+            pool.lease_time,
+        });
 
         // Notify sync peers of new/updated lease (use store's copy which has last_modified set)
         if (self.sync_mgr) |s| {
@@ -1507,6 +1524,7 @@ pub const DHCPServer = struct {
         const is_reserved = if (self.store.leases.get(mac_str)) |l| l.reserved else false;
         self.store.removeLease(mac_str);
         if (old_lease) |l| {
+            log_v.debug("DHCPRELEASE {s} from {s}", .{ l.ip, mac_str });
             if (self.poolForIp(l.ip)) |pool| {
                 if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(l.ip, l.hostname);
             }
@@ -1574,7 +1592,7 @@ pub const DHCPServer = struct {
             std.log.warn("Failed to quarantine declined IP {s}: {s}", .{ ip_str, @errorName(err) });
             return;
         };
-        std.log.info("DHCPDECLINE: quarantined {s} for {d}s", .{ ip_str, quarantine_secs });
+        log_v.debug("DHCPDECLINE {s} from {s} (quarantined {d}s)", .{ ip_str, mac_str, quarantine_secs });
 
         // Track declines per MAC. After decline_threshold declines within
         // decline_window_secs, refuse further allocations for decline_cooldown_secs.
@@ -1901,6 +1919,12 @@ pub const DHCPServer = struct {
         resp.chaddr = req_header.chaddr;
         resp.magic = dhcp_magic_cookie;
         @memcpy(pkt[dhcp_min_packet_size .. dhcp_min_packet_size + opts_len], opts_buf[0..opts_len]);
+
+        const nak_mac = req_header.chaddr[0..6];
+        log_v.debug("DHCPNAK to {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            nak_mac[0], nak_mac[1], nak_mac[2], nak_mac[3], nak_mac[4], nak_mac[5],
+        });
+
         return pkt;
     }
 };
@@ -1910,7 +1934,7 @@ pub fn create_server(
     cfg: *Config,
     cfg_path: []const u8,
     store: *StateStore,
-    log_level: *std.log.Level,
+    log_level: *config_mod.LogLevel,
     sync_mgr: ?*sync_mod.SyncManager,
 ) !*DHCPServer {
     return DHCPServer.create(allocator, cfg, cfg_path, store, log_level, sync_mgr);
@@ -1920,7 +1944,7 @@ pub fn create_server(
 // Tests
 // ---------------------------------------------------------------------------
 
-var test_log_level: std.log.Level = .info;
+var test_log_level: config_mod.LogLevel = .info;
 
 test "resolveDestination: giaddr set -> relay at giaddr:67" {
     var pkt = std.mem.zeroes([dhcp_min_packet_size]u8);
