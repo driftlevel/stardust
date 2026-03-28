@@ -318,44 +318,52 @@ fn buildReverseUpdate(
 
 /// Append a TSIG additional record to the message and update ADCOUNT.
 /// Returns the new message length.
+// Build the TSIG variables buffer used as HMAC input (RFC 2845 §4.3.2).
+// Returns number of bytes written.
+fn buildTsigVars(buf: []u8, key_name: []const u8, algo_name: []const u8, now: u64) error{NameTooLong}!usize {
+    var pos: usize = 0;
+    // NAME: wire-encoded key name
+    pos += try encodeDnsName(buf[pos..], key_name);
+    // CLASS: ANY (0x00FF)
+    writeU16(buf[pos..], 255);
+    pos += 2;
+    // TTL: 0
+    writeU32(buf[pos..], 0);
+    pos += 4;
+    // ALGORITHM NAME: wire-encoded
+    pos += try encodeDnsName(buf[pos..], algo_name);
+    // TIME SIGNED: big-endian 48-bit Unix seconds
+    buf[pos + 0] = @intCast((now >> 40) & 0xFF);
+    buf[pos + 1] = @intCast((now >> 32) & 0xFF);
+    buf[pos + 2] = @intCast((now >> 24) & 0xFF);
+    buf[pos + 3] = @intCast((now >> 16) & 0xFF);
+    buf[pos + 4] = @intCast((now >> 8) & 0xFF);
+    buf[pos + 5] = @intCast(now & 0xFF);
+    pos += 6;
+    // FUDGE: 300
+    writeU16(buf[pos..], 300);
+    pos += 2;
+    // ERROR: 0
+    writeU16(buf[pos..], 0);
+    pos += 2;
+    // OTHER LEN: 0
+    writeU16(buf[pos..], 0);
+    pos += 2;
+    return pos;
+}
+
 fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []const u8) error{NameTooLong}!usize {
     const algo_name = switch (key.algorithm) {
         .hmac_sha256 => "hmac-sha256",
         .hmac_md5 => "hmac-md5.sig-alg.reg.int",
     };
 
-    // Build tsig_variables for HMAC input
-    var tsig_vars: [512]u8 = undefined;
-    var tv_pos: usize = 0;
-
-    // wire(key_name)
-    tv_pos += try encodeDnsName(tsig_vars[tv_pos..], key_name);
-
-    // wire(algorithm_name)
-    tv_pos += try encodeDnsName(tsig_vars[tv_pos..], algo_name);
-
-    // time_signed[6] — big-endian 48-bit Unix seconds
     const now_signed: i64 = std.time.timestamp();
     const now: u64 = @intCast(@max(now_signed, 0));
-    tsig_vars[tv_pos + 0] = @intCast((now >> 40) & 0xFF);
-    tsig_vars[tv_pos + 1] = @intCast((now >> 32) & 0xFF);
-    tsig_vars[tv_pos + 2] = @intCast((now >> 24) & 0xFF);
-    tsig_vars[tv_pos + 3] = @intCast((now >> 16) & 0xFF);
-    tsig_vars[tv_pos + 4] = @intCast((now >> 8) & 0xFF);
-    tsig_vars[tv_pos + 5] = @intCast(now & 0xFF);
-    tv_pos += 6;
 
-    // fudge[2] = 300
-    writeU16(tsig_vars[tv_pos..], 300);
-    tv_pos += 2;
-
-    // error[2] = 0
-    writeU16(tsig_vars[tv_pos..], 0);
-    tv_pos += 2;
-
-    // other_len[2] = 0
-    writeU16(tsig_vars[tv_pos..], 0);
-    tv_pos += 2;
+    // Build tsig_variables for HMAC input (RFC 2845 §4.3.2)
+    var tsig_vars: [512]u8 = undefined;
+    const tv_pos = try buildTsigVars(&tsig_vars, key_name, algo_name, now);
 
     // Compute HMAC over base message + tsig_variables
     var mac_buf: [32]u8 = undefined; // large enough for SHA-256
@@ -720,6 +728,62 @@ test "buildReverseUpdate: add=false uses ANY type and TTL=0" {
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00, 0x00 }, buf[71..75]);
     // RDLENGTH = 0
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[75..77]);
+}
+
+test "buildTsigVars: CLASS and TTL present between key name and algorithm (RFC 2845 §4.3.2)" {
+    // wire("dhcp-update") = [11 d h c p - u p d a t e 0] = 13 bytes
+    // wire("hmac-sha256")  = [11 h m a c - s h a 2 5 6 0] = 13 bytes
+    // Total: 13 + 2 (CLASS) + 4 (TTL) + 13 (algo) + 6 (time) + 2 (fudge) + 2 (error) + 2 (other_len) = 44
+    var buf: [512]u8 = undefined;
+    const n = try buildTsigVars(&buf, "dhcp-update", "hmac-sha256", 1700000000);
+    try std.testing.expectEqual(@as(usize, 44), n);
+    // CLASS: ANY = 0x00FF at offset 13 (right after the 13-byte key name wire encoding)
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFF }, buf[13..15]);
+    // TTL: 0 at offset 15
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00, 0x00 }, buf[15..19]);
+    // Algorithm name starts at offset 19; first byte is label length 11
+    try std.testing.expectEqual(@as(u8, 11), buf[19]);
+    try std.testing.expectEqualSlices(u8, "hmac-sha256", buf[20..31]);
+    try std.testing.expectEqual(@as(u8, 0), buf[31]); // root label
+}
+
+test "signTsig: appends TSIG RR with correct type, class, TTL, and ADCOUNT" {
+    // Build a minimal DNS UPDATE message to sign.
+    var msg: [256]u8 = undefined;
+    var pos: usize = 0;
+    // Header: ID + flags + counts (12 bytes)
+    std.mem.writeInt(u16, msg[0..2], 0x1234, .big); // ID
+    std.mem.writeInt(u16, msg[2..4], 0x2800, .big); // UPDATE flags
+    std.mem.writeInt(u16, msg[4..6], 1, .big); // ZOCOUNT
+    std.mem.writeInt(u16, msg[6..8], 0, .big);
+    std.mem.writeInt(u16, msg[8..10], 0, .big);
+    std.mem.writeInt(u16, msg[10..12], 0, .big); // ADCOUNT = 0 before signing
+    pos = 12;
+    // Zone: "example.com" + SOA + IN
+    pos += try encodeDnsName(msg[pos..], "example.com");
+    std.mem.writeInt(u16, msg[pos..][0..2], 6, .big);
+    pos += 2; // SOA
+    std.mem.writeInt(u16, msg[pos..][0..2], 1, .big);
+    pos += 2; // IN
+    const msg_len = pos;
+
+    const key = TsigKey{ .algorithm = .hmac_sha256, .secret = "test_secret_key!" };
+    const signed_len = try signTsig(&msg, msg_len, &key, "dhcp-update");
+
+    // ADCOUNT in header must be 1 after signing
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, msg[10..12]);
+    // TSIG RR appended: name wire("dhcp-update") = 13 bytes
+    const tsig_rr_start = msg_len;
+    try std.testing.expectEqual(@as(u8, 11), msg[tsig_rr_start]); // label len
+    // TYPE = TSIG (250) at tsig_rr_start + 13
+    const type_off = tsig_rr_start + 13;
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFA }, msg[type_off .. type_off + 2]); // 250
+    // CLASS = ANY (255) at type_off + 2
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFF }, msg[type_off + 2 .. type_off + 4]);
+    // TTL = 0 at type_off + 4
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00, 0x00 }, msg[type_off + 4 .. type_off + 8]);
+    // signed_len should be larger than msg_len (TSIG RR was appended)
+    try std.testing.expect(signed_len > msg_len);
 }
 
 test "DNSUpdater: empty key_file leaves tsig_key null (anonymous updates)" {
