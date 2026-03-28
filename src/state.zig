@@ -645,3 +645,103 @@ test "forceRemoveLease is no-op for unknown MAC" {
     store.forceRemoveLease("de:ad:be:ef:00:01");
     try std.testing.expectEqual(@as(usize, 0), store.leases.count());
 }
+
+test "save/load round-trip preserves active lease fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Save phase
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+
+        try store.addLease(.{
+            .mac = "aa:bb:cc:dd:ee:ff",
+            .ip = "192.168.1.10",
+            .hostname = "myhost",
+            .expires = std.time.timestamp() + 3600,
+            .client_id = "01aabbccddeeff",
+        });
+        try store.save();
+    }
+
+    // Load phase
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+        try store.load();
+
+        const lease = store.leases.get("aa:bb:cc:dd:ee:ff");
+        try std.testing.expect(lease != null);
+        try std.testing.expectEqualStrings("192.168.1.10", lease.?.ip);
+        try std.testing.expectEqualStrings("myhost", lease.?.hostname.?);
+        try std.testing.expectEqualStrings("01aabbccddeeff", lease.?.client_id.?);
+    }
+}
+
+test "save/load: expired lease is skipped on load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+
+        try putLease(store, "aa:bb:cc:dd:ee:01", "192.168.1.10", std.time.timestamp() - 1); // expired
+        try putLease(store, "aa:bb:cc:dd:ee:02", "192.168.1.11", std.time.timestamp() + 3600); // active
+        try store.save();
+    }
+
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+        try store.load();
+
+        try std.testing.expectEqual(@as(usize, 1), store.leases.count());
+        try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:01") == null);
+        try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:02") != null);
+    }
+}
+
+test "save/load: reserved lease loads regardless of expiry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+
+        try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", 0, null); // expires=0
+        try store.save();
+    }
+
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+        try store.load();
+
+        const lease = store.leases.get("aa:bb:cc:dd:ee:ff");
+        try std.testing.expect(lease != null);
+        try std.testing.expect(lease.?.reserved);
+        try std.testing.expectEqualStrings("192.168.1.50", lease.?.ip);
+    }
+}
+
+fn makeTestStoreAt(allocator: std.mem.Allocator, dir: []const u8) !*StateStore {
+    const store = try allocator.create(StateStore);
+    store.* = .{
+        .allocator = allocator,
+        .dir = dir,
+        .leases = std.StringHashMap(Lease).init(allocator),
+    };
+    return store;
+}

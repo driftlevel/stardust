@@ -23,3 +23,31 @@ pub const EscapedStr = struct {
 pub fn escapedStr(bytes: []const u8) EscapedStr {
     return .{ .bytes = bytes };
 }
+
+test "EscapedStr: printable ASCII passes through unchanged" {
+    var buf: [64]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try escapedStr("hello world").format(stream.writer());
+    try std.testing.expectEqualStrings("hello world", stream.getWritten());
+}
+
+test "EscapedStr: non-printable bytes are escaped" {
+    var buf: [64]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try escapedStr("\x00\x01\x7f").format(stream.writer());
+    try std.testing.expectEqualStrings("\\x00\\x01\\x7f", stream.getWritten());
+}
+
+test "EscapedStr: mixed printable and non-printable" {
+    var buf: [64]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try escapedStr("host\x00name").format(stream.writer());
+    try std.testing.expectEqualStrings("host\\x00name", stream.getWritten());
+}
+
+test "EscapedStr: empty slice produces empty output" {
+    var buf: [8]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try escapedStr("").format(stream.writer());
+    try std.testing.expectEqualStrings("", stream.getWritten());
+}

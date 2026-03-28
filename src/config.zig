@@ -931,6 +931,30 @@ test "parseLogLevel" {
     try std.testing.expectEqual(LogLevel.info, parseLogLevel("unknown"));
 }
 
+test "reverseZoneForSubnet: /24 produces 3-octet zone" {
+    const zone = try reverseZoneForSubnet(std.testing.allocator, .{ 192, 168, 1, 0 }, 24);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualStrings("1.168.192.in-addr.arpa", zone);
+}
+
+test "reverseZoneForSubnet: /16 produces 2-octet zone" {
+    const zone = try reverseZoneForSubnet(std.testing.allocator, .{ 192, 168, 0, 0 }, 16);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualStrings("168.192.in-addr.arpa", zone);
+}
+
+test "reverseZoneForSubnet: /8 produces 1-octet zone" {
+    const zone = try reverseZoneForSubnet(std.testing.allocator, .{ 10, 0, 0, 0 }, 8);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualStrings("10.in-addr.arpa", zone);
+}
+
+test "reverseZoneForSubnet: prefix > 24 uses 3-octet boundary" {
+    const zone = try reverseZoneForSubnet(std.testing.allocator, .{ 10, 0, 2, 0 }, 25);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualStrings("2.0.10.in-addr.arpa", zone);
+}
+
 test "parseStaticRoutes: CIDR destination parsed and masked" {
     const r = parseOneStaticRoute("10.10.10.5/24", "192.168.1.1");
     try std.testing.expect(r != null);

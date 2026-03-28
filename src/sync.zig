@@ -711,7 +711,7 @@ fn joinMulticast(sock_fd: std.posix.fd_t, mc_addr: []const u8) !void {
 // -----------------------------------------------------------------------
 
 fn peerIpOctets(p: *const SyncManager.Peer) [4]u8 {
-    return @bitCast(std.mem.bigToNative(u32, p.addr.addr));
+    return @bitCast(p.addr.addr);
 }
 
 fn parseIpv4Local(s: []const u8) ![4]u8 {

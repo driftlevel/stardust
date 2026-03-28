@@ -681,3 +681,58 @@ test "parseTsigKey: valid hmac-sha256 key file" {
     try std.testing.expectEqual(Algorithm.hmac_sha256, key.algorithm);
     try std.testing.expectEqualSlices(u8, "test", key.secret);
 }
+
+test "buildReverseUpdate: add=true has PTR record with IN class and FQDN rdata" {
+    var buf: [1024]u8 = undefined;
+    // ip={192,168,1,50}: owner name "50.1.168.192.in-addr.arpa" (27 bytes)
+    // zone "1.168.192.in-addr.arpa" (24 bytes) + SOA+IN (4) = 28 bytes zone section
+    // fwd FQDN "host1.example.com" (19 bytes) as PTR rdata
+    // Total: Header(12) + zone section(28) + PTR owner(27) + PTR+IN+TTL+RDLEN(10) + rdata(19) = 96 bytes.
+    const n = try buildReverseUpdate(&buf, "1.168.192.in-addr.arpa", "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, true);
+    try std.testing.expectEqual(@as(usize, 96), n);
+    // FLAGS = 0x2800 (OPCODE=UPDATE)
+    try std.testing.expectEqual(@as(u8, 0x28), buf[2]);
+    try std.testing.expectEqual(@as(u8, 0x00), buf[3]);
+    // ZOCOUNT=1, PRCOUNT=0, UPCOUNT=1 (PTR only), ADCOUNT=0
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[4..6]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[6..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[8..10]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[10..12]);
+    // PTR record starts at byte 40 (12 header + 28 zone section).
+    // Owner name "50.1.168.192.in-addr.arpa" is 27 bytes, so type field is at byte 67.
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0C }, buf[67..69]); // PTR type = 12
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[69..71]); // IN class
+    // RDLENGTH = 19 (encoded "host1.example.com")
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x13 }, buf[75..77]);
+}
+
+test "buildReverseUpdate: add=false uses ANY type and TTL=0" {
+    var buf: [1024]u8 = undefined;
+    // Total: Header(12) + zone section(28) + PTR owner(27) + ANY+ANY+TTL=0+RDLEN=0(10) = 77 bytes.
+    const n = try buildReverseUpdate(&buf, "1.168.192.in-addr.arpa", "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, false);
+    try std.testing.expectEqual(@as(usize, 77), n);
+    // UPCOUNT=1
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[8..10]);
+    // ANY type (255) and ANY class (255) at byte 67
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFF }, buf[67..69]); // ANY type
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFF }, buf[69..71]); // ANY class
+    // TTL = 0
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00, 0x00 }, buf[71..75]);
+    // RDLENGTH = 0
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[75..77]);
+}
+
+test "DNSUpdater: empty key_file leaves tsig_key null (anonymous updates)" {
+    const cfg = Config{
+        .enable = true,
+        .server = "127.0.0.1",
+        .zone = "example.com",
+        .rev_zone = "1.168.192.in-addr.arpa",
+        .key_name = "",
+        .key_file = "",
+        .lease_time = 3600,
+    };
+    const updater = try DNSUpdater.create(std.testing.allocator, &cfg);
+    defer updater.cleanup();
+    try std.testing.expect(updater.tsig_key == null);
+}
