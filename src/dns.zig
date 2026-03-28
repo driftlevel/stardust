@@ -83,11 +83,6 @@ pub const DNSUpdater = struct {
     }
 
     fn doUpdate(self: *Self, ip_str: []const u8, hostname: []const u8, add: bool) !void {
-        const key = self.tsig_key orelse {
-            std.log.warn("DNS: skipping update for {s} — no TSIG key loaded", .{ip_str});
-            return;
-        };
-
         const ip = parseIpv4Local(ip_str) catch {
             std.log.warn("DNS: invalid IP address '{s}'", .{ip_str});
             return;
@@ -95,7 +90,10 @@ pub const DNSUpdater = struct {
 
         var msg_buf: [1024]u8 = undefined;
         var msg_len = try buildUpdate(&msg_buf, self.config.zone, hostname, ip, self.config.lease_time, add);
-        msg_len = try signTsig(&msg_buf, msg_len, &key, self.config.key_name);
+        // Sign with TSIG if a key is configured; otherwise send as an anonymous update.
+        if (self.tsig_key) |key| {
+            msg_len = try signTsig(&msg_buf, msg_len, &key, self.config.key_name);
+        }
         try sendUpdate(self.config.server, msg_buf[0..msg_len]);
         log_v.debug("DNS: {s} A+PTR {s} {f} → {s}", .{
             if (add) "added" else "removed",
