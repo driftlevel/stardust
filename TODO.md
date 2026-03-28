@@ -15,7 +15,7 @@ Options 53 (MessageType) and 54 (ServerIdentifier) are always included per RFC.
 
 **Option 82 (Relay Agent Information) logged** ✓ (RFC 3046)
 `logRelayAgentInfo()` parses sub-options 1 (circuit-id) and 2 (remote-id)
-and logs them at DEBUG level. Called from `createOffer`, `createAck`, and `handleInform`.
+and logs them at VERBOSE level. Called from `createOffer`, `createAck`, and `handleInform`.
 
 **Pool range validated against subnet** ✓
 `validatePoolRange()` in `config.zig` logs warnings when `pool_start`/`pool_end`
@@ -65,9 +65,15 @@ as DHCPDECLINE. Interface detection via `/sys/class/net` + ioctls.
 
 **DNS update integration** ✓
 Implemented RFC 2136 dynamic DNS updates in `src/dns.zig` with TSIG key
-authentication (HMAC-SHA256 and HMAC-MD5). Sends A/PTR record updates to the
-configured DNS server when a lease is granted or released. Key file format is
-BIND-compatible (`key "name" { algorithm ...; secret "..."; };`).
+authentication (HMAC-SHA256 and HMAC-MD5). Sends A and PTR record updates in
+two separate DNS UPDATE messages (one per zone, per RFC 2136 §3.1). Key file
+format is BIND-compatible (`key "name" { algorithm ...; secret "..."; };`).
+Anonymous (unsigned) updates supported when `key_file` is empty.
+
+**Reverse zone derived from pool subnet** ✓
+`reverseZoneForSubnet()` in `config.zig` derives the `in-addr.arpa` zone name
+from the pool's CIDR prefix: ≤8 bit → one octet, ≤16 bit → two octets,
+>16 bit → three octets. Stored as `dns_update.rev_zone` per pool.
 
 **`dhcp_options` passthrough** ✓
 `Config.dhcp_options` is now populated from `config.yaml` via an untyped YAML
@@ -77,7 +83,7 @@ into OFFER and ACK packets. Values can be comma-separated IPv4 addresses
 decimal strings (e.g. `42: "192.168.1.1"` for NTP server).
 
 **Static IP reservations** ✓
-`reservations:` section in `config.yaml` pins a MAC (or `client_id`) to a
+`reservations:` section in per-pool config pins a MAC (or `client_id`) to a
 fixed IP and optional hostname. Reservations are seeded into the state store at
 startup and on SIGHUP. Reserved leases survive `removeLease` (expires zeroed,
 entry kept); `pruneExpired` skips them. `allocateIp` returns the reserved IP
@@ -101,19 +107,67 @@ included in responses when requested via PRL.
 routes (option 121, RFC 3442). `/0` default routes are rejected (use `router:`
 instead). Routes are sorted and included only when the client's PRL requests them.
 
+**Multi-subnet support via top-level pools** ✓
+Configuration restructured to a `pools:` list. Each pool is one subnet with its
+own lease range, options, reservations, and DNS update config. The relay agent
+`giaddr` selects the correct pool; `ciaddr` and server IP are used as fallbacks.
+
 **Lease sync — redundant server group** ✓
 `src/sync.zig` implements a UDP lease-synchronisation protocol (port 647) for
-active-active DHCP pairs. AES-256-GCM encryption (key derived via HKDF-SHA-256
-from a BIND TSIG key file), SHA-256 pool hash for peer admission, last-write-wins
-conflict resolution via `Lease.last_modified`, and periodic LEASE_HASH
-anti-entropy checks. Discovery via IPv4 multicast or explicit unicast peer list.
-`pool_allocation_random: true` reduces split-brain IP collisions.
+active-active DHCP groups of any size. AES-256-GCM encryption (key derived via
+HKDF-SHA-256 from a BIND TSIG key file), SHA-256 pool hash for peer admission,
+last-write-wins conflict resolution via `Lease.last_modified`, and periodic
+LEASE_HASH anti-entropy checks. Discovery via IPv4 multicast or explicit unicast
+peer list. `pool_allocation_random: true` reduces split-brain IP collisions.
 
 **Logging improvements** ✓
-All output now goes through `std.log` with a custom `logFn` in `main.zig`.
-Each line is written to stderr in the format:
-```
-<N>YYYY-MM-DDTHH:MM:SSZ [LEVEL] message
-```
-where `<N>` is the sd-daemon priority prefix (journald-compatible). Log level
-is configurable via `log_level: debug|info|warn|error` in `config.yaml`.
+All output goes through `std.log` with a custom `logFn` in `main.zig`. Lines are
+written to stderr in the format `<N>YYYY-MM-DDTHH:MM:SSZ [LEVEL] message`.
+Timestamps are omitted when `JOURNAL_STREAM` is set (journald adds its own).
+Log level configurable via `log_level: error|warn|info|verbose|debug`.
+
+**Verbose log level** ✓
+Added `verbose` level between `info` and `debug`. Logs one line per DHCP event
+(DHCPOFFER, DHCPACK, DHCPNAK, DHCPRELEASE, DHCPDECLINE), per DNS update sent,
+and per sync lease send/receive. Implemented using `std.log.scoped(.verbose)`
+riding on `std.log.debug`; `logFn` maps it to effective priority 3.
+
+**Escape non-printable bytes in log output** ✓
+`src/util.zig` provides `EscapedStr` / `escapedStr()`, formatting bytes outside
+the printable ASCII range (0x20–0x7e) as `\xNN`. Used for hostnames and sync
+group names to prevent binary data reaching journald as blob messages.
+
+**Journald timestamp suppression** ✓
+`logFn` checks `JOURNAL_STREAM` at startup; when set, timestamps are omitted
+from log lines so journald's own metadata is not duplicated.
+
+**Probe false-positive fixes for renewing clients** ✓
+Two related bugs fixed in `src/probe.zig` and `src/dhcp.zig`:
+- ARP probe now accepts `client_mac` and ignores replies from the client's own
+  MAC (SHA field in ARP reply), preventing a false conflict when a client already
+  holds the offered IP from a prior lease.
+- `createOffer` resolves the client's existing lease IP before the probe loop
+  and skips probing it entirely — covering the ICMP case where MAC filtering is
+  not possible, and acting as belt-and-suspenders for the ARP case.
+- `isIpQuarantined()` added so the `allocateIp` reuse path checks for an active
+  `conflict:` sentinel before returning a previously quarantined IP.
+
+**DNS duplicate updates and double DHCPACK in HA sync groups** ✓
+Three related HA bugs fixed:
+- `Lease.local` (bool, default false) set to true in `createAck`. Persisted in
+  `leases.json`; forced to false by `applyLeaseUpdate` so DNS ownership never
+  transfers via sync.
+- `shouldHandleDns()` gates all DNS sends (expiry prune and DHCPRELEASE) on
+  `lease.local`, with failover via `isLowestActivePeer`.
+- `isLowestActivePeer(my_ip)` in `SyncManager`: returns true if no authenticated
+  peer has a lower IP. Acts as a deterministic leader election — the lowest-IP
+  active server is always the DNS delegate for non-local leases. Works correctly
+  for groups of any size.
+- REBINDING deferral: when a broadcast DHCPREQUEST has no server identifier,
+  standbys defer to the originating server if it is reachable (lowest-IP check),
+  and take over automatically if it goes down.
+
+**Sync peer IP display fix** ✓
+`peerIpOctets()` was applying `bigToNative` to `addr.addr`, which is already
+stored in network byte order in memory — causing reversed IPs in log messages.
+Fixed by casting directly without byte-swapping.

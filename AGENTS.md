@@ -124,8 +124,10 @@ if (root.get("key")) |val| {
 owns them. `removeLease()` on a reserved lease zeroes `expires` rather than
 deleting. `forceRemoveLease()` deletes unconditionally (used by sync).
 
-**Lease fields**: `reserved: bool = false` and `last_modified: i64 = 0` both
-default to zero for JSON backward-compatibility.
+**Lease fields**: `reserved: bool = false`, `last_modified: i64 = 0`, and
+`local: bool = false` all have JSON-compatible defaults. `local` is set to
+`true` in `createAck` (this server issued the DHCPACK) and forced back to
+`false` in `applyLeaseUpdate` (DNS ownership never transfers via sync).
 
 **Sync crypto**: HKDF-SHA-256 derives a 32-byte AES-256-GCM key from the TSIG
 secret. Every datagram has a 26-byte authenticated-data header (version, type,
@@ -135,3 +137,16 @@ Anti-replay window: ±300 s on the timestamp field.
 **Pool hash** (`config_mod.computePoolHash`): SHA-256 over subnet/mask/pool
 bounds/lease_time/sorted reservations/sorted static routes. Two servers must
 produce identical hashes to authenticate each other during sync handshake.
+
+**DNS ownership in HA groups** (`shouldHandleDns` in `dhcp.zig`): DNS updates
+(adds and deletes) are sent only when `lease.local == true` OR when this server
+is the lowest-IP active node (`sync_mgr.isLowestActivePeer(server_ip)`). The
+lowest-IP election ensures exactly one standby takes over DNS when the originator
+goes offline, for groups of any size.
+
+**Log level**: `config_mod.LogLevel` is `err | warn | info | verbose | debug`.
+Verbose messages use `std.log.scoped(.verbose)` on top of `std.log.debug`;
+`logFn` detects the `.verbose` scope at comptime and maps it to effective
+priority 3 (between info=2 and debug=4). The `{f}` format specifier invokes
+`EscapedStr.format(writer: anytype) !void` (2-arg signature — no `comptime fmt`
+or `FormatOptions` params).
