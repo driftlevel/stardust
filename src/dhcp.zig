@@ -356,6 +356,19 @@ const DeclineRecord = struct {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Atomic counters for DHCP message types. Incremented from the main loop;
+/// read by the metrics/SSH threads. Counters reset to zero at server start.
+pub const Counters = struct {
+    discover: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    offer: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    request: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    ack: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    nak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    release: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    inform: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
     cfg: *Config,
@@ -375,6 +388,8 @@ pub const DHCPServer = struct {
     if_info: ?probe_mod.IfaceInfo,
     /// Lease synchronisation manager. Null when sync is disabled.
     sync_mgr: ?*sync_mod.SyncManager,
+    /// DHCP message counters. Populated only when cfg.metrics.collect is true.
+    counters: Counters,
 
     const Self = @This();
 
@@ -411,6 +426,7 @@ pub const DHCPServer = struct {
             .global_decline_window_start = 0,
             .if_info = null,
             .sync_mgr = sync_mgr,
+            .counters = .{},
         };
         return self;
     }
@@ -800,20 +816,44 @@ pub const DHCPServer = struct {
 
         const msg_type = getMessageType(packet) orelse return null;
 
-        return switch (msg_type) {
-            .DHCPDISCOVER => self.createOffer(packet),
-            .DHCPREQUEST => self.createAck(packet),
-            .DHCPRELEASE => blk: {
+        switch (msg_type) {
+            .DHCPDISCOVER => {
+                _ = self.counters.discover.fetchAdd(1, .monotonic);
+                const resp = try self.createOffer(packet);
+                if (resp != null) _ = self.counters.offer.fetchAdd(1, .monotonic);
+                return resp;
+            },
+            .DHCPREQUEST => {
+                _ = self.counters.request.fetchAdd(1, .monotonic);
+                const resp = try self.createAck(packet);
+                if (resp) |r| {
+                    // Distinguish ACK from NAK by checking option 53 in the response
+                    if (getMessageType(r)) |rt| {
+                        if (rt == .DHCPACK) {
+                            _ = self.counters.ack.fetchAdd(1, .monotonic);
+                        } else {
+                            _ = self.counters.nak.fetchAdd(1, .monotonic);
+                        }
+                    }
+                }
+                return resp;
+            },
+            .DHCPRELEASE => {
+                _ = self.counters.release.fetchAdd(1, .monotonic);
                 self.handleRelease(packet);
-                break :blk null;
+                return null;
             },
-            .DHCPDECLINE => blk: {
+            .DHCPDECLINE => {
+                _ = self.counters.decline.fetchAdd(1, .monotonic);
                 self.handleDecline(packet);
-                break :blk null;
+                return null;
             },
-            .DHCPINFORM => self.handleInform(packet),
-            else => null,
-        };
+            .DHCPINFORM => {
+                _ = self.counters.inform.fetchAdd(1, .monotonic);
+                return self.handleInform(packet);
+            },
+            else => return null,
+        }
     }
 
     /// Scan DHCP options for the first occurrence of `target`. Returns the value slice or null.

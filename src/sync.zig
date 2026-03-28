@@ -13,6 +13,7 @@
 ///   Total overhead: 42 bytes
 const std = @import("std");
 const config_mod = @import("./config.zig");
+const config_write = @import("./config_write.zig");
 const state_mod = @import("./state.zig");
 const dns_mod = @import("./dns.zig");
 const util = @import("./util.zig");
@@ -56,6 +57,8 @@ const anti_replay_window: i64 = 300; // seconds
 pub const SyncManager = struct {
     allocator: std.mem.Allocator,
     cfg: *const config_mod.SyncConfig,
+    full_cfg: *config_mod.Config, // full config for reservation write-back
+    cfg_path: []const u8, // config file path for reservation write-back
     store: *state_mod.StateStore,
     aes_key: [32]u8,
     pool_hash: [32]u8,
@@ -81,6 +84,8 @@ pub const SyncManager = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         cfg: *const config_mod.SyncConfig,
+        full_cfg: *config_mod.Config,
+        cfg_path: []const u8,
         store: *state_mod.StateStore,
         pool_hash: [32]u8,
     ) !*Self {
@@ -129,6 +134,8 @@ pub const SyncManager = struct {
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
+            .full_cfg = full_cfg,
+            .cfg_path = cfg_path,
             .store = store,
             .aes_key = aes_key,
             .pool_hash = pool_hash,
@@ -634,6 +641,31 @@ pub const SyncManager = struct {
             return;
         };
         log_v.debug("sync: received lease update {s} ({s})", .{ incoming.ip, incoming.mac });
+
+        // If this is a reservation, persist it to config.yaml so it survives a reload.
+        // Without this, the reservation would exist in the lease store at runtime but
+        // disappear from config.yaml, causing it to vanish on SIGHUP or restart.
+        if (incoming.reserved) {
+            if (config_write.findPoolForIp(self.full_cfg, incoming.ip)) |pool| {
+                _ = config_write.upsertReservation(
+                    self.allocator,
+                    pool,
+                    incoming.mac,
+                    incoming.ip,
+                    incoming.hostname,
+                    incoming.client_id,
+                ) catch |err| {
+                    std.log.warn("sync: failed to update config.yaml for reservation {s}: {s}", .{ incoming.mac, @errorName(err) });
+                    return;
+                };
+                config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+                    std.log.warn("sync: failed to write config.yaml for reservation {s}: {s}", .{ incoming.mac, @errorName(err) });
+                };
+                log_v.debug("sync: persisted reservation {s} ({s}) to config.yaml", .{ incoming.ip, incoming.mac });
+            } else {
+                std.log.warn("sync: received reservation {s} ({s}) does not match any pool, skipping config write", .{ incoming.ip, incoming.mac });
+            }
+        }
     }
 
     fn applyLeaseDelete(self: *Self, plaintext: []const u8) void {

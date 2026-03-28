@@ -19,6 +19,24 @@ pub const SyncConfig = struct {
     peers: [][]const u8, // empty if using multicast mode
 };
 
+/// SSH admin interface configuration.
+pub const AdminSSHConfig = struct {
+    enable: bool = false,
+    port: u16 = 2267, // DHCP(67) + SSH(22) concatenated
+    bind: []const u8,
+    read_only: bool = false, // if true: viewing only, all writes blocked
+    host_key: []const u8, // path to SSH host private key (Ed25519 recommended)
+    authorized_keys: []const u8, // path to authorized_keys file
+};
+
+/// Prometheus metrics configuration.
+pub const MetricsConfig = struct {
+    collect: bool = true, // enable in-process counters (used by SSH stats page)
+    http_enable: bool = false, // expose via HTTP endpoint
+    http_port: u16 = 9167, // Prometheus convention 91xx + DHCP port 67
+    http_bind: []const u8, // bind address for HTTP server
+};
+
 pub const Reservation = struct {
     mac: []const u8,
     ip: []const u8,
@@ -108,6 +126,8 @@ pub const Config = struct {
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
     sync: ?SyncConfig,
     pools: []PoolConfig, // at least one required
+    admin_ssh: AdminSSHConfig,
+    metrics: MetricsConfig,
 
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.listen_address);
@@ -121,6 +141,10 @@ pub const Config = struct {
             for (s.peers) |p| self.allocator.free(p);
             self.allocator.free(s.peers);
         }
+        self.allocator.free(self.admin_ssh.bind);
+        self.allocator.free(self.admin_ssh.host_key);
+        self.allocator.free(self.admin_ssh.authorized_keys);
+        self.allocator.free(self.metrics.http_bind);
     }
 };
 
@@ -162,6 +186,20 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .pool_allocation_random = false,
         .sync = null,
         .pools = try allocator.alloc(PoolConfig, 0),
+        .admin_ssh = .{
+            .enable = false,
+            .port = 2267,
+            .bind = try allocator.dupe(u8, "0.0.0.0"),
+            .read_only = false,
+            .host_key = try allocator.dupe(u8, "/etc/stardust/ssh_host_key"),
+            .authorized_keys = try allocator.dupe(u8, "/etc/stardust/authorized_keys"),
+        },
+        .metrics = .{
+            .collect = true,
+            .http_enable = false,
+            .http_port = 9167,
+            .http_bind = try allocator.dupe(u8, "127.0.0.1"),
+        },
     };
     errdefer cfg.deinit();
 
@@ -176,6 +214,58 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             if (root_map.get("sync")) |sync_val| {
                 if (sync_val.asMap()) |sync_map| {
                     cfg.sync = try parseSyncConfig(allocator, sync_map);
+                }
+            }
+
+            if (root_map.get("admin_ssh")) |ssh_val| {
+                if (ssh_val.asMap()) |ssh_map| {
+                    if (ssh_map.get("enable")) |v| {
+                        if (v.asScalar()) |s| cfg.admin_ssh.enable = std.mem.eql(u8, s, "true");
+                    }
+                    if (ssh_map.get("port")) |v| {
+                        if (v.asScalar()) |s| cfg.admin_ssh.port = std.fmt.parseInt(u16, s, 10) catch 2267;
+                    }
+                    if (ssh_map.get("bind")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.admin_ssh.bind);
+                            cfg.admin_ssh.bind = try allocator.dupe(u8, s);
+                        }
+                    }
+                    if (ssh_map.get("read_only")) |v| {
+                        if (v.asScalar()) |s| cfg.admin_ssh.read_only = std.mem.eql(u8, s, "true");
+                    }
+                    if (ssh_map.get("host_key")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.admin_ssh.host_key);
+                            cfg.admin_ssh.host_key = try allocator.dupe(u8, s);
+                        }
+                    }
+                    if (ssh_map.get("authorized_keys")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.admin_ssh.authorized_keys);
+                            cfg.admin_ssh.authorized_keys = try allocator.dupe(u8, s);
+                        }
+                    }
+                }
+            }
+
+            if (root_map.get("metrics")) |met_val| {
+                if (met_val.asMap()) |met_map| {
+                    if (met_map.get("collect")) |v| {
+                        if (v.asScalar()) |s| cfg.metrics.collect = !std.mem.eql(u8, s, "false");
+                    }
+                    if (met_map.get("http_enable")) |v| {
+                        if (v.asScalar()) |s| cfg.metrics.http_enable = std.mem.eql(u8, s, "true");
+                    }
+                    if (met_map.get("http_port")) |v| {
+                        if (v.asScalar()) |s| cfg.metrics.http_port = std.fmt.parseInt(u16, s, 10) catch 9167;
+                    }
+                    if (met_map.get("http_bind")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.metrics.http_bind);
+                            cfg.metrics.http_bind = try allocator.dupe(u8, s);
+                        }
+                    }
                 }
             }
 
