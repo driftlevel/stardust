@@ -261,7 +261,7 @@ example `config.yaml`.
 ```ini
 [Unit]
 Description=Stardust DHCP Server
-After=network.target
+After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/stardust -c /etc/stardust/config.yaml
