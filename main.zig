@@ -4,6 +4,7 @@ const config_mod = @import("./src/config.zig");
 const state_mod = @import("./src/state.zig");
 const dns = @import("./src/dns.zig");
 const sync_mod = @import("./src/sync.zig");
+const metrics_mod = @import("./src/metrics.zig");
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -195,6 +196,36 @@ pub fn main() !void {
     // Sync reservations from config into the state store.
     // On SIGHUP the server calls syncReservations() again after reloading config.
     dhcp_server.syncReservations();
+
+    // Start HTTP metrics server in a background thread if enabled.
+    var metrics_server: ?*metrics_mod.MetricsServer = null;
+    var metrics_thread: ?std.Thread = null;
+    if (cfg.metrics.http_enable) {
+        metrics_server = metrics_mod.MetricsServer.init(allocator, cfg, store, &dhcp_server.counters) catch |err| blk: {
+            std.log.err("Failed to initialize metrics server ({s}); running without metrics HTTP", .{@errorName(err)});
+            break :blk null;
+        };
+        if (metrics_server) |ms| {
+            metrics_thread = std.Thread.spawn(.{}, metrics_mod.MetricsServer.run, .{ms}) catch |err| blk: {
+                std.log.err("Failed to start metrics thread ({s}); running without metrics HTTP", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    }
+    defer {
+        if (metrics_server) |ms| {
+            ms.stop();
+            if (metrics_thread) |t| t.join();
+            ms.deinit();
+        }
+    }
+
+    if (cfg.metrics.http_enable and metrics_server != null) {
+        std.log.info("Metrics HTTP server enabled on {s}:{d}", .{
+            cfg.metrics.http_bind,
+            cfg.metrics.http_port,
+        });
+    }
 
     std.log.info("Starting DHCP server...", .{});
     dhcp_server.run() catch |err| {
