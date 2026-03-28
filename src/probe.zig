@@ -83,8 +83,10 @@ pub fn findIfaceForIp(server_ip: [4]u8) !IfaceInfo {
 
 /// Send an ARP request for target_ip and return true if any host replies.
 /// Uses SPA=0.0.0.0 (RFC 5227 probe style) to avoid polluting ARP caches.
+/// Replies from `client_mac` are ignored — the client may already hold the IP
+/// from a previous lease and should not be treated as a conflict with itself.
 /// Returns false on timeout or error.
-pub fn arpProbe(src_mac: [6]u8, if_index: u32, target_ip: [4]u8) !bool {
+pub fn arpProbe(src_mac: [6]u8, if_index: u32, target_ip: [4]u8, client_mac: [6]u8) !bool {
     const sock = try std.posix.socket(
         std.os.linux.AF.PACKET,
         std.posix.SOCK.RAW,
@@ -146,9 +148,12 @@ pub fn arpProbe(src_mac: [6]u8, if_index: u32, target_ip: [4]u8) !bool {
         const n = std.posix.recv(sock, &buf, 0) catch return false;
         if (n < 42) continue;
         // ARP reply (oper=2) where the sender (SPA, buf[28..32]) is our target.
+        // Ignore replies from the client being offered the address — it may already
+        // hold the IP from a previous lease and is not a conflict with itself.
         if (buf[12] == 0x08 and buf[13] == 0x06 and
             buf[20] == 0x00 and buf[21] == 0x02 and
-            std.mem.eql(u8, buf[28..32], &target_ip))
+            std.mem.eql(u8, buf[28..32], &target_ip) and
+            !std.mem.eql(u8, buf[22..28], &client_mac))
         {
             return true;
         }

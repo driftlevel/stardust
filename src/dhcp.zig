@@ -853,6 +853,13 @@ pub const DHCPServer = struct {
         return (ip_int & pool.subnet_mask) == subnet_int;
     }
 
+    /// Returns true if the given IP string has an active probe-conflict quarantine entry.
+    fn isIpQuarantined(store: *state_mod.StateStore, ip_str: []const u8) bool {
+        var mac_buf: [24]u8 = undefined; // "conflict:255.255.255.255" = 24 chars
+        const conflict_mac = std.fmt.bufPrint(&mac_buf, "conflict:{s}", .{ip_str}) catch return false;
+        return store.getLeaseByMac(conflict_mac) != null;
+    }
+
     fn allocateIp(self: *Self, pool: *const config_mod.PoolConfig, mac_bytes: [6]u8, client_id: ?[]const u8) !?[4]u8 {
         var mac_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -874,19 +881,21 @@ pub const DHCPServer = struct {
         // Client identifier (option 61) takes precedence over chaddr per RFC 2131 §2.
         // A client moving between pools should receive a fresh allocation from the new pool,
         // not its old IP from a different subnet.
+        // Skip reuse if the IP was quarantined by a probe conflict — fall through to pool scan
+        // so a different address is allocated instead of retrying the same conflicted one.
         if (client_id) |cid| {
             var cid_hex_buf: [510]u8 = undefined;
             const cid_hex = std.fmt.bufPrint(&cid_hex_buf, "{x}", .{cid}) catch "";
             if (cid_hex.len > 0) {
                 if (self.store.getLeaseByClientId(cid_hex)) |lease| {
                     const ip = try config_mod.parseIpv4(lease.ip);
-                    if (ipInPool(ip, pool)) return ip;
+                    if (ipInPool(ip, pool) and !isIpQuarantined(self.store, lease.ip)) return ip;
                 }
             }
         }
         if (self.store.getLeaseByMac(mac_str)) |lease| {
             const ip = try config_mod.parseIpv4(lease.ip);
-            if (ipInPool(ip, pool)) return ip;
+            if (ipInPool(ip, pool) and !isIpQuarantined(self.store, lease.ip)) return ip;
         }
 
         // Check for a reservation for this client in the selected pool's config (ignores expiry).
@@ -978,12 +987,14 @@ pub const DHCPServer = struct {
     /// Returns true if `ip` appears to be in use on the network.
     /// Uses ARP for locally-attached networks (giaddr==0), ICMP for relayed.
     /// On any probe error, returns false (false negatives preferred over blocking).
-    fn probeConflict(self: *Self, ip: [4]u8, is_relayed: bool) bool {
+    /// `client_mac` is excluded from ARP replies so a client that already holds
+    /// the offered IP is not treated as a conflict.
+    fn probeConflict(self: *Self, ip: [4]u8, is_relayed: bool, client_mac: [6]u8) bool {
         if (is_relayed) {
             return probe_mod.icmpProbe(ip) catch false;
         } else {
             const info = self.if_info orelse return false;
-            return probe_mod.arpProbe(info.mac, info.index, ip) catch false;
+            return probe_mod.arpProbe(info.mac, info.index, ip, client_mac) catch false;
         }
     }
 
@@ -1018,12 +1029,25 @@ pub const DHCPServer = struct {
         // giaddr != 0 means the DISCOVER came through a relay agent.
         const is_relayed = !std.mem.eql(u8, &req_header.giaddr, &[_]u8{ 0, 0, 0, 0 });
 
+        // Resolve the client's currently-leased IP, if any. Probing it would get a false
+        // positive from the client itself (ARP handles this via MAC filter, but ICMP cannot).
+        const client_existing_ip: ?[4]u8 = blk: {
+            var mac_str_buf: [17]u8 = undefined;
+            const mac_str_tmp = std.fmt.bufPrint(&mac_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5],
+            }) catch break :blk null;
+            const lease = self.store.getLeaseByMac(mac_str_tmp) orelse break :blk null;
+            break :blk config_mod.parseIpv4(lease.ip) catch null;
+        };
+
         // Probe up to probe_max_tries candidates. On conflict, quarantine the IP
         // (so allocateIp skips it next iteration) and try again.
         const offered_ip = blk: {
             for (0..probe_mod.probe_max_tries) |_| {
                 const candidate = (try self.allocateIp(pool, mac_bytes, client_id_raw)) orelse break :blk null;
-                if (!self.probeConflict(candidate, is_relayed)) break :blk candidate;
+                // Skip probe if this is the client's own existing IP — they legitimately hold it.
+                const is_clients_own = if (client_existing_ip) |cip| std.mem.eql(u8, &cip, &candidate) else false;
+                if (is_clients_own or !self.probeConflict(candidate, is_relayed, mac_bytes)) break :blk candidate;
                 self.quarantineProbeConflict(candidate);
             }
             break :blk null;
