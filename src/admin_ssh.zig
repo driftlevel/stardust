@@ -442,12 +442,21 @@ const TuiState = struct {
     tab: Tab = .leases,
     lease_row: u16 = 0,
     lease_start: u16 = 0,
-    sort_col: SortCol = .none,
-    sort_dir: SortDir = .asc,
+    sort_col: SortCol = .expires,
+    sort_dir: SortDir = .desc,
     // Filter ('/') — active while the user is typing; cleared when Esc/Enter pressed.
     filter_active: bool = false,
     filter_buf: [256]u8 = undefined,
     filter_len: usize = 0,
+    // Yank mode ('y' prefix) — next keypress copies i=IP, m=MAC, h=hostname via OSC 52.
+    yank_mode: bool = false,
+    // Selected row field values (updated each frame by renderLeaseTab).
+    sel_ip: [16]u8 = [_]u8{0} ** 16,
+    sel_ip_len: usize = 0,
+    sel_mac: [18]u8 = [_]u8{0} ** 18,
+    sel_mac_len: usize = 0,
+    sel_hostname: [256]u8 = [_]u8{0} ** 256,
+    sel_hostname_len: usize = 0,
 };
 
 /// Replicate the vaxis Table dynamic_fill column-width calculation.
@@ -468,6 +477,21 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
+}
+
+/// Send an OSC 52 clipboard write sequence (base64-encodes text).
+/// Works over SSH with terminals that support OSC 52 (kitty, iTerm2, most
+/// modern xterm-compatible terminals). No-op for terminals that ignore it.
+fn sendOsc52(writer: *std.io.Writer, text: []const u8) !void {
+    const enc = std.base64.standard.Encoder;
+    const b64_len = enc.calcSize(text.len);
+    // 512 bytes covers IP (20), MAC (24), and typical hostnames (≤344 for 256-char name).
+    var b64_buf: [512]u8 = undefined;
+    if (b64_len > b64_buf.len) return; // safety: skip if text is unexpectedly long
+    const b64 = enc.encode(b64_buf[0..b64_len], text);
+    try writer.writeAll("\x1b]52;c;");
+    try writer.writeAll(b64);
+    try writer.writeAll("\x07");
 }
 
 fn runTui(
@@ -610,11 +634,29 @@ fn runTui(
                                 state.filter_len += 1;
                             }
                         }
+                    } else if (state.yank_mode) {
+                        // Yank mode: one keypress selects the field to copy.
+                        state.yank_mode = false;
+                        const yank_text: []const u8 = if (key.matches('i', .{}))
+                            state.sel_ip[0..state.sel_ip_len]
+                        else if (key.matches('m', .{}))
+                            state.sel_mac[0..state.sel_mac_len]
+                        else if (key.matches('h', .{}))
+                            state.sel_hostname[0..state.sel_hostname_len]
+                        else
+                            "";
+                        if (yank_text.len > 0) {
+                            try sendOsc52(io, yank_text);
+                            try io.flush();
+                        }
                     } else {
                         // Normal mode.
                         if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
                             running = false;
                             break :parse_loop;
+                        }
+                        if (key.matches('y', .{}) and state.tab == .leases) {
+                            state.yank_mode = true;
                         }
                         if (key.matches('/', .{}) and state.tab == .leases) {
                             state.filter_active = true;
@@ -660,13 +702,19 @@ fn runTui(
                     }
                 },
                 .mouse => |mouse| {
-                    if (state.tab == .leases) {
-                        switch (mouse.button) {
-                            .wheel_up => table_ctx.row -|= 1,
-                            .wheel_down => table_ctx.row +|= 1,
-                            .left => if (mouse.type == .press and mouse.row >= 0) {
-                                const term_row: u16 = @intCast(mouse.row);
-                                const term_col: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
+                    switch (mouse.button) {
+                        .left => if (mouse.type == .press) {
+                            const term_row: u16 = if (mouse.row >= 0) @intCast(mouse.row) else 0;
+                            const term_col: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
+                            if (term_row == 0) {
+                                // Header bar: tab switching.
+                                // Layout: " Stardust "(10) + " [1] Leases "(12) + " [2] Stats "(11)
+                                if (term_col >= 10 and term_col < 22) {
+                                    state.tab = .leases;
+                                } else if (term_col >= 22 and term_col < 33) {
+                                    state.tab = .stats;
+                                }
+                            } else if (state.tab == .leases) {
                                 if (term_row == 1) {
                                     // Column header row: sort by clicked column.
                                     const n_cols: u16 = 6;
@@ -687,9 +735,15 @@ fn runTui(
                                     if (clicked <= std.math.maxInt(u16))
                                         table_ctx.row = @intCast(clicked);
                                 }
-                            },
-                            else => {},
-                        }
+                            }
+                        },
+                        .wheel_up => if (state.tab == .leases) {
+                            table_ctx.row -|= 1;
+                        },
+                        .wheel_down => if (state.tab == .leases) {
+                            table_ctx.row +|= 1;
+                        },
+                        else => {},
                     }
                 },
                 else => {},
@@ -798,12 +852,24 @@ fn renderHeader(state: *TuiState, win: vaxis.Window) void {
     _ = win.print(&.{.{ .text = stats_label, .style = if (state.tab == .stats) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
     col += @intCast(stats_label.len);
 
-    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  q:quit";
+    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  y:yank  q:quit";
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
 
 fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     win.fill(.{ .style = .{ .bg = .{ .rgb = .{ 15, 15, 15 } } } });
+
+    if (state.tab == .leases and state.yank_mode) {
+        const yank_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0, 0, 0 } },
+            .bg = .{ .rgb = .{ 80, 220, 80 } },
+            .bold = true,
+        };
+        _ = win.print(&.{
+            .{ .text = " YANK: i=IP  m=MAC  h=hostname  (any other key cancels)", .style = yank_style },
+        }, .{ .col_offset = 0, .wrap = .none });
+        return;
+    }
 
     if (state.tab == .leases and state.filter_active) {
         // Filter input bar.
@@ -854,20 +920,150 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
 // Column base names (index matches SortCol enum value).
 const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expires", "pool" };
 
-/// Sort context for lease rows.
+// Per-column layout spec:
+//   ideal     — preferred width (chars) when terminal has enough space
+//   min       — minimum width before this column is squeezed no further
+//   left_trunc — true = show the END of the string (best for addresses);
+//               false = show the START (best for hostnames, labels)
+const LeaseColSpec = struct { ideal: u16, min: u16, left_trunc: bool };
+const LEASE_COL_SPECS = [6]LeaseColSpec{
+    .{ .ideal = 15, .min = 7, .left_trunc = true }, // ip      ("255.255.255.255" = 15)
+    .{ .ideal = 17, .min = 9, .left_trunc = true }, // mac     ("aa:bb:cc:dd:ee:ff" = 17)
+    .{ .ideal = 24, .min = 6, .left_trunc = false }, // hostname
+    .{ .ideal = 8, .min = 4, .left_trunc = false }, // type    ("reserved" = 8)
+    .{ .ideal = 9, .min = 7, .left_trunc = false }, // expires ("1234h56m" ~ 9)
+    .{ .ideal = 14, .min = 7, .left_trunc = false }, // pool    ("192.168.0.0/24" = 14)
+};
+// Columns reduced in this priority order when terminal is too narrow.
+// Flexible/variable content is reduced first; address columns last.
+const LEASE_COL_REDUCE_ORDER = [6]usize{ 2, 5, 4, 3, 0, 1 }; // hostname→pool→exp→type→ip→mac
+const LEASE_COL_SEP: u16 = 1; // single space between columns
+
+/// Calculate column widths that fit within win_width.
+/// Total occupied = sum(widths) + (N-1)*LEASE_COL_SEP.
+fn calcLeaseColWidths(win_width: u16) [6]u16 {
+    var widths: [6]u16 = undefined;
+    for (LEASE_COL_SPECS, 0..) |spec, i| widths[i] = spec.ideal;
+    const seps: u16 = (LEASE_COL_SPECS.len - 1) * LEASE_COL_SEP;
+    var total: u16 = seps;
+    for (widths) |w| total +|= w;
+    for (LEASE_COL_REDUCE_ORDER) |col| {
+        if (total <= win_width) break;
+        const over = total - win_width;
+        const slack = widths[col] - LEASE_COL_SPECS[col].min;
+        const cut = @min(over, slack);
+        widths[col] -= cut;
+        total -= cut;
+    }
+    return widths;
+}
+
+/// Truncate `text` to fit within `width` terminal columns using a single '…'.
+/// left_trunc=true  → show the END of the string ("…1.100" for an IP);
+/// left_trunc=false → show the BEGINNING ("hostname…").
+/// Returns a slice of the input (no alloc) when it already fits.
+fn truncateCell(fa: std.mem.Allocator, text: []const u8, width: u16, left_trunc: bool) ![]const u8 {
+    if (width == 0) return "";
+    if (text.len <= width) return text; // fits as-is (ASCII assumed for network data)
+    if (width == 1) return "…";
+    const content_len = width - 1; // one column reserved for the ellipsis
+    if (left_trunc) {
+        return try std.fmt.allocPrint(fa, "…{s}", .{text[text.len - content_len ..]});
+    } else {
+        return try std.fmt.allocPrint(fa, "{s}…", .{text[0..content_len]});
+    }
+}
+
+/// Custom lease-table renderer with fixed-width address columns and sensible
+/// proportional widths.  Replaces vaxis.widgets.Table.drawTable.
+fn drawLeaseTable(
+    win: vaxis.Window,
+    rows: []const LeaseRow,
+    ctx: *vaxis.widgets.Table.TableContext,
+    header_names: []const []const u8,
+    fa: std.mem.Allocator,
+) !void {
+    if (win.height < 2 or win.width < 10) return;
+
+    const widths = calcLeaseColWidths(@intCast(win.width));
+    const hdr_bg: vaxis.Color = .{ .rgb = .{ 30, 30, 50 } };
+    const hdr_style: vaxis.Style = .{
+        .bold = true,
+        .fg = .{ .rgb = .{ 200, 200, 200 } },
+        .bg = hdr_bg,
+    };
+
+    // --- Header row ---
+    {
+        const hdr_win = win.child(.{ .y_off = 0, .height = 1, .width = win.width });
+        hdr_win.fill(.{ .style = .{ .bg = hdr_bg } });
+        var x: i17 = 0;
+        for (0..6) |ci| {
+            if (widths[ci] > 0) {
+                const cell = hdr_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
+                const text = try truncateCell(fa, header_names[ci], widths[ci], false);
+                _ = cell.print(&.{.{ .text = text, .style = hdr_style }}, .{ .wrap = .none });
+            }
+            x += @as(i17, widths[ci]) + LEASE_COL_SEP;
+        }
+    }
+
+    // --- Scroll-offset management (mirrors vaxis Table logic) ---
+    const visible: u16 = win.height -| 1;
+    const n: u16 = if (rows.len > 0xFFFF) 0xFFFF else @intCast(rows.len);
+    if (n > 0 and ctx.row >= n) ctx.row = n - 1;
+    if (n == 0) ctx.row = 0;
+    ctx.start = start: {
+        if (ctx.row == 0) break :start 0;
+        if (ctx.row < ctx.start) break :start ctx.row;
+        const end = ctx.start +| visible;
+        if (ctx.row >= end) break :start ctx.start + (ctx.row - end + 1);
+        break :start ctx.start;
+    };
+
+    // --- Data rows ---
+    const alt_bg: vaxis.Color = .{ .rgb = .{ 22, 22, 28 } };
+    for (0..visible) |ri| {
+        const row_idx = ctx.start + @as(u16, @intCast(ri));
+        if (row_idx >= rows.len) break;
+        const row = rows[row_idx];
+        const selected = (row_idx == ctx.row);
+        const row_bg: vaxis.Color = if (selected) ctx.active_bg else if (ri % 2 != 0) alt_bg else .default;
+        const row_style: vaxis.Style = .{ .bg = row_bg };
+
+        const row_win = win.child(.{ .x_off = 0, .y_off = @intCast(ri + 1), .width = win.width, .height = 1 });
+        row_win.fill(.{ .style = row_style });
+
+        const fields = [6][]const u8{ row.ip, row.mac, row.hostname, row.type, row.expires, row.pool };
+        var x: i17 = 0;
+        for (0..6) |ci| {
+            if (widths[ci] > 0) {
+                const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
+                const lt = LEASE_COL_SPECS[ci].left_trunc;
+                const text = try truncateCell(fa, fields[ci], widths[ci], lt);
+                _ = cell.print(&.{.{ .text = text, .style = row_style }}, .{ .wrap = .none });
+            }
+            x += @as(i17, widths[ci]) + LEASE_COL_SEP;
+        }
+    }
+}
+
+/// Sort context for raw leases.  Operates on state_mod.Lease directly so that
+/// the expires column sorts by numeric timestamp rather than a formatted string.
 const LeaseSort = struct {
     col: SortCol,
     dir: SortDir,
+    cfg: *const config_mod.Config,
 
-    fn lessThan(ctx: LeaseSort, a: LeaseRow, b: LeaseRow) bool {
+    fn lessThan(ctx: LeaseSort, a: state_mod.Lease, b: state_mod.Lease) bool {
         const asc = switch (ctx.col) {
             .none => return false,
             .ip => ipLess(a.ip, b.ip),
             .mac => std.mem.lessThan(u8, a.mac, b.mac),
-            .hostname => std.mem.lessThan(u8, a.hostname, b.hostname),
-            .type => std.mem.lessThan(u8, a.type, b.type),
-            .expires => std.mem.lessThan(u8, a.expires, b.expires),
-            .pool => std.mem.lessThan(u8, a.pool, b.pool),
+            .hostname => std.mem.lessThan(u8, a.hostname orelse "", b.hostname orelse ""),
+            .type => std.mem.lessThan(u8, if (a.reserved) "reserved" else "dynamic", if (b.reserved) "reserved" else "dynamic"),
+            .expires => expiresLess(a, b),
+            .pool => poolLess(ctx.cfg, a.ip, b.ip),
         };
         return if (ctx.dir == .asc) asc else !asc;
     }
@@ -878,6 +1074,19 @@ const LeaseSort = struct {
         const a_n = std.mem.readInt(u32, &a_bytes, .big);
         const b_n = std.mem.readInt(u32, &b_bytes, .big);
         return a_n < b_n;
+    }
+
+    fn expiresLess(a: state_mod.Lease, b: state_mod.Lease) bool {
+        // Treat reserved leases as expires = maxInt so they sort after dynamic leases.
+        const a_exp: i64 = if (a.reserved) std.math.maxInt(i64) else a.expires;
+        const b_exp: i64 = if (b.reserved) std.math.maxInt(i64) else b.expires;
+        return a_exp < b_exp;
+    }
+
+    fn poolLess(cfg: *const config_mod.Config, a_ip: []const u8, b_ip: []const u8) bool {
+        const a_pool = findPoolLabel(cfg, a_ip) orelse "";
+        const b_pool = findPoolLabel(cfg, b_ip) orelse "";
+        return std.mem.lessThan(u8, a_pool, b_pool);
     }
 };
 
@@ -898,6 +1107,16 @@ fn renderLeaseTab(
 
     const leases = server.store.listLeases() catch return;
     defer server.store.allocator.free(leases);
+
+    // Sort raw leases before formatting so numeric fields (expires timestamp)
+    // compare correctly.
+    if (state.sort_col != .none) {
+        std.sort.pdq(state_mod.Lease, leases, LeaseSort{
+            .col = state.sort_col,
+            .dir = state.sort_dir,
+            .cfg = server.cfg,
+        }, LeaseSort.lessThan);
+    }
 
     var rows = std.ArrayList(LeaseRow){};
     for (leases) |lease| {
@@ -934,17 +1153,26 @@ fn renderLeaseTab(
         });
     }
 
-    // Sort rows if a sort column is active.
-    if (state.sort_col != .none) {
-        std.sort.pdq(LeaseRow, rows.items, LeaseSort{ .col = state.sort_col, .dir = state.sort_dir }, LeaseSort.lessThan);
-    }
-
     // Clamp table cursor to the actual number of rows.
     const n_rows: u16 = if (rows.items.len > 0xFFFF) 0xFFFF else @intCast(rows.items.len);
     if (n_rows > 0 and table_ctx.row >= n_rows) table_ctx.row = n_rows - 1;
     if (n_rows == 0) table_ctx.row = 0;
 
-    // Build custom column headers with sort indicator on the active column.
+    // Update selected-row state (used by yank mode to copy fields to clipboard).
+    if (rows.items.len > 0 and table_ctx.row < rows.items.len) {
+        const sel = rows.items[table_ctx.row];
+        const ip_len = @min(sel.ip.len, state.sel_ip.len);
+        @memcpy(state.sel_ip[0..ip_len], sel.ip[0..ip_len]);
+        state.sel_ip_len = ip_len;
+        const mac_len = @min(sel.mac.len, state.sel_mac.len);
+        @memcpy(state.sel_mac[0..mac_len], sel.mac[0..mac_len]);
+        state.sel_mac_len = mac_len;
+        const hn_len = @min(sel.hostname.len, state.sel_hostname.len);
+        @memcpy(state.sel_hostname[0..hn_len], sel.hostname[0..hn_len]);
+        state.sel_hostname_len = hn_len;
+    }
+
+    // Build column headers with sort indicator on the active column.
     var hdr_names: [LEASE_COL_NAMES.len][]const u8 = undefined;
     for (LEASE_COL_NAMES, 0..) |base, i| {
         if (state.sort_col != .none and @intFromEnum(state.sort_col) == i) {
@@ -954,9 +1182,7 @@ fn renderLeaseTab(
             hdr_names[i] = base;
         }
     }
-    table_ctx.header_names = .{ .custom = &hdr_names };
-    table_ctx.active = true;
-    try vaxis.widgets.Table.drawTable(a, win, rows.items, table_ctx);
+    try drawLeaseTable(win, rows.items, table_ctx, &hdr_names, a);
 }
 
 fn findPoolLabel(cfg: *const config_mod.Config, ip_str: []const u8) ?[]const u8 {
@@ -1098,4 +1324,135 @@ fn isIpInPool(ip_str: []const u8, pool: *const config_mod.PoolConfig) bool {
     const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
     return (ip_int & pool.subnet_mask) == subnet_int;
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+test "calcDynColWidth: result covers window width" {
+    // 6-column layout at common terminal widths
+    for ([_]u16{ 80, 100, 120, 132, 200 }) |w| {
+        const cw = calcDynColWidth(w, 6);
+        try std.testing.expect(@as(u32, cw) * 6 >= @as(u32, w) -| 1);
+    }
+}
+
+test "calcDynColWidth: zero columns returns full width" {
+    try std.testing.expectEqual(@as(u16, 80), calcDynColWidth(80, 0));
+}
+
+test "calcDynColWidth: single column returns full width" {
+    const cw = calcDynColWidth(80, 1);
+    try std.testing.expectEqual(@as(u16, 80), cw);
+}
+
+test "calcLeaseColWidths: fits within window" {
+    const seps: u16 = 5;
+    for ([_]u16{ 80, 100, 120, 200 }) |w| {
+        const cols = calcLeaseColWidths(w);
+        var total: u16 = seps;
+        for (cols) |col_w| total += col_w;
+        try std.testing.expect(total <= w);
+    }
+}
+
+test "calcLeaseColWidths: ideal layout at wide terminal" {
+    // At 200 chars, all columns should be at their ideal widths.
+    const cols = calcLeaseColWidths(200);
+    for (LEASE_COL_SPECS, 0..) |spec, i| {
+        try std.testing.expectEqual(spec.ideal, cols[i]);
+    }
+}
+
+test "calcLeaseColWidths: respects minimums at narrow terminal" {
+    const cols = calcLeaseColWidths(40);
+    for (LEASE_COL_SPECS, 0..) |spec, i| {
+        try std.testing.expect(cols[i] >= spec.min);
+    }
+}
+
+test "truncateCell: no truncation when fits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    const result = try truncateCell(fa, "192.168.1.1", 15, true);
+    try std.testing.expectEqualStrings("192.168.1.1", result);
+}
+
+test "truncateCell: right truncation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    const result = try truncateCell(fa, "very-long-hostname.example.com", 12, false);
+    try std.testing.expectEqualStrings("very-long-ho…", result);
+    try std.testing.expectEqual(@as(usize, 12 - 1 + 3), result.len); // content(11) + "…"(3 bytes)
+}
+
+test "truncateCell: left truncation for addresses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    // "192.168.100.200" (len=15), width=10: content_len=9, take last 9 chars = "8.100.200"
+    const result = try truncateCell(fa, "192.168.100.200", 10, true);
+    try std.testing.expectEqualStrings("…8.100.200", result);
+}
+
+test "truncateCell: width=1 returns ellipsis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    const result = try truncateCell(fa, "hello", 1, false);
+    try std.testing.expectEqualStrings("…", result);
+}
+
+test "containsIgnoreCase: basic matching" {
+    try std.testing.expect(containsIgnoreCase("Hello World", "hello"));
+    try std.testing.expect(containsIgnoreCase("Hello World", "WORLD"));
+    try std.testing.expect(containsIgnoreCase("Hello World", "lo Wo"));
+    try std.testing.expect(!containsIgnoreCase("Hello World", "xyz"));
+}
+
+test "containsIgnoreCase: IP and MAC patterns" {
+    try std.testing.expect(containsIgnoreCase("192.168.1.1", "192"));
+    try std.testing.expect(containsIgnoreCase("aa:bb:cc:dd:ee:ff", "DD:EE"));
+    try std.testing.expect(!containsIgnoreCase("192.168.1.1", "10.0"));
+}
+
+test "containsIgnoreCase: edge cases" {
+    try std.testing.expect(containsIgnoreCase("abc", "")); // empty needle = always match
+    try std.testing.expect(!containsIgnoreCase("", "abc")); // empty haystack, non-empty needle
+    try std.testing.expect(containsIgnoreCase("", "")); // both empty
+    try std.testing.expect(containsIgnoreCase("x", "x")); // exact match
+    try std.testing.expect(!containsIgnoreCase("x", "xy")); // needle longer than haystack
+}
+
+test "LeaseSort.ipLess: numeric ordering" {
+    try std.testing.expect(LeaseSort.ipLess("10.0.0.1", "10.0.0.2"));
+    try std.testing.expect(!LeaseSort.ipLess("10.0.0.2", "10.0.0.1"));
+    try std.testing.expect(!LeaseSort.ipLess("10.0.0.1", "10.0.0.1")); // equal = not less
+    try std.testing.expect(LeaseSort.ipLess("192.168.1.1", "192.168.1.100"));
+    try std.testing.expect(LeaseSort.ipLess("10.0.0.1", "192.168.0.0")); // 10.x < 192.x
+    try std.testing.expect(LeaseSort.ipLess("0.0.0.0", "255.255.255.255"));
+}
+
+test "LeaseSort.expiresLess: timestamp ordering" {
+    const mk = struct {
+        fn lease(ip: []const u8, exp: i64, res: bool) state_mod.Lease {
+            return .{ .mac = "aa:bb:cc:dd:ee:ff", .ip = ip, .hostname = null, .expires = exp, .reserved = res };
+        }
+    };
+    const a = mk.lease("10.0.0.1", 1000, false);
+    const b = mk.lease("10.0.0.2", 2000, false);
+    const r = mk.lease("10.0.0.3", 0, true); // reserved = expires as maxInt
+
+    try std.testing.expect(LeaseSort.expiresLess(a, b)); // 1000 < 2000
+    try std.testing.expect(!LeaseSort.expiresLess(b, a));
+    try std.testing.expect(!LeaseSort.expiresLess(a, a)); // equal = not less
+    try std.testing.expect(LeaseSort.expiresLess(b, r)); // dynamic < reserved (maxInt)
+    try std.testing.expect(!LeaseSort.expiresLess(r, a)); // reserved not < dynamic
 }
