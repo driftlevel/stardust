@@ -434,11 +434,41 @@ const LeaseRow = struct {
 
 const Tab = enum(u8) { leases = 0, stats = 1 };
 
+// Lease table sort state.  Column index matches LeaseRow field order (0-based).
+const SortCol = enum(u8) { none = 255, ip = 0, mac = 1, hostname = 2, type = 3, expires = 4, pool = 5 };
+const SortDir = enum { asc, desc };
+
 const TuiState = struct {
     tab: Tab = .leases,
     lease_row: u16 = 0,
     lease_start: u16 = 0,
+    sort_col: SortCol = .none,
+    sort_dir: SortDir = .asc,
+    // Filter ('/') — active while the user is typing; cleared when Esc/Enter pressed.
+    filter_active: bool = false,
+    filter_buf: [256]u8 = undefined,
+    filter_len: usize = 0,
 };
+
+/// Replicate the vaxis Table dynamic_fill column-width calculation.
+fn calcDynColWidth(win_width: u16, num_cols: u16) u16 {
+    if (num_cols == 0) return win_width;
+    var cw: u16 = win_width / num_cols;
+    if (cw % 2 != 0) cw +|= 1;
+    while (@as(u32, cw) * num_cols < @as(u32, win_width) -| 1) cw +|= 1;
+    return cw;
+}
+
+/// Case-insensitive substring search.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
 
 fn runTui(
     server: *AdminServer,
@@ -565,22 +595,75 @@ fn runTui(
             const event = result.event orelse continue;
             switch (event) {
                 .key_press => |key| {
-                    if (key.matches('c', .{ .ctrl = true }) or
-                        key.matches('q', .{}))
-                    {
-                        running = false;
-                        break :parse_loop;
+                    if (state.filter_active) {
+                        // Filter input mode: Esc/Enter closes; Backspace deletes;
+                        // printable ASCII appends.
+                        if (key.matches(vaxis.Key.escape, .{}) or
+                            key.matches(vaxis.Key.enter, .{}))
+                        {
+                            state.filter_active = false;
+                        } else if (key.matches(vaxis.Key.backspace, .{})) {
+                            if (state.filter_len > 0) state.filter_len -= 1;
+                        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+                            if (state.filter_len < state.filter_buf.len - 1) {
+                                state.filter_buf[state.filter_len] = @intCast(key.codepoint);
+                                state.filter_len += 1;
+                            }
+                        }
+                    } else {
+                        // Normal mode.
+                        if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
+                            running = false;
+                            break :parse_loop;
+                        }
+                        if (key.matches('/', .{}) and state.tab == .leases) {
+                            state.filter_active = true;
+                            state.filter_len = 0;
+                        }
+                        if (key.matches(vaxis.Key.escape, .{}) and state.tab == .leases) {
+                            // Clear filter without opening input.
+                            state.filter_len = 0;
+                        }
+                        switch (state.tab) {
+                            .leases => handleLeaseKey(&state, &table_ctx, key),
+                            .stats => {},
+                        }
+                        if (key.matches('1', .{})) state.tab = .leases;
+                        if (key.matches('2', .{})) state.tab = .stats;
                     }
-                    switch (state.tab) {
-                        .leases => handleLeaseKey(&state, &table_ctx, key),
-                        .stats => {},
-                    }
-                    if (key.matches('1', .{})) state.tab = .leases;
-                    if (key.matches('2', .{})) state.tab = .stats;
                 },
-                .mouse => |_mouse| {
-                    // TODO: click-to-select, scroll wheel
-                    _ = _mouse;
+                .mouse => |mouse| {
+                    if (state.tab == .leases) {
+                        switch (mouse.button) {
+                            .wheel_up => table_ctx.row -|= 1,
+                            .wheel_down => table_ctx.row +|= 1,
+                            .left => if (mouse.type == .press and mouse.row >= 0) {
+                                const term_row: u16 = @intCast(mouse.row);
+                                const term_col: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
+                                if (term_row == 1) {
+                                    // Column header row: sort by clicked column.
+                                    const n_cols: u16 = 6;
+                                    const cw = calcDynColWidth(@intCast(vx.window().width), n_cols);
+                                    const clicked_col: SortCol = if (cw > 0)
+                                        @enumFromInt(@min(term_col / cw, n_cols - 1))
+                                    else
+                                        .ip;
+                                    if (state.sort_col == clicked_col) {
+                                        state.sort_dir = if (state.sort_dir == .asc) .desc else .asc;
+                                    } else {
+                                        state.sort_col = clicked_col;
+                                        state.sort_dir = .asc;
+                                    }
+                                } else if (term_row >= 2) {
+                                    // Data row: select it.
+                                    const clicked: u32 = (term_row - 2) + table_ctx.start;
+                                    if (clicked <= std.math.maxInt(u16))
+                                        table_ctx.row = @intCast(clicked);
+                                }
+                            },
+                            else => {},
+                        }
+                    }
                 },
                 else => {},
             }
@@ -693,24 +776,46 @@ fn renderHeader(state: *TuiState, win: vaxis.Window) void {
 }
 
 fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
-    _ = state;
+    win.fill(.{ .style = .{ .bg = .{ .rgb = .{ 15, 15, 15 } } } });
+
+    if (state.tab == .leases and state.filter_active) {
+        // Filter input bar.
+        const filter_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 255, 220, 80 } },
+            .bg = .{ .rgb = .{ 15, 15, 15 } },
+        };
+        const cursor_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0, 0, 0 } },
+            .bg = .{ .rgb = .{ 255, 220, 80 } },
+        };
+        const prompt = try std.fmt.allocPrint(fa, " / {s}", .{state.filter_buf[0..state.filter_len]});
+        _ = win.print(&.{
+            .{ .text = prompt, .style = filter_style },
+            .{ .text = " ", .style = cursor_style },
+            .{ .text = "  Esc/Enter to close", .style = .{ .fg = .{ .rgb = .{ 100, 100, 100 } }, .bg = .{ .rgb = .{ 15, 15, 15 } } } },
+        }, .{ .col_offset = 0, .wrap = .none });
+        return;
+    }
+
+    // Normal status bar.
+    const style: vaxis.Style = .{
+        .fg = .{ .rgb = .{ 150, 150, 150 } },
+        .bg = .{ .rgb = .{ 15, 15, 15 } },
+    };
     const now = std.time.timestamp();
     const uptime_s = now - server.start_time;
     const uptime_h = @divTrunc(uptime_s, 3600);
     const uptime_m = @divTrunc(@rem(uptime_s, 3600), 60);
 
-    const style: vaxis.Style = .{
-        .fg = .{ .rgb = .{ 150, 150, 150 } },
-        .bg = .{ .rgb = .{ 15, 15, 15 } },
-    };
-    win.fill(.{ .style = .{ .bg = .{ .rgb = .{ 15, 15, 15 } } } });
-
-    // Allocate into the frame arena so the slice outlives this function and
-    // remains valid when vx.render() dereferences Cell.char.grapheme.
-    const text = try std.fmt.allocPrint(fa, " uptime {d}h{d:0>2}m  {s}", .{
+    const filter_note: []const u8 = if (state.tab == .leases and state.filter_len > 0)
+        try std.fmt.allocPrint(fa, "  filter: {s}  (Esc clears)", .{state.filter_buf[0..state.filter_len]})
+    else
+        "";
+    const text = try std.fmt.allocPrint(fa, " uptime {d}h{d:0>2}m  {s}{s}", .{
         uptime_h,
         uptime_m,
         if (server.cfg.admin_ssh.read_only) "read-only" else "read-write",
+        filter_note,
     });
     _ = win.print(&.{.{ .text = text, .style = style }}, .{ .col_offset = 0, .wrap = .none });
 }
@@ -719,20 +824,50 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
 // Lease tab
 // ---------------------------------------------------------------------------
 
+// Column base names (index matches SortCol enum value).
+const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expires", "pool" };
+
+/// Sort context for lease rows.
+const LeaseSort = struct {
+    col: SortCol,
+    dir: SortDir,
+
+    fn lessThan(ctx: LeaseSort, a: LeaseRow, b: LeaseRow) bool {
+        const asc = switch (ctx.col) {
+            .none => return false,
+            .ip => ipLess(a.ip, b.ip),
+            .mac => std.mem.lessThan(u8, a.mac, b.mac),
+            .hostname => std.mem.lessThan(u8, a.hostname, b.hostname),
+            .type => std.mem.lessThan(u8, a.type, b.type),
+            .expires => std.mem.lessThan(u8, a.expires, b.expires),
+            .pool => std.mem.lessThan(u8, a.pool, b.pool),
+        };
+        return if (ctx.dir == .asc) asc else !asc;
+    }
+
+    fn ipLess(a: []const u8, b: []const u8) bool {
+        const a_bytes = config_mod.parseIpv4(a) catch return false;
+        const b_bytes = config_mod.parseIpv4(b) catch return true;
+        const a_n = std.mem.readInt(u32, &a_bytes, .big);
+        const b_n = std.mem.readInt(u32, &b_bytes, .big);
+        return a_n < b_n;
+    }
+};
+
 fn renderLeaseTab(
     server: *AdminServer,
-    _state: *TuiState,
+    state: *TuiState,
     table_ctx: *vaxis.widgets.Table.TableContext,
     win: vaxis.Window,
     fa: std.mem.Allocator,
 ) !void {
-    _ = _state;
     // Use the caller-supplied frame arena (fa).  Do NOT create a local arena
     // here: Cell.char.grapheme stores a []const u8 into our strings, so they
     // must remain alive through the vx.render() call in the parent.
     const a = fa;
 
     const now = std.time.timestamp();
+    const filter = state.filter_buf[0..state.filter_len];
 
     const leases = server.store.listLeases() catch return;
     defer server.store.allocator.free(leases);
@@ -741,6 +876,7 @@ fn renderLeaseTab(
     for (leases) |lease| {
         const pool_label = findPoolLabel(server.cfg, lease.ip) orelse "?";
         const type_str: []const u8 = if (lease.reserved) "reserved" else "dynamic";
+        const hostname_str = lease.hostname orelse "";
 
         const expires_str = blk: {
             if (lease.reserved) break :blk try a.dupe(u8, "forever");
@@ -751,7 +887,15 @@ fn renderLeaseTab(
             break :blk try std.fmt.allocPrint(a, "{d}h{d:0>2}m", .{ h, m });
         };
 
-        const hostname_str = lease.hostname orelse "";
+        // Filter: skip rows that don't match any field (case-insensitive).
+        if (filter.len > 0) {
+            const match = containsIgnoreCase(lease.ip, filter) or
+                containsIgnoreCase(lease.mac, filter) or
+                containsIgnoreCase(hostname_str, filter) or
+                containsIgnoreCase(type_str, filter) or
+                containsIgnoreCase(pool_label, filter);
+            if (!match) continue;
+        }
 
         try rows.append(a, .{
             .ip = try a.dupe(u8, lease.ip),
@@ -763,12 +907,27 @@ fn renderLeaseTab(
         });
     }
 
-    // Clamp table cursor to the actual number of rows.
-    const n_rows: u16 = if (rows.items.len > 0xFFFF) 0xFFFF else @intCast(rows.items.len);
-    if (n_rows > 0 and table_ctx.row >= n_rows) {
-        table_ctx.row = n_rows - 1;
+    // Sort rows if a sort column is active.
+    if (state.sort_col != .none) {
+        std.sort.pdq(LeaseRow, rows.items, LeaseSort{ .col = state.sort_col, .dir = state.sort_dir }, LeaseSort.lessThan);
     }
 
+    // Clamp table cursor to the actual number of rows.
+    const n_rows: u16 = if (rows.items.len > 0xFFFF) 0xFFFF else @intCast(rows.items.len);
+    if (n_rows > 0 and table_ctx.row >= n_rows) table_ctx.row = n_rows - 1;
+    if (n_rows == 0) table_ctx.row = 0;
+
+    // Build custom column headers with sort indicator on the active column.
+    var hdr_names: [LEASE_COL_NAMES.len][]const u8 = undefined;
+    for (LEASE_COL_NAMES, 0..) |base, i| {
+        if (state.sort_col != .none and @intFromEnum(state.sort_col) == i) {
+            const arrow: []const u8 = if (state.sort_dir == .asc) " ^" else " v";
+            hdr_names[i] = try std.fmt.allocPrint(a, "{s}{s}", .{ base, arrow });
+        } else {
+            hdr_names[i] = base;
+        }
+    }
+    table_ctx.header_names = .{ .custom = &hdr_names };
     table_ctx.active = true;
     try vaxis.widgets.Table.drawTable(a, win, rows.items, table_ctx);
 }
