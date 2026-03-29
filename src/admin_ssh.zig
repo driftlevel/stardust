@@ -624,6 +624,33 @@ fn runTui(
                             // Clear filter without opening input.
                             state.filter_len = 0;
                         }
+                        // Sort shortcuts (leases tab only).
+                        // I=ip  M=mac  H=hostname  T=type  E=expires  P=pool
+                        // Pressing the active column's key again toggles asc/desc.
+                        if (state.tab == .leases) {
+                            const sort_key: ?SortCol = if (key.matches('I', .{}))
+                                .ip
+                            else if (key.matches('M', .{}))
+                                .mac
+                            else if (key.matches('H', .{}))
+                                .hostname
+                            else if (key.matches('T', .{}))
+                                .type
+                            else if (key.matches('E', .{}))
+                                .expires
+                            else if (key.matches('P', .{}))
+                                .pool
+                            else
+                                null;
+                            if (sort_key) |col| {
+                                if (state.sort_col == col) {
+                                    state.sort_dir = if (state.sort_dir == .asc) .desc else .asc;
+                                } else {
+                                    state.sort_col = col;
+                                    state.sort_dir = .asc;
+                                }
+                            }
+                        }
                         switch (state.tab) {
                             .leases => handleLeaseKey(&state, &table_ctx, key),
                             .stats => {},
@@ -771,7 +798,7 @@ fn renderHeader(state: *TuiState, win: vaxis.Window) void {
     _ = win.print(&.{.{ .text = stats_label, .style = if (state.tab == .stats) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
     col += @intCast(stats_label.len);
 
-    const hint = "  j/k:move  q:quit";
+    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  q:quit";
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
 
