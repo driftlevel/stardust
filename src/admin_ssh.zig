@@ -927,9 +927,9 @@ const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expires
 //               false = show the START (best for hostnames, labels)
 const LeaseColSpec = struct { ideal: u16, min: u16, left_trunc: bool };
 const LEASE_COL_SPECS = [6]LeaseColSpec{
-    .{ .ideal = 15, .min = 7, .left_trunc = true }, // ip      ("255.255.255.255" = 15)
-    .{ .ideal = 17, .min = 9, .left_trunc = true }, // mac     ("aa:bb:cc:dd:ee:ff" = 17)
-    .{ .ideal = 24, .min = 6, .left_trunc = false }, // hostname
+    .{ .ideal = 16, .min = 7, .left_trunc = true }, // ip      ("255.255.255.255" = 15 + 1 padding)
+    .{ .ideal = 18, .min = 9, .left_trunc = true }, // mac     ("aa:bb:cc:dd:ee:ff" = 17 + 1 padding)
+    .{ .ideal = 60, .min = 6, .left_trunc = false }, // hostname (room for FQDNs)
     .{ .ideal = 8, .min = 4, .left_trunc = false }, // type    ("reserved" = 8)
     .{ .ideal = 9, .min = 7, .left_trunc = false }, // expires ("1234h56m" ~ 9)
     .{ .ideal = 14, .min = 7, .left_trunc = false }, // pool    ("192.168.0.0/24" = 14)
