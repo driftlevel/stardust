@@ -34,6 +34,37 @@ const c = @cImport({
 const log = std.log.scoped(.admin_ssh);
 
 // ---------------------------------------------------------------------------
+// Peer address helper
+// ---------------------------------------------------------------------------
+
+/// Format the remote address of a connected session as "a.b.c.d:port".
+/// buf must be at least 32 bytes.  Returns a slice into buf.
+fn fmtPeerAddr(session: c.ssh_session, buf: []u8) []const u8 {
+    const fd: std.posix.socket_t = @intCast(c.ssh_get_fd(session));
+    var storage: std.posix.sockaddr.storage = undefined;
+    var alen: std.posix.socklen_t = @sizeOf(@TypeOf(storage));
+    std.posix.getpeername(fd, @ptrCast(&storage), &alen) catch return "?";
+    const sa: *const std.posix.sockaddr = @ptrCast(&storage);
+    switch (sa.family) {
+        std.posix.AF.INET => {
+            const sin: *const std.posix.sockaddr.in = @ptrCast(&storage);
+            const b: *const [4]u8 = @ptrCast(&sin.addr); // network byte order
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                b[0],                               b[1], b[2], b[3],
+                std.mem.bigToNative(u16, sin.port),
+            }) catch "?";
+        },
+        std.posix.AF.INET6 => {
+            const sin6: *const std.posix.sockaddr.in6 = @ptrCast(&storage);
+            return std.fmt.bufPrint(buf, "[ipv6]:{d}", .{
+                std.mem.bigToNative(u16, sin6.port),
+            }) catch "?";
+        },
+        else => return "?",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SSH channel → std.io.Writer bridge
 // ---------------------------------------------------------------------------
 
@@ -152,17 +183,40 @@ pub const AdminServer = struct {
 // ---------------------------------------------------------------------------
 
 fn sessionThread(server: *AdminServer, session: c.ssh_session) void {
-    defer c.ssh_free(session);
-    runSession(server, session) catch |err| {
-        log.warn("session error: {s}", .{@errorName(err)});
+    var peer_buf: [64]u8 = undefined;
+    const peer = fmtPeerAddr(session, &peer_buf);
+    log.info("connection from {s}", .{peer});
+    defer {
+        log.info("connection closed: {s}", .{peer});
+        c.ssh_free(session);
+    }
+    runSession(server, session, peer) catch |err| {
+        log.warn("session error from {s}: {s}", .{ peer, @errorName(err) });
     };
 }
 
-fn runSession(server: *AdminServer, session: c.ssh_session) !void {
+fn runSession(server: *AdminServer, session: c.ssh_session, peer: []const u8) !void {
+    // Prefer post-quantum hybrid key exchange algorithms; libssh negotiates
+    // down to a mutually supported algorithm if the client doesn't support PQC.
+    const kex_pref = "sntrup761x25519-sha512@openssh.com," ++
+        "mlkem768x25519-sha256," ++
+        "curve25519-sha256,curve25519-sha256@libssh.org," ++
+        "ecdh-sha2-nistp521,ecdh-sha2-nistp256," ++
+        "diffie-hellman-group14-sha256";
+    if (c.ssh_options_set(session, c.SSH_OPTIONS_KEY_EXCHANGE, kex_pref) < 0) {
+        log.debug("{s}: could not set KEX preference: {s}", .{
+            peer, std.mem.span(c.ssh_get_error(session)),
+        });
+    }
+
     if (c.ssh_handle_key_exchange(session) < 0) {
-        log.debug("key exchange failed", .{});
+        log.info("{s}: key exchange failed: {s}", .{
+            peer, std.mem.span(c.ssh_get_error(session)),
+        });
         return;
     }
+    log.debug("{s}: key exchange OK", .{peer});
+
     c.ssh_set_auth_methods(session, c.SSH_AUTH_METHOD_PUBLICKEY);
 
     var channel: c.ssh_channel = null;
@@ -173,7 +227,11 @@ fn runSession(server: *AdminServer, session: c.ssh_session) !void {
     // Process SSH messages until we have an authenticated shell channel.
     msg_loop: while (true) {
         const msg = c.ssh_message_get(session) orelse {
-            log.debug("session closed during setup", .{});
+            if (authed) {
+                log.debug("{s}: session closed after auth", .{peer});
+            } else {
+                log.info("{s}: session closed before auth completed", .{peer});
+            }
             return;
         };
         defer c.ssh_message_free(msg);
@@ -188,23 +246,36 @@ fn runSession(server: *AdminServer, session: c.ssh_session) !void {
             c.SSH_REQUEST_AUTH => {
                 if (msg_sub == c.SSH_AUTH_METHOD_PUBLICKEY) {
                     const client_key = c.ssh_message_auth_pubkey(msg);
-                    const in_auth_keys = checkAuthorizedKeys(server, client_key);
+                    const user_cstr = c.ssh_message_auth_user(msg);
+                    const user: []const u8 = if (user_cstr != null) std.mem.span(user_cstr) else "(unknown)";
+                    const key_type_cstr = c.ssh_key_type_to_char(c.ssh_key_type(client_key));
+                    const key_type: []const u8 = if (key_type_cstr != null) std.mem.span(key_type_cstr) else "unknown";
+
                     const pk_state = c.ssh_message_auth_publickey_state(msg);
+                    const in_auth_keys = checkAuthorizedKeys(server, client_key, user, peer);
+
                     if (in_auth_keys and pk_state == c.SSH_PUBLICKEY_STATE_NONE) {
                         // Query: client is checking whether the key is acceptable.
+                        log.debug("{s}: pubkey query accepted for user '{s}' ({s})", .{ peer, user, key_type });
                         _ = c.ssh_message_auth_reply_pk_ok_simple(msg);
                     } else if (in_auth_keys and pk_state == c.SSH_PUBLICKEY_STATE_VALID) {
                         // Attempt: libssh already verified the signature.
+                        log.info("{s}: authenticated user '{s}' ({s})", .{ peer, user, key_type });
                         _ = c.ssh_message_auth_reply_success(msg, 0);
                         authed = true;
                     } else {
+                        log.info("{s}: rejected pubkey for user '{s}' ({s}): key not in authorized_keys", .{ peer, user, key_type });
                         _ = c.ssh_message_reply_default(msg);
                     }
                 } else {
+                    const user_cstr = c.ssh_message_auth_user(msg);
+                    const user: []const u8 = if (user_cstr != null) std.mem.span(user_cstr) else "(unknown)";
+                    log.debug("{s}: rejected non-pubkey auth method {d} for user '{s}'", .{ peer, msg_sub, user });
                     _ = c.ssh_message_reply_default(msg);
                 }
             },
             c.SSH_REQUEST_CHANNEL_OPEN => {
+                log.debug("{s}: channel open", .{peer});
                 channel = c.ssh_message_channel_request_open_reply_accept(msg);
             },
             c.SSH_REQUEST_CHANNEL => {
@@ -215,12 +286,14 @@ fn runSession(server: *AdminServer, session: c.ssh_session) !void {
                         const h = c.ssh_message_channel_request_pty_height(msg);
                         if (w > 0) cols = @intCast(w);
                         if (h > 0) rows = @intCast(h);
+                        log.debug("{s}: PTY requested ({d}x{d})", .{ peer, cols, rows });
                         _ = c.ssh_message_channel_request_reply_success(msg);
                     },
                     c.SSH_CHANNEL_REQUEST_SHELL => {
                         _ = c.ssh_message_channel_request_reply_success(msg);
                         if (authed and channel != null) break :msg_loop;
-                        // Unauthenticated; silently close.
+                        // Unauthenticated — should not happen, but close cleanly.
+                        log.warn("{s}: shell request before auth", .{peer});
                         return;
                     },
                     c.SSH_CHANNEL_REQUEST_WINDOW_CHANGE => {
@@ -239,6 +312,9 @@ fn runSession(server: *AdminServer, session: c.ssh_session) !void {
 
     if (!authed or channel == null) return;
 
+    log.info("{s}: TUI session started", .{peer});
+    defer log.info("{s}: TUI session ended", .{peer});
+
     try runTui(server, session, channel, cols, rows);
 
     _ = c.ssh_channel_request_send_exit_status(channel, 0);
@@ -249,19 +325,24 @@ fn runSession(server: *AdminServer, session: c.ssh_session) !void {
 // authorized_keys check
 // ---------------------------------------------------------------------------
 
-fn checkAuthorizedKeys(server: *AdminServer, client_key: c.ssh_key) bool {
+fn checkAuthorizedKeys(server: *AdminServer, client_key: c.ssh_key, user: []const u8, peer: []const u8) bool {
     if (client_key == null) return false;
 
     const path = server.cfg.admin_ssh.authorized_keys;
     const file = std.fs.cwd().openFile(path, .{}) catch {
-        log.warn("cannot open authorized_keys '{s}'", .{path});
+        log.warn("{s}: cannot open authorized_keys '{s}'", .{ peer, path });
         return false;
     };
     defer file.close();
+    log.debug("{s}: checking authorized_keys '{s}' for user '{s}'", .{ peer, path, user });
 
-    const content = file.readToEndAlloc(server.allocator, 1024 * 1024) catch return false;
+    const content = file.readToEndAlloc(server.allocator, 1024 * 1024) catch {
+        log.warn("{s}: failed to read authorized_keys '{s}'", .{ peer, path });
+        return false;
+    };
     defer server.allocator.free(content);
 
+    var n_checked: usize = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -271,22 +352,41 @@ fn checkAuthorizedKeys(server: *AdminServer, client_key: c.ssh_key) bool {
         var tokens = std.mem.splitScalar(u8, trimmed, ' ');
         const keytype_str = tokens.next() orelse continue;
         const b64_key = tokens.next() orelse continue;
+        // Optional comment field (used for logging identity of the matched key)
+        const comment = tokens.next() orelse "";
 
-        const keytype = c.ssh_key_type_from_name(keytype_str.ptr);
-        if (keytype == c.SSH_KEYTYPE_UNKNOWN) continue;
+        // ssh_key_type_from_name requires a null-terminated C string.
+        var kt_buf: [64]u8 = undefined;
+        if (keytype_str.len >= kt_buf.len) continue;
+        @memcpy(kt_buf[0..keytype_str.len], keytype_str);
+        kt_buf[keytype_str.len] = 0;
+        const keytype = c.ssh_key_type_from_name(&kt_buf);
+        if (keytype == c.SSH_KEYTYPE_UNKNOWN) {
+            log.debug("{s}: skipping unknown key type '{s}'", .{ peer, keytype_str });
+            continue;
+        }
 
-        // ssh_pki_import_pubkey_base64 needs a null-terminated string.
+        // ssh_pki_import_pubkey_base64 also requires a null-terminated string.
         var b64z_buf: [2048]u8 = undefined;
         if (b64_key.len >= b64z_buf.len) continue;
         @memcpy(b64z_buf[0..b64_key.len], b64_key);
         b64z_buf[b64_key.len] = 0;
 
         var auth_key: c.ssh_key = undefined;
-        if (c.ssh_pki_import_pubkey_base64(&b64z_buf, keytype, &auth_key) < 0) continue;
+        if (c.ssh_pki_import_pubkey_base64(&b64z_buf, keytype, &auth_key) < 0) {
+            log.debug("{s}: failed to parse key '{s}' ({s})", .{ peer, comment, keytype_str });
+            continue;
+        }
         defer c.ssh_key_free(auth_key);
 
-        if (c.ssh_key_cmp(client_key, auth_key, c.SSH_KEY_CMP_PUBLIC) == 0) return true;
+        n_checked += 1;
+        if (c.ssh_key_cmp(client_key, auth_key, c.SSH_KEY_CMP_PUBLIC) == 0) {
+            log.debug("{s}: key matched entry '{s}' ({s})", .{ peer, comment, keytype_str });
+            return true;
+        }
     }
+
+    log.debug("{s}: offered key not found (checked {d} entries)", .{ peer, n_checked });
     return false;
 }
 
