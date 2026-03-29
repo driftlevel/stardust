@@ -21,6 +21,7 @@ var g_log_level: config_mod.LogLevel = .info;
 // Set to true when stderr is connected to the systemd journal (JOURNAL_STREAM is set).
 // sd-daemon priority prefixes (<N>) are only emitted in that case.
 var g_journal_stream: bool = false;
+var g_log_mutex: std.Thread.Mutex = .{};
 
 fn logFn(
     comptime level: std.log.Level,
@@ -58,6 +59,9 @@ fn logFn(
         .warn => "WARN",
         .err => "ERROR",
     };
+    g_log_mutex.lock();
+    defer g_log_mutex.unlock();
+
     if (g_journal_stream) {
         std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] " ++ format ++ "\n", args);
     } else {
