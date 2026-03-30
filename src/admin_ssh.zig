@@ -394,31 +394,6 @@ fn checkAuthorizedKeys(server: *AdminServer, client_key: c.ssh_key, user: []cons
 // Window-resize callback context (updated from libssh callback thread)
 // ---------------------------------------------------------------------------
 
-const WinCtx = struct {
-    pending_cols: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    pending_rows: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-};
-
-fn ptyWindowChangeCb(
-    _session: c.ssh_session,
-    _channel: c.ssh_channel,
-    width: c_int,
-    height: c_int,
-    _pxw: c_int,
-    _pxh: c_int,
-    userdata: ?*anyopaque,
-) callconv(.c) c_int {
-    _ = _session;
-    _ = _channel;
-    _ = _pxw;
-    _ = _pxh;
-    const ctx: *WinCtx = @ptrCast(@alignCast(userdata.?));
-    if (width > 0) ctx.pending_cols.store(@intCast(width), .release);
-    if (height > 0) ctx.pending_rows.store(@intCast(height), .release);
-    log.debug("pty resize callback: {d}x{d}", .{ width, height });
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // TUI session
 // ---------------------------------------------------------------------------
@@ -518,14 +493,6 @@ fn runTui(
         c.ssh_channel_is_eof(channel),
     });
 
-    // Set up SSH channel callbacks so resize events update our WinCtx.
-    var winctx: WinCtx = .{};
-    var chan_cbs = std.mem.zeroes(c.struct_ssh_channel_callbacks_struct);
-    chan_cbs.size = @sizeOf(c.struct_ssh_channel_callbacks_struct);
-    chan_cbs.userdata = &winctx;
-    chan_cbs.channel_pty_window_change_function = ptyWindowChangeCb;
-    _ = c.ssh_set_channel_callbacks(channel, &chan_cbs);
-
     // Build the SSH channel writer bridge.
     var gen_writer = SshChanGenericWriter{ .context = channel };
     var write_buf: [8192]u8 = undefined;
@@ -603,32 +570,40 @@ fn runTui(
             break;
         }
 
-        // Apply any pending resize.  Use cur_cols/cur_rows as fallback for
-        // whichever dimension the callback didn't update (some clients send
-        // WINDOW_CHANGE with only one non-zero dimension).
-        {
-            const pr = winctx.pending_rows.swap(0, .acq_rel);
-            const pc = winctx.pending_cols.swap(0, .acq_rel);
-            const new_cols = if (pc > 0) pc else cur_cols;
-            const new_rows = if (pr > 0) pr else cur_rows;
-            if (new_cols != cur_cols or new_rows != cur_rows) {
-                log.debug("{s}: applying resize {d}x{d} → {d}x{d}", .{
-                    peer, cur_cols, cur_rows, new_cols, new_rows,
-                });
-                cur_cols = new_cols;
-                cur_rows = new_rows;
-                try vx.resize(allocator, io, .{
-                    .rows = @intCast(new_rows),
-                    .cols = @intCast(new_cols),
-                    .x_pixel = 0,
-                    .y_pixel = 0,
-                });
-                // vx.resize() sends cursor-home + erase-below + flush.
-                // Also send an explicit full-screen erase so content left
-                // outside the new viewport (e.g. after a narrowing resize) is
-                // guaranteed gone before vaxis redraws.
-                try io.writeAll("\x1b[2J");
-                try io.flush();
+        // Drain the SSH message queue.  In libssh server mode,
+        // SSH_CHANNEL_REQUEST_WINDOW_CHANGE is queued here rather than
+        // dispatched through ssh_channel_callbacks.  ssh_message_get returns
+        // null immediately when the queue is empty.
+        while (true) {
+            const msg = c.ssh_message_get(session) orelse break;
+            defer c.ssh_message_free(msg);
+            const mt = c.ssh_message_type(msg);
+            const ms = c.ssh_message_subtype(msg);
+            if (mt == c.SSH_REQUEST_CHANNEL and ms == c.SSH_CHANNEL_REQUEST_WINDOW_CHANGE) {
+                const w = c.ssh_message_channel_request_pty_width(msg);
+                const h = c.ssh_message_channel_request_pty_height(msg);
+                const new_cols: u32 = if (w > 0) @intCast(w) else cur_cols;
+                const new_rows: u32 = if (h > 0) @intCast(h) else cur_rows;
+                if (new_cols != cur_cols or new_rows != cur_rows) {
+                    log.debug("{s}: resize {d}x{d} → {d}x{d}", .{
+                        peer, cur_cols, cur_rows, new_cols, new_rows,
+                    });
+                    cur_cols = new_cols;
+                    cur_rows = new_rows;
+                    try vx.resize(allocator, io, .{
+                        .rows = @intCast(new_rows),
+                        .cols = @intCast(new_cols),
+                        .x_pixel = 0,
+                        .y_pixel = 0,
+                    });
+                    // Belt-and-suspenders: also erase the full viewport so
+                    // content outside the new bounds is gone before redraw.
+                    try io.writeAll("\x1b[2J");
+                    try io.flush();
+                }
+                // RFC 4254 §6.7: window-change requests need no reply.
+            } else {
+                _ = c.ssh_message_reply_default(msg);
             }
         }
 
