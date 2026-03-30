@@ -68,6 +68,11 @@ pub const PoolConfig = struct {
     ntp_servers: [][]const u8,
     tftp_server_name: []const u8,
     boot_filename: []const u8,
+    /// HTTP/HTTPS URL served as option 67 when the client identifies as a
+    /// UEFI HTTP boot client (option 60 = "HTTPClient…").  When non-empty and
+    /// the client sends the "HTTPClient" vendor class, this URL overrides
+    /// boot_filename and option 60 is echoed back to the client.
+    http_boot_url: []const u8,
     dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
     reservations: []Reservation,
@@ -91,6 +96,7 @@ pub const PoolConfig = struct {
         allocator.free(self.ntp_servers);
         allocator.free(self.tftp_server_name);
         allocator.free(self.boot_filename);
+        allocator.free(self.http_boot_url);
         allocator.free(self.dns_update.server);
         allocator.free(self.dns_update.zone);
         allocator.free(self.dns_update.rev_zone);
@@ -354,6 +360,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -408,6 +415,13 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asScalar()) |s| {
             allocator.free(pool.boot_filename);
             pool.boot_filename = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (pool_map.get("http_boot_url")) |v| {
+        if (v.asScalar()) |s| {
+            allocator.free(pool.http_boot_url);
+            pool.http_boot_url = try allocator.dupe(u8, s);
         }
     }
 
@@ -1164,6 +1178,7 @@ fn makeHashTestConfig(alloc: std.mem.Allocator) Config {
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,
@@ -1335,6 +1350,7 @@ test "computePoolHash: different pool count produces different hash" {
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,

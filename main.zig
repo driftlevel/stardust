@@ -236,7 +236,7 @@ pub fn main() !void {
     var admin_server: ?*admin_mod.AdminServer = null;
     var admin_thread: ?std.Thread = null;
     if (cfg.admin_ssh.enable) {
-        admin_server = admin_mod.AdminServer.init(allocator, cfg, store, &dhcp_server.counters) catch |err| blk: {
+        admin_server = admin_mod.AdminServer.init(allocator, cfg, cfg_path, store, &dhcp_server.counters, sync_mgr) catch |err| blk: {
             std.log.err("Failed to initialize admin SSH server ({s}); running without admin TUI", .{@errorName(err)});
             break :blk null;
         };

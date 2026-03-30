@@ -66,6 +66,9 @@ pub const SyncManager = struct {
     peers: std.ArrayList(Peer),
     last_full_sync: i64,
     last_keepalive: i64,
+    /// Atomically-maintained count of currently authenticated peers.
+    /// Safe to read from any thread (e.g. the SSH TUI) without a lock.
+    authenticated_count: std.atomic.Value(u32),
 
     const max_peers = 8;
     const keepalive_interval_s: i64 = 30;
@@ -143,6 +146,7 @@ pub const SyncManager = struct {
             .peers = std.ArrayList(Peer){},
             .last_full_sync = 0,
             .last_keepalive = 0,
+            .authenticated_count = std.atomic.Value(u32).init(0),
         };
 
         // Seed configured unicast peers (unauthenticated initially)
@@ -184,7 +188,12 @@ pub const SyncManager = struct {
         if (std.mem.eql(u8, &new_hash, &self.pool_hash)) return;
         self.pool_hash = new_hash;
         // Remove all authenticated peers; they need to re-handshake.
-        for (self.peers.items) |*p| p.authenticated = false;
+        var was_auth: u32 = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated) was_auth += 1;
+            p.authenticated = false;
+        }
+        _ = self.authenticated_count.fetchSub(was_auth, .monotonic);
         self.sendHelloAll();
         std.log.info("sync: pool hash changed, re-authenticating all peers", .{});
     }
@@ -228,8 +237,10 @@ pub const SyncManager = struct {
                 if (isConfiguredPeer(self, p)) {
                     p.authenticated = false;
                     p.last_seen = 0;
+                    _ = self.authenticated_count.fetchSub(1, .monotonic);
                     i += 1;
                 } else {
+                    _ = self.authenticated_count.fetchSub(1, .monotonic);
                     _ = self.peers.swapRemove(i);
                 }
             } else {
@@ -571,6 +582,7 @@ pub const SyncManager = struct {
         const was_authenticated = peer.authenticated;
         peer.authenticated = true;
         peer.last_seen = now;
+        if (!was_authenticated) _ = self.authenticated_count.fetchAdd(1, .monotonic);
 
         if (!is_ack) {
             // Send HELLO_ACK back
@@ -672,7 +684,7 @@ pub const SyncManager = struct {
         // plaintext is the MAC string (17 bytes "xx:xx:xx:xx:xx:xx")
         if (plaintext.len == 0) return;
         self.store.removeLease(plaintext);
-        log_v.debug("sync: received lease delete {s}", .{plaintext});
+        log_v.debug("sync: received lease delete {f}", .{util.escapedStr(plaintext)});
     }
 
     fn fullSyncToPeer(self: *Self, peer: *Peer) void {

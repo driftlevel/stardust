@@ -88,6 +88,7 @@ pub const OptionCode = enum(u8) {
     ParameterRequestList = 55,
     RenewalTimeValue = 58,
     RebindingTimeValue = 59,
+    VendorClassIdentifier = 60,
     ClientID = 61,
     TftpServerName = 66,
     BootFileName = 67,
@@ -322,6 +323,19 @@ fn appendStringOpt(
     value: []const u8,
 ) void {
     if (!isRequested(prl, code) or value.len == 0) return;
+    const len = @min(value.len, 255);
+    if (opts_len.* + 2 + len > opts_buf.len) return;
+    opts_buf[opts_len.*] = @intFromEnum(code);
+    opts_buf[opts_len.* + 1] = @intCast(len);
+    @memcpy(opts_buf[opts_len.* + 2 ..][0..len], value[0..len]);
+    opts_len.* += 2 + len;
+}
+
+/// Unconditionally append a string option (no PRL check). Used for options
+/// that must be included regardless of what the client requested — specifically
+/// option 60 (VCI echo) and option 67 (boot URL) in UEFI HTTP boot responses.
+fn appendRawStringOpt(opts_buf: []u8, opts_len: *usize, code: OptionCode, value: []const u8) void {
+    if (value.len == 0) return;
     const len = @min(value.len, 255);
     if (opts_len.* + 2 + len > opts_buf.len) return;
     opts_buf[opts_len.*] = @intFromEnum(code);
@@ -883,6 +897,14 @@ pub const DHCPServer = struct {
         return null;
     }
 
+    /// Returns true if the client's option 60 (Vendor Class Identifier) begins with
+    /// "HTTPClient", indicating a UEFI HTTP/HTTPS network boot request (per UEFI
+    /// Specification §24.4 and RFC 7386).
+    fn isHttpClient(packet: []const u8) bool {
+        const vci = getOption(packet, .VendorClassIdentifier) orelse return false;
+        return std.mem.startsWith(u8, vci, "HTTPClient");
+    }
+
     fn getMessageType(packet: []const u8) ?MessageType {
         const val = getOption(packet, .MessageType) orelse return null;
         if (val.len < 1) return null;
@@ -895,11 +917,25 @@ pub const DHCPServer = struct {
     /// skipping the router and (if specific) the server's own address.
     /// Returns null when the pool is exhausted.
     /// Returns true if ip_bytes falls within the given pool's subnet.
+    /// Returns true if `ip_bytes` falls within the pool's allocatable range:
+    /// same subnet AND within [pool_start, pool_end] (when configured).
+    /// Used to validate lease-reuse candidates in allocateIp — if pool_end
+    /// was reduced after a lease was issued, the stale IP is outside the range
+    /// and must not be re-offered.
     fn ipInPool(ip_bytes: [4]u8, pool: *const config_mod.PoolConfig) bool {
         const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
         const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        return (ip_int & pool.subnet_mask) == subnet_int;
+        if ((ip_int & pool.subnet_mask) != subnet_int) return false;
+        if (pool.pool_start.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_start) catch return false;
+            if (ip_int < std.mem.readInt(u32, &b, .big)) return false;
+        }
+        if (pool.pool_end.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_end) catch return false;
+            if (ip_int > std.mem.readInt(u32, &b, .big)) return false;
+        }
+        return true;
     }
 
     /// Returns true if this server should send a DNS update for the given lease.
@@ -1231,11 +1267,16 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
-        // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
-
-        // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
+        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+            // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
+            // Both sent unconditionally per UEFI Spec §24.4.
+            appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+        } else {
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
 
         // Option 33: Static Routes (RFC 2132)
         if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
@@ -1530,11 +1571,16 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
-        // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
-
-        // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
+        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+            // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
+            // Both sent unconditionally per UEFI Spec §24.4.
+            appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+        } else {
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
 
         // Option 33: Static Routes (RFC 2132)
         if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
@@ -1765,10 +1811,14 @@ pub const DHCPServer = struct {
             const sub_len = val[i + 1];
             if (i + 2 + sub_len > val.len) break;
             const sub_data = val[i + 2 .. i + 2 + sub_len];
+            // Truncate logged bytes to 16 to prevent blob output from large
+            // relay-agent sub-options; always show the actual length.
+            const preview = sub_data[0..@min(sub_data.len, 16)];
+            const truncated = sub_data.len > 16;
             switch (sub_code) {
-                1 => std.log.debug("Option 82 circuit-id: {x}", .{sub_data}),
-                2 => std.log.debug("Option 82 remote-id: {x}", .{sub_data}),
-                else => std.log.debug("Option 82 sub-option {d}: {x} ({d}B)", .{ sub_code, sub_data, sub_len }),
+                1 => std.log.debug("Option 82 circuit-id ({d}B){s}: {x}", .{ sub_len, if (truncated) "…" else "", preview }),
+                2 => std.log.debug("Option 82 remote-id ({d}B){s}: {x}", .{ sub_len, if (truncated) "…" else "", preview }),
+                else => std.log.debug("Option 82 sub-option {d} ({d}B){s}: {x}", .{ sub_code, sub_len, if (truncated) "…" else "", preview }),
             }
             i += 2 + sub_len;
         }
@@ -1925,11 +1975,16 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
-        // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
-
-        // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
+        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+            // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
+            // Both sent unconditionally per UEFI Spec §24.4.
+            appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+        } else {
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
 
         // Option 33: Static Routes (RFC 2132)
         if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
@@ -2296,6 +2351,7 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -2353,6 +2409,7 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -2383,6 +2440,7 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -3652,6 +3710,74 @@ test "allocateIp: single-IP pool allocates the one IP" {
     try std.testing.expectEqual([4]u8{ 192, 168, 1, 42 }, ip.?);
 }
 
+test "allocateIp: stale lease above shrunk pool_end is not reused" {
+    // Regression: if pool_end is reduced after a lease was issued, allocateIp must
+    // not re-offer the now-out-of-range IP.  Previously ipInPool only checked subnet
+    // membership, so .150 passed even when pool_end=.120.
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.100");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.120"); // shrunk; .150 is outside
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Seed a stale lease at .150 for the client MAC.
+    const mac = [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.150",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    const ip = try server.allocateIp(&server.cfg.pools[0], mac, null);
+    // Must not return the stale .150; must return an address within [.100, .120].
+    try std.testing.expect(ip != null);
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 100 }, .big);
+    const end_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 120 }, .big);
+    try std.testing.expect(ip_int >= start_int and ip_int <= end_int);
+}
+
+test "allocateIp: stale lease below shrunk pool_start is not reused" {
+    // Mirror of the above: lease at .10 when pool_start was raised to .50.
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.50");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.80");
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const mac = [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 };
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:01",
+        .ip = "192.168.1.10", // below new pool_start
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    const ip = try server.allocateIp(&server.cfg.pools[0], mac, null);
+    try std.testing.expect(ip != null);
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 50 }, .big);
+    const end_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 80 }, .big);
+    try std.testing.expect(ip_int >= start_int and ip_int <= end_int);
+}
+
 test "allocateIp: pool exhausted returns null" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
@@ -3937,4 +4063,189 @@ test "allocateIp: MAC reserved in both pools gets correct IP per pool" {
     // pool[1] must honour its own reservation, not return the pool[0] IP
     const ip1 = try server.allocateIp(&server.cfg.pools[1], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expectEqual([4]u8{ 10, 0, 0, 42 }, ip1.?);
+}
+
+test "isHttpClient: detects HTTPClient prefix" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 32);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    const vci = "HTTPClient";
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.VendorClassIdentifier);
+    pkt[dhcp_min_packet_size + 1] = @intCast(vci.len);
+    @memcpy(pkt[dhcp_min_packet_size + 2 ..][0..vci.len], vci);
+    pkt[dhcp_min_packet_size + 2 + vci.len] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.isHttpClient(&pkt));
+}
+
+test "isHttpClient: detects HTTPClient with trailing data" {
+    // UEFI spec allows "HTTPClient" followed by architecture-specific suffix.
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 32);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    const vci = "HTTPClient:Arch:00007";
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.VendorClassIdentifier);
+    pkt[dhcp_min_packet_size + 1] = @intCast(vci.len);
+    @memcpy(pkt[dhcp_min_packet_size + 2 ..][0..vci.len], vci);
+    pkt[dhcp_min_packet_size + 2 + vci.len] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.isHttpClient(&pkt));
+}
+
+test "isHttpClient: rejects non-HTTP VCI" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 32);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    const vci = "PXEClient:Arch:00000";
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.VendorClassIdentifier);
+    pkt[dhcp_min_packet_size + 1] = @intCast(vci.len);
+    @memcpy(pkt[dhcp_min_packet_size + 2 ..][0..vci.len], vci);
+    pkt[dhcp_min_packet_size + 2 + vci.len] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(!DHCPServer.isHttpClient(&pkt));
+}
+
+test "isHttpClient: returns false when option 60 absent" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 4);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(!DHCPServer.isHttpClient(&pkt));
+}
+
+/// Build a minimal DISCOVER packet, optionally with option 60 (VCI).
+fn makeDiscover(buf: []u8, mac: [6]u8, vci: ?[]const u8) usize {
+    @memset(buf, 0);
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xDEADBEEF;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &mac);
+
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    if (vci) |v| {
+        buf[i] = @intFromEnum(OptionCode.VendorClassIdentifier);
+        buf[i + 1] = @intCast(v.len);
+        @memcpy(buf[i + 2 ..][0..v.len], v);
+        i += 2 + v.len;
+    }
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+    return i;
+}
+
+test "UEFI HTTP boot: DISCOVER with HTTPClient gets option 60 echo and URL in option 67" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].http_boot_url);
+    cfg.pools[0].http_boot_url = try alloc.dupe(u8, "http://boot.example.com/efi/bootx64.efi");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x11 }, "HTTPClient");
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // Option 60 must be echoed back as "HTTPClient"
+    const opt60 = DHCPServer.getOption(resp.?, .VendorClassIdentifier);
+    try std.testing.expect(opt60 != null);
+    try std.testing.expectEqualStrings("HTTPClient", opt60.?);
+    // Option 67 must contain the HTTP URL
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("http://boot.example.com/efi/bootx64.efi", opt67.?);
+    // Option 66 (TftpServerName) must NOT be present
+    try std.testing.expect(DHCPServer.getOption(resp.?, .TftpServerName) == null);
+}
+
+test "UEFI HTTP boot: DISCOVER without HTTPClient gets normal TFTP options" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].http_boot_url);
+    cfg.pools[0].http_boot_url = try alloc.dupe(u8, "http://boot.example.com/efi/bootx64.efi");
+    alloc.free(cfg.pools[0].tftp_server_name);
+    cfg.pools[0].tftp_server_name = try alloc.dupe(u8, "tftp.example.com");
+    alloc.free(cfg.pools[0].boot_filename);
+    cfg.pools[0].boot_filename = try alloc.dupe(u8, "pxelinux.0");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // No VCI option — regular PXE client
+    var buf = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x22 }, null);
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // Option 60 must NOT be present (no echo for non-HTTP clients)
+    try std.testing.expect(DHCPServer.getOption(resp.?, .VendorClassIdentifier) == null);
+    // Option 67 must contain TFTP filename, not the HTTP URL
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("pxelinux.0", opt67.?);
+}
+
+test "UEFI HTTP boot: http_boot_url empty => normal TFTP options even with HTTPClient VCI" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    // http_boot_url is empty (default); tftp options set
+    alloc.free(cfg.pools[0].tftp_server_name);
+    cfg.pools[0].tftp_server_name = try alloc.dupe(u8, "tftp.example.com");
+    alloc.free(cfg.pools[0].boot_filename);
+    cfg.pools[0].boot_filename = try alloc.dupe(u8, "pxelinux.0");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x33 }, "HTTPClient");
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // http_boot_url empty => fallback to TFTP options
+    try std.testing.expect(DHCPServer.getOption(resp.?, .VendorClassIdentifier) == null);
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("pxelinux.0", opt67.?);
 }

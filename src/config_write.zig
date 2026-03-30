@@ -139,6 +139,9 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
     if (pool.boot_filename.len > 0) {
         try w.print("    boot_filename: {s}\n", .{pool.boot_filename});
     }
+    if (pool.http_boot_url.len > 0) {
+        try w.print("    http_boot_url: {s}\n", .{pool.http_boot_url});
+    }
 
     if (pool.dns_update.enable) {
         try w.writeAll("    dns_update:\n");
@@ -318,6 +321,7 @@ test "renderConfig round-trips global fields" {
             .ntp_servers = &.{},
             .tftp_server_name = "",
             .boot_filename = "",
+            .http_boot_url = "",
             .dns_update = .{
                 .enable = false,
                 .server = "",

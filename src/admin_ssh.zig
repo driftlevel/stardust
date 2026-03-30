@@ -24,6 +24,8 @@ const vaxis = @import("vaxis");
 const config_mod = @import("./config.zig");
 const state_mod = @import("./state.zig");
 const dhcp_mod = @import("./dhcp.zig");
+const sync_mod = @import("./sync.zig");
+const config_write = @import("./config_write.zig");
 
 const c = @cImport({
     @cInclude("libssh/libssh.h");
@@ -89,9 +91,12 @@ const SshChanGenericWriter = std.io.GenericWriter(
 
 pub const AdminServer = struct {
     allocator: std.mem.Allocator,
-    cfg: *const config_mod.Config,
+    cfg: *config_mod.Config,
+    cfg_path: []const u8,
     store: *state_mod.StateStore,
     counters: *const dhcp_mod.Counters,
+    /// Non-null when the server is part of a sync group.
+    sync_mgr: ?*sync_mod.SyncManager,
     running: std.atomic.Value(bool),
     /// Number of session threads currently alive. Incremented in runInner
     /// before spawning (so stop() never races a freshly-spawned thread),
@@ -103,16 +108,20 @@ pub const AdminServer = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        cfg: *const config_mod.Config,
+        cfg: *config_mod.Config,
+        cfg_path: []const u8,
         store: *state_mod.StateStore,
         counters: *const dhcp_mod.Counters,
+        sync_mgr: ?*sync_mod.SyncManager,
     ) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
+            .cfg_path = cfg_path,
             .store = store,
             .counters = counters,
+            .sync_mgr = sync_mgr,
             .running = std.atomic.Value(bool).init(true),
             .active_sessions = std.atomic.Value(i32).init(0),
             .start_time = std.time.timestamp(),
@@ -429,12 +438,37 @@ const LeaseRow = struct {
 
 const Tab = enum(u8) { leases = 0, stats = 1 };
 
+const TuiMode = enum { normal, reservation_form, delete_confirm };
+
+const ReservationForm = struct {
+    /// MAC of the lease being edited; empty string means "new reservation".
+    orig_mac: [18]u8 = [_]u8{0} ** 18,
+    orig_mac_len: usize = 0,
+    // Editable field buffers.
+    ip_buf: [16]u8 = [_]u8{0} ** 16,
+    ip_len: usize = 0,
+    mac_buf: [18]u8 = [_]u8{0} ** 18,
+    mac_len: usize = 0,
+    hostname_buf: [64]u8 = [_]u8{0} ** 64,
+    hostname_len: usize = 0,
+    /// Index of the field currently receiving input: 0=ip  1=mac  2=hostname.
+    active_field: u8 = 0,
+    /// Inline error message (empty = no error).
+    err_buf: [80]u8 = [_]u8{0} ** 80,
+    err_len: usize = 0,
+
+    fn isNew(self: *const ReservationForm) bool {
+        return self.orig_mac_len == 0;
+    }
+};
+
 // Lease table sort state.  Column index matches LeaseRow field order (0-based).
 const SortCol = enum(u8) { none = 255, ip = 0, mac = 1, hostname = 2, type = 3, expires = 4, pool = 5 };
 const SortDir = enum { asc, desc };
 
 const TuiState = struct {
     tab: Tab = .leases,
+    mode: TuiMode = .normal,
     lease_row: u16 = 0,
     lease_start: u16 = 0,
     sort_col: SortCol = .expires,
@@ -453,8 +487,16 @@ const TuiState = struct {
     sel_mac_len: usize = 0,
     sel_hostname: [256]u8 = [_]u8{0} ** 256,
     sel_hostname_len: usize = 0,
+    sel_reserved: bool = false,
     // Ctrl+R reload flash: show "Reloading config..." until this timestamp.
     reload_flash_until: i64 = 0,
+    // Reservation form (mode == .reservation_form).
+    form: ReservationForm = .{},
+    // Delete confirm (mode == .delete_confirm): MAC of the reservation to delete.
+    del_mac: [18]u8 = [_]u8{0} ** 18,
+    del_mac_len: usize = 0,
+    del_ip: [16]u8 = [_]u8{0} ** 16,
+    del_ip_len: usize = 0,
 };
 
 /// Replicate the vaxis Table dynamic_fill column-width calculation.
@@ -637,6 +679,15 @@ fn runTui(
             const event = result.event orelse continue;
             switch (event) {
                 .key_press => |key| {
+                    // Modal modes consume all keys before normal/filter/yank handling.
+                    if (state.mode == .reservation_form) {
+                        handleFormKey(server, &state, key);
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .delete_confirm) {
+                        handleDeleteConfirmKey(server, &state, key);
+                        continue :parse_loop;
+                    }
                     if (state.filter_active) {
                         // Filter input mode: Esc/Enter closes; Backspace deletes;
                         // printable ASCII appends.
@@ -725,6 +776,40 @@ fn runTui(
                         }
                         if (key.matches('1', .{})) state.tab = .leases;
                         if (key.matches('2', .{})) state.tab = .stats;
+
+                        // Reservation actions (leases tab only).
+                        if (state.tab == .leases) {
+                            if (key.matches('n', .{})) {
+                                // New blank reservation.
+                                state.form = .{};
+                                state.mode = .reservation_form;
+                            } else if (key.matches('e', .{})) {
+                                // Edit selected lease as a reservation.
+                                state.form = .{};
+                                const ip = state.sel_ip[0..state.sel_ip_len];
+                                const mac = state.sel_mac[0..state.sel_mac_len];
+                                const hn = state.sel_hostname[0..state.sel_hostname_len];
+                                @memcpy(state.form.ip_buf[0..ip.len], ip);
+                                state.form.ip_len = ip.len;
+                                @memcpy(state.form.mac_buf[0..mac.len], mac);
+                                state.form.mac_len = mac.len;
+                                @memcpy(state.form.hostname_buf[0..hn.len], hn);
+                                state.form.hostname_len = hn.len;
+                                // Store orig_mac so we can remove the old entry on rename.
+                                @memcpy(state.form.orig_mac[0..mac.len], mac);
+                                state.form.orig_mac_len = mac.len;
+                                state.mode = .reservation_form;
+                            } else if (key.matches('d', .{}) and state.sel_reserved) {
+                                // Delete confirmation for a reserved lease.
+                                const mac = state.sel_mac[0..state.sel_mac_len];
+                                const ip = state.sel_ip[0..state.sel_ip_len];
+                                @memcpy(state.del_mac[0..mac.len], mac);
+                                state.del_mac_len = mac.len;
+                                @memcpy(state.del_ip[0..ip.len], ip);
+                                state.del_ip_len = ip.len;
+                                state.mode = .delete_confirm;
+                            }
+                        }
                     }
                 },
                 .mouse => |mouse| {
@@ -856,6 +941,13 @@ fn renderFrame(
 
     // Status bar (last row)
     try renderStatus(server, state, win.child(.{ .y_off = h -| 1, .height = 1, .width = w }), fa);
+
+    // Modal overlays — drawn on top of everything else.
+    switch (state.mode) {
+        .normal => {},
+        .reservation_form => try renderReservationForm(state, win, fa),
+        .delete_confirm => renderDeleteConfirm(state, win),
+    }
 }
 
 fn renderHeader(state: *TuiState, win: vaxis.Window) void {
@@ -892,7 +984,7 @@ fn renderHeader(state: *TuiState, win: vaxis.Window) void {
     _ = win.print(&.{.{ .text = stats_label, .style = if (state.tab == .stats) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
     col += @intCast(stats_label.len);
 
-    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  y:yank  ^R:reload  q:quit";
+    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  y:yank  n:new  e:edit  d:del  ^R:reload  q:quit";
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
 
@@ -954,13 +1046,36 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
         try std.fmt.allocPrint(fa, "  filter: {s}  (Esc clears)", .{state.filter_buf[0..state.filter_len]})
     else
         "";
+
+    const rw_label = if (server.cfg.admin_ssh.read_only) "read-only" else "read-write";
+
     const text = try std.fmt.allocPrint(fa, " uptime {d}h{d:0>2}m  {s}{s}", .{
         uptime_h,
         uptime_m,
-        if (server.cfg.admin_ssh.read_only) "read-only" else "read-write",
+        rw_label,
         filter_note,
     });
     _ = win.print(&.{.{ .text = text, .style = style }}, .{ .col_offset = 0, .wrap = .none });
+
+    // Sync peer indicator — only when sync is configured.
+    if (server.sync_mgr) |sm| {
+        const n = sm.authenticated_count.load(.monotonic);
+        const col: u16 = @intCast(text.len);
+        if (n == 0) {
+            const warn_style: vaxis.Style = .{
+                .fg = .{ .rgb = .{ 255, 160, 0 } },
+                .bg = .{ .rgb = .{ 15, 15, 15 } },
+                .bold = true,
+            };
+            _ = win.print(&.{.{ .text = "  sync: no peers", .style = warn_style }}, .{ .col_offset = col, .wrap = .none });
+        } else {
+            const peer_str = if (n == 1)
+                try std.fmt.allocPrint(fa, "  {d} peer", .{n})
+            else
+                try std.fmt.allocPrint(fa, "  {d} peers", .{n});
+            _ = win.print(&.{.{ .text = peer_str, .style = style }}, .{ .col_offset = col, .wrap = .none });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,7 +1342,7 @@ fn renderLeaseTab(
     if (n_rows > 0 and table_ctx.row >= n_rows) table_ctx.row = n_rows - 1;
     if (n_rows == 0) table_ctx.row = 0;
 
-    // Update selected-row state (used by yank mode to copy fields to clipboard).
+    // Update selected-row state (used by yank mode and reservation form).
     if (rows.items.len > 0 and table_ctx.row < rows.items.len) {
         const sel = rows.items[table_ctx.row];
         const ip_len = @min(sel.ip.len, state.sel_ip.len);
@@ -1239,6 +1354,7 @@ fn renderLeaseTab(
         const hn_len = @min(sel.hostname.len, state.sel_hostname.len);
         @memcpy(state.sel_hostname[0..hn_len], sel.hostname[0..hn_len]);
         state.sel_hostname_len = hn_len;
+        state.sel_reserved = std.mem.eql(u8, sel.type, "reserved");
     }
 
     // Build column headers with sort indicator on the active column.
@@ -1428,6 +1544,273 @@ fn renderStatsTab(
     // trailing blank line (vr not used after this point)
     comptime {} // suppress unused-variable lint; vr is intentionally incremented for accounting
     _ = &vr;
+}
+
+// ---------------------------------------------------------------------------
+// Reservation form overlay
+// ---------------------------------------------------------------------------
+
+/// Draw a simple single-line border box starting at (row, col) in `win`.
+/// Box is `w` columns wide, `h` rows tall.
+fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.Style) void {
+    if (w < 2 or h < 2) return;
+
+    // Top and bottom border strings.
+    var top_buf: [256]u8 = undefined;
+    var bot_buf: [256]u8 = undefined;
+    const inner = w - 2;
+    top_buf[0] = '\xe2';
+    top_buf[1] = '\x94';
+    top_buf[2] = '\x8c'; // ┌
+    var i: usize = 3;
+    var n: usize = 0;
+    while (n < inner) : (n += 1) {
+        top_buf[i] = '\xe2';
+        top_buf[i + 1] = '\x94';
+        top_buf[i + 2] = '\x80'; // ─
+        bot_buf[i] = '\xe2';
+        bot_buf[i + 1] = '\x94';
+        bot_buf[i + 2] = '\x80';
+        i += 3;
+    }
+    top_buf[i] = '\xe2';
+    top_buf[i + 1] = '\x94';
+    top_buf[i + 2] = '\x90'; // ┐
+    bot_buf[0] = '\xe2';
+    bot_buf[1] = '\x94';
+    bot_buf[2] = '\x94'; // └
+    bot_buf[i] = '\xe2';
+    bot_buf[i + 1] = '\x94';
+    bot_buf[i + 2] = '\x98'; // ┘
+    _ = win.print(&.{.{ .text = top_buf[0 .. i + 3], .style = style }}, .{ .col_offset = col, .row_offset = row, .wrap = .none });
+    _ = win.print(&.{.{ .text = bot_buf[0 .. i + 3], .style = style }}, .{ .col_offset = col, .row_offset = row + h - 1, .wrap = .none });
+
+    // Side borders.
+    var r: u16 = 1;
+    while (r < h - 1) : (r += 1) {
+        _ = win.print(&.{.{ .text = "\xe2\x94\x82", .style = style }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none }); // │
+        _ = win.print(&.{.{ .text = "\xe2\x94\x82", .style = style }}, .{ .col_offset = col + w - 1, .row_offset = row + r, .wrap = .none });
+    }
+}
+
+/// Render the reservation add/edit form as a centered overlay.
+fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const BOX_W: u16 = 54;
+    const BOX_H: u16 = 11;
+    if (win.width < BOX_W or win.height < BOX_H) return;
+
+    const col: u16 = (win.width - BOX_W) / 2;
+    const row: u16 = (win.height -| BOX_H) / 2;
+
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 180 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } }, .bg = .{ .rgb = .{ 40, 40, 55 } } };
+    const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = .{ 100, 180, 255 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 120, 120, 120 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const ro_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 160, 0 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+
+    // Fill box interior background.
+    var r: u16 = 0;
+    while (r < BOX_H) : (r += 1) {
+        const fill = try fa.alloc(u8, BOX_W);
+        @memset(fill, ' ');
+        _ = win.print(&.{.{ .text = fill, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none });
+    }
+    drawBox(win, row, col, BOX_W, BOX_H, border_style);
+
+    const title = if (state.form.isNew()) "  New Reservation" else "  Edit Reservation";
+    _ = win.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = col + 1, .row_offset = row + 1, .wrap = .none });
+
+    const fields = [3]struct { label: []const u8, buf: []const u8, len: usize }{
+        .{ .label = "  IP Address : ", .buf = &state.form.ip_buf, .len = state.form.ip_len },
+        .{ .label = "  MAC Address: ", .buf = &state.form.mac_buf, .len = state.form.mac_len },
+        .{ .label = "  Hostname   : ", .buf = &state.form.hostname_buf, .len = state.form.hostname_len },
+    };
+    const FIELD_W: u16 = 22;
+
+    for (fields, 0..) |f, fi| {
+        const fr: u16 = row + 3 + @as(u16, @intCast(fi)) * 2;
+        _ = win.print(&.{.{ .text = f.label, .style = label_style }}, .{ .col_offset = col + 1, .row_offset = fr, .wrap = .none });
+        const is_active = state.form.active_field == @as(u8, @intCast(fi));
+        const fs = if (is_active) active_style else field_style;
+        const value = f.buf[0..f.len];
+        // Pad field to FIELD_W, show cursor at end if active.
+        const pad = if (value.len < FIELD_W) FIELD_W - @as(u16, @intCast(value.len)) else 0;
+        const padded = try fa.alloc(u8, pad);
+        @memset(padded, ' ');
+        const lbl_len: u16 = @intCast(f.label.len);
+        _ = win.print(&.{.{ .text = value, .style = fs }}, .{ .col_offset = col + 1 + lbl_len, .row_offset = fr, .wrap = .none });
+        _ = win.print(&.{.{ .text = padded, .style = fs }}, .{ .col_offset = col + 1 + lbl_len + @as(u16, @intCast(value.len)), .row_offset = fr, .wrap = .none });
+        if (is_active) {
+            // Draw cursor block at the insert position.
+            _ = win.print(&.{.{ .text = " ", .style = cursor_style }}, .{ .col_offset = col + 1 + lbl_len + @as(u16, @intCast(value.len)), .row_offset = fr, .wrap = .none });
+        }
+    }
+
+    _ = win.print(&.{.{ .text = "  Tab/Shift-Tab: next/prev  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 3, .wrap = .none });
+
+    if (state.form.err_len > 0) {
+        _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+    }
+    _ = win.print(&.{.{ .text = "  (hostname optional)", .style = ro_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+}
+
+/// Save the form: update StateStore + config.yaml. Returns an error message on failure.
+fn saveReservation(server: *AdminServer, form: *const ReservationForm) ?[]const u8 {
+    const ip = form.ip_buf[0..form.ip_len];
+    const mac = form.mac_buf[0..form.mac_len];
+    const hostname_raw = form.hostname_buf[0..form.hostname_len];
+    const hostname: ?[]const u8 = if (hostname_raw.len > 0) hostname_raw else null;
+
+    if (ip.len == 0) return "IP address is required";
+    if (mac.len == 0) return "MAC address is required";
+
+    // If editing (has orig_mac) and MAC changed, remove old entry first.
+    const orig_mac = form.orig_mac[0..form.orig_mac_len];
+    if (orig_mac.len > 0 and !std.mem.eql(u8, orig_mac, mac)) {
+        server.store.removeLease(orig_mac);
+        if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
+            _ = config_write.removeReservation(server.allocator, pool, orig_mac);
+        }
+    }
+
+    // Update StateStore.
+    server.store.addReservation(mac, ip, hostname, null) catch |err| {
+        return @errorName(err);
+    };
+
+    // Update config.yaml.
+    if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
+        _ = config_write.upsertReservation(server.allocator, pool, mac, ip, hostname, null) catch |err| {
+            return @errorName(err);
+        };
+        config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
+            return @errorName(err);
+        };
+    } else {
+        return "IP not in any configured pool";
+    }
+
+    return null;
+}
+
+fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    var form = &state.form;
+    form.err_len = 0; // clear error on any keypress
+
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .normal;
+        return;
+    }
+
+    if (key.matches(vaxis.Key.enter, .{}) or
+        (key.matches(vaxis.Key.tab, .{}) and form.active_field == 2))
+    {
+        // Save on Enter (any field) or Tab past the last field.
+        if (server.cfg.admin_ssh.read_only) {
+            const msg = "read-only mode — changes not permitted";
+            form.err_len = @min(msg.len, form.err_buf.len);
+            @memcpy(form.err_buf[0..form.err_len], msg[0..form.err_len]);
+            return;
+        }
+        if (saveReservation(server, form)) |err_msg| {
+            form.err_len = @min(err_msg.len, form.err_buf.len);
+            @memcpy(form.err_buf[0..form.err_len], err_msg[0..form.err_len]);
+            return;
+        }
+        state.mode = .normal;
+        return;
+    }
+
+    if (key.matches(vaxis.Key.tab, .{})) {
+        form.active_field = (form.active_field + 1) % 3;
+        return;
+    }
+    if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        form.active_field = if (form.active_field == 0) 2 else form.active_field - 1;
+        return;
+    }
+
+    // Text input for the active field.
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        switch (form.active_field) {
+            0 => if (form.ip_len > 0) {
+                form.ip_len -= 1;
+            },
+            1 => if (form.mac_len > 0) {
+                form.mac_len -= 1;
+            },
+            2 => if (form.hostname_len > 0) {
+                form.hostname_len -= 1;
+            },
+            else => {},
+        }
+        return;
+    }
+    if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        const ch: u8 = @intCast(key.codepoint);
+        switch (form.active_field) {
+            0 => if (form.ip_len < form.ip_buf.len - 1) {
+                form.ip_buf[form.ip_len] = ch;
+                form.ip_len += 1;
+            },
+            1 => if (form.mac_len < form.mac_buf.len - 1) {
+                form.mac_buf[form.mac_len] = ch;
+                form.mac_len += 1;
+            },
+            2 => if (form.hostname_len < form.hostname_buf.len - 1) {
+                form.hostname_buf[form.hostname_len] = ch;
+                form.hostname_len += 1;
+            },
+            else => {},
+        }
+    }
+}
+
+fn renderDeleteConfirm(state: *TuiState, win: vaxis.Window) void {
+    const BOX_W: u16 = 52;
+    const BOX_H: u16 = 5;
+    if (win.width < BOX_W or win.height < BOX_H) return;
+
+    const col: u16 = (win.width - BOX_W) / 2;
+    const row: u16 = (win.height -| BOX_H) / 2;
+
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 30, 10, 10 } } };
+    const text_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } }, .bg = .{ .rgb = .{ 30, 10, 10 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 150, 150, 150 } }, .bg = .{ .rgb = .{ 30, 10, 10 } } };
+
+    // Fill background
+    var r: u16 = 0;
+    while (r < BOX_H) : (r += 1) {
+        var fill_buf: [52]u8 = [_]u8{' '} ** 52;
+        _ = win.print(&.{.{ .text = &fill_buf, .style = .{ .bg = .{ .rgb = .{ 30, 10, 10 } } } }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none });
+    }
+    drawBox(win, row, col, BOX_W, BOX_H, border_style);
+
+    const ip = state.del_ip[0..state.del_ip_len];
+    // Build prompt inline with a fixed-size buffer.
+    var prompt_buf: [60]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "  Delete reservation for {s}? [y/N]", .{ip}) catch "  Delete reservation? [y/N]";
+    _ = win.print(&.{.{ .text = prompt, .style = text_style }}, .{ .col_offset = col + 1, .row_offset = row + 1, .wrap = .none });
+    _ = win.print(&.{.{ .text = "  y = confirm   Esc / any other key = cancel", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + 3, .wrap = .none });
+}
+
+fn handleDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    if (key.matches('y', .{})) {
+        const mac = state.del_mac[0..state.del_mac_len];
+        const ip = state.del_ip[0..state.del_ip_len];
+        server.store.removeLease(mac);
+        if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
+            _ = config_write.removeReservation(server.allocator, pool, mac);
+            config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
+                log.warn("delete reservation: failed to write config: {s}", .{@errorName(err)});
+            };
+        }
+    }
+    state.mode = .normal;
 }
 
 // ---------------------------------------------------------------------------

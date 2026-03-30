@@ -13,14 +13,17 @@ jobs:
       matrix:
         include:
           - zig_target: x86_64-linux-musl
+            alpine_arch: x86_64
             arch_tag: x86_64
             deb_arch: amd64
             rpm_arch: x86_64
           - zig_target: aarch64-linux-musl
+            alpine_arch: aarch64
             arch_tag: aarch64
             deb_arch: arm64
             rpm_arch: aarch64
           - zig_target: riscv64-linux-musl
+            alpine_arch: riscv64
             arch_tag: riscv64
             deb_arch: riscv64
             rpm_arch: riscv64
@@ -35,11 +38,44 @@ jobs:
       - name: Install packaging tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ruby rpm
+          sudo apt-get install -y ruby rpm libssh-dev
           sudo gem install fpm --no-document
 
+      # Fetch musl-linked libssh-static and its transitive deps (openssl, zlib)
+      # from Alpine's package CDN for this job's target architecture.
+      # apk fetch --arch downloads a foreign-arch APK without running foreign
+      # binaries — no QEMU required.  apk add --root installs into a sysroot.
+      - name: Fetch libssh static library for ${{ matrix.alpine_arch }}
+        run: |
+          mkdir -p libssh-sysroot/${{ matrix.alpine_arch }}
+
+          docker run --rm \
+            -v "$(pwd)/libssh-sysroot/${{ matrix.alpine_arch }}:/out" \
+            alpine:3 sh -c '
+              set -e
+              ARCH=${{ matrix.alpine_arch }}
+
+              mkdir -p /sysroot/etc/apk
+              cp /etc/apk/repositories /sysroot/etc/apk/repositories
+
+              apk add \
+                --arch "$ARCH" \
+                --root /sysroot \
+                --initdb \
+                --no-scripts \
+                --no-cache \
+                --allow-untrusted \
+                libssh-static openssl-libs-static zlib-static
+
+              find /sysroot/usr/lib -maxdepth 1 -name "*.a" \
+                -exec cp {} /out/ \;
+            '
+
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }}
+        run: |
+          zig build -Doptimize=ReleaseSafe \
+            -Dtarget=${{ matrix.zig_target }} \
+            -Dlibssh_lib_dir=./libssh-sysroot/${{ matrix.alpine_arch }}
 
       - name: Stage files
         run: |
@@ -68,7 +104,6 @@ jobs:
 
       - name: Build .deb package
         run: |
-          # Sanitize version: hyphens become tildes for deb pre-release ordering
           DEB_VERSION="${VERSION//-/\~}"
           fpm \
             --input-type dir \
@@ -87,7 +122,6 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          # Sanitize version: hyphens not allowed in RPM version field
           RPM_VERSION="${VERSION//-/.}"
           fpm \
             --input-type dir \

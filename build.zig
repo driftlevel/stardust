@@ -18,6 +18,16 @@ pub fn build(b: *std.Build) void {
     });
     const vaxis_mod = vaxis_dep.module("vaxis");
 
+    // Optional: path to a directory containing libssh.a (and its static deps)
+    // for cross-compilation targets where pkg-config cannot find the right library.
+    // Example: -Dlibssh_lib_dir=./libssh-sysroot/aarch64
+    // When omitted, falls back to pkg-config / system library paths.
+    const libssh_lib_dir = b.option(
+        []const u8,
+        "libssh_lib_dir",
+        "Directory containing libssh.a for cross-compilation (bypasses pkg-config)",
+    );
+
     const main_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
@@ -36,8 +46,7 @@ pub fn build(b: *std.Build) void {
     // On Arch: no libssh.a by default — build from source or use AUR.
     // On Alpine: apk add libssh-static provides libssh.a (used in CI).
     // On Ubuntu/Debian: libssh-dev includes libssh.a.
-    exe.linkSystemLibrary2("ssh", .{ .preferred_link_mode = .static });
-    exe.linkLibC();
+    linkLibssh(exe, libssh_lib_dir);
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
@@ -56,8 +65,7 @@ pub fn build(b: *std.Build) void {
         .name = "stardust-dev",
         .root_module = dev_mod,
     });
-    dev_exe.linkSystemLibrary("ssh");
-    dev_exe.linkLibC();
+    linkLibssh(dev_exe, libssh_lib_dir);
     const dev_step = b.step("dev", "Run with debug optimizations");
     dev_step.dependOn(&b.addRunArtifact(dev_exe).step);
 
@@ -65,8 +73,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = main_mod,
     });
-    unit_tests.linkSystemLibrary("ssh");
-    unit_tests.linkLibC();
+    linkLibssh(unit_tests, libssh_lib_dir);
     if (b.option([]const u8, "test_filter", "Filter tests by name")) |f| {
         // Allocate on the build arena so the slice outlives the build() function frame.
         const filter_slice = b.allocator.dupe([]const u8, &.{f}) catch @panic("OOM");
@@ -80,8 +87,35 @@ pub fn build(b: *std.Build) void {
         .name = "check",
         .root_module = main_mod,
     });
-    check_exe.linkSystemLibrary("ssh");
-    check_exe.linkLibC();
+    linkLibssh(check_exe, libssh_lib_dir);
     const check_step = b.step("check", "Type-check the codebase");
     check_step.dependOn(&check_exe.step);
+}
+
+/// Link libssh and its static dependencies.
+///
+/// When `lib_dir` is provided (cross-compilation path), we add an explicit
+/// library search path and bypass pkg-config — pkg-config on the build host
+/// can only find the host-arch glibc-linked library, which is wrong for musl
+/// cross-compilation targets.  The directory must contain libssh.a and the
+/// transitive static deps (libssl.a, libcrypto.a, libz.a) extracted from
+/// Alpine's libssh-static package for the target architecture.
+///
+/// When `lib_dir` is null, pkg-config discovers everything automatically,
+/// which is correct for native builds (dev workstation, CI test runner).
+fn linkLibssh(step: *std.Build.Step.Compile, lib_dir: ?[]const u8) void {
+    if (lib_dir) |d| {
+        step.addLibraryPath(.{ .cwd_relative = d });
+        // Bypass pkg-config; explicitly name libssh and its static deps.
+        // Alpine's libssh-static links against OpenSSL and zlib.
+        inline for (.{ "ssh", "ssl", "crypto", "z" }) |lib| {
+            step.linkSystemLibrary2(lib, .{
+                .preferred_link_mode = .static,
+                .use_pkg_config = .no,
+            });
+        }
+    } else {
+        step.linkSystemLibrary2("ssh", .{ .preferred_link_mode = .static });
+    }
+    step.linkLibC();
 }
