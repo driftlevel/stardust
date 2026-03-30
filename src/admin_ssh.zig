@@ -93,6 +93,10 @@ pub const AdminServer = struct {
     store: *state_mod.StateStore,
     counters: *const dhcp_mod.Counters,
     running: std.atomic.Value(bool),
+    /// Number of session threads currently alive. Incremented in runInner
+    /// before spawning (so stop() never races a freshly-spawned thread),
+    /// decremented in sessionThread's defer.
+    active_sessions: std.atomic.Value(i32),
     start_time: i64,
 
     const Self = @This();
@@ -110,6 +114,7 @@ pub const AdminServer = struct {
             .store = store,
             .counters = counters,
             .running = std.atomic.Value(bool).init(true),
+            .active_sessions = std.atomic.Value(i32).init(0),
             .start_time = std.time.timestamp(),
         };
         return self;
@@ -121,6 +126,15 @@ pub const AdminServer = struct {
 
     pub fn stop(self: *Self) void {
         self.running.store(false, .release);
+        // Wait up to 2 s for active session threads to send their terminal
+        // cleanup sequences (mouse-off, exit alt-screen) before we free self.
+        // Each session thread polls server.running with a 100 ms read timeout,
+        // so it will notice within ~100 ms and finish cleanly.
+        var waited_ms: u32 = 0;
+        while (self.active_sessions.load(.acquire) > 0 and waited_ms < 2000) {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            waited_ms += 50;
+        }
     }
 
     /// Thread entry point.
@@ -168,7 +182,11 @@ pub const AdminServer = struct {
                 c.ssh_free(session);
                 continue;
             }
+            // Increment before spawning so stop() cannot race a thread that
+            // has been spawned but hasn't yet run its first instruction.
+            _ = self.active_sessions.fetchAdd(1, .acq_rel);
             const thread = std.Thread.spawn(.{}, sessionThread, .{ self, session }) catch |err| {
+                _ = self.active_sessions.fetchSub(1, .acq_rel);
                 log.warn("failed to spawn session thread: {s}", .{@errorName(err)});
                 c.ssh_free(session);
                 continue;
@@ -189,6 +207,7 @@ fn sessionThread(server: *AdminServer, session: c.ssh_session) void {
     defer {
         log.info("connection closed: {s}", .{peer});
         c.ssh_free(session);
+        _ = server.active_sessions.fetchSub(1, .acq_rel);
     }
     runSession(server, session, peer) catch |err| {
         log.warn("session error from {s}: {s}", .{ peer, @errorName(err) });
@@ -420,6 +439,7 @@ const TuiState = struct {
     lease_start: u16 = 0,
     sort_col: SortCol = .expires,
     sort_dir: SortDir = .desc,
+    stats_scroll: u16 = 0,
     // Filter ('/') — active while the user is typing; cleared when Esc/Enter pressed.
     filter_active: bool = false,
     filter_buf: [256]u8 = undefined,
@@ -433,6 +453,8 @@ const TuiState = struct {
     sel_mac_len: usize = 0,
     sel_hostname: [256]u8 = [_]u8{0} ** 256,
     sel_hostname_len: usize = 0,
+    // Ctrl+R reload flash: show "Reloading config..." until this timestamp.
+    reload_flash_until: i64 = 0,
 };
 
 /// Replicate the vaxis Table dynamic_fill column-width calculation.
@@ -479,13 +501,6 @@ fn runTui(
     peer: []const u8,
 ) !void {
     const allocator = server.allocator;
-
-    // ssh_event_dopoll is the only libssh mechanism that reliably dispatches
-    // channel request callbacks (including SSH_CHANNEL_REQUEST_WINDOW_CHANGE).
-    // ssh_channel_read_timeout does NOT fire them.
-    const ssh_ev = c.ssh_event_new() orelse return error.SshEventFailed;
-    defer c.ssh_event_free(ssh_ev);
-    if (c.ssh_event_add_session(ssh_ev, session) != 0) return error.SshEventFailed;
 
     log.debug("{s}: channel open={d} eof={d}", .{
         peer,
@@ -540,40 +555,34 @@ fn runTui(
     var cur_rows: u32 = init_rows;
 
     var running = true;
-    while (running) {
-        // Poll for all SSH events with a 100 ms timeout.
-        // ssh_event_dopoll dispatches ALL channel callbacks (including
-        // SSH_CHANNEL_REQUEST_WINDOW_CHANGE → ptyWindowChangeCb) which
-        // ssh_channel_read_timeout does NOT do.
-        // Returns SSH_OK (0) or SSH_ERROR (-1).
-        const poll_rc = c.ssh_event_dopoll(ssh_ev, 100);
-        if (poll_rc < 0 and c.ssh_channel_is_open(channel) == 0) {
-            log.debug("{s}: session error during poll, closing TUI", .{peer});
-            break;
-        }
-
-        if (c.ssh_channel_is_eof(channel) != 0) {
-            log.debug("{s}: channel EOF, closing TUI", .{peer});
-            break;
-        }
-
-        // Read any channel data buffered by dopoll (non-blocking — returns
-        // immediately with 0 if nothing available).
-        const n_raw = c.ssh_channel_read_nonblocking(
+    while (running and server.running.load(.acquire)) {
+        // Read keyboard/mouse input with a 100 ms timeout.
+        // Return values: >0 bytes read; 0 = timeout; -1 = SSH_ERROR (fatal);
+        // -2 = SSH_AGAIN (session momentarily non-blocking, no data — not fatal).
+        const n_raw = c.ssh_channel_read_timeout(
             channel,
             &read_buf[read_start],
             @intCast(read_buf.len - read_start),
             0,
+            100,
         );
-        if (n_raw < 0) {
+        if (n_raw == -1) {
             log.debug("{s}: channel read error, closing TUI", .{peer});
             break;
         }
+        if (c.ssh_channel_is_eof(channel) != 0) {
+            log.debug("{s}: channel EOF, closing TUI", .{peer});
+            break;
+        }
+        // SSH_AGAIN (-2): throttle briefly to avoid spinning.
+        if (n_raw == -2) std.Thread.sleep(50 * std.time.ns_per_ms);
 
-        // Drain the SSH message queue.  In libssh server mode,
-        // SSH_CHANNEL_REQUEST_WINDOW_CHANGE is queued here rather than
-        // dispatched through ssh_channel_callbacks.  ssh_message_get returns
-        // null immediately when the queue is empty.
+        // Drain the SSH message queue for window-change requests.
+        // In libssh server mode, SSH_CHANNEL_REQUEST_WINDOW_CHANGE arrives in
+        // the session message queue rather than via channel callbacks.
+        // Switch to non-blocking mode so ssh_message_get returns NULL immediately
+        // when the queue is empty; restore blocking mode afterwards.
+        c.ssh_set_blocking(session, 0);
         while (true) {
             const msg = c.ssh_message_get(session) orelse break;
             defer c.ssh_message_free(msg);
@@ -606,6 +615,7 @@ fn runTui(
                 _ = c.ssh_message_reply_default(msg);
             }
         }
+        c.ssh_set_blocking(session, 1);
 
         const n: usize = if (n_raw > 0) @intCast(n_raw) else 0;
         const avail = read_start + n;
@@ -663,6 +673,14 @@ fn runTui(
                             running = false;
                             break :parse_loop;
                         }
+                        if (key.matches('r', .{ .ctrl = true })) {
+                            // Send SIGHUP to self — triggers config reload in the DHCP run loop.
+                            const pid = std.os.linux.getpid();
+                            std.posix.kill(@intCast(pid), std.posix.SIG.HUP) catch |err| {
+                                log.warn("{s}: Ctrl+R kill failed: {s}", .{ peer, @errorName(err) });
+                            };
+                            state.reload_flash_until = std.time.timestamp() + 3;
+                        }
                         if (key.matches('y', .{}) and state.tab == .leases) {
                             state.yank_mode = true;
                         }
@@ -703,7 +721,7 @@ fn runTui(
                         }
                         switch (state.tab) {
                             .leases => handleLeaseKey(&state, &table_ctx, key),
-                            .stats => {},
+                            .stats => handleStatsKey(&state, key),
                         }
                         if (key.matches('1', .{})) state.tab = .leases;
                         if (key.matches('2', .{})) state.tab = .stats;
@@ -745,11 +763,13 @@ fn runTui(
                                 }
                             }
                         },
-                        .wheel_up => if (state.tab == .leases) {
-                            table_ctx.row -|= 1;
+                        .wheel_up => switch (state.tab) {
+                            .leases => table_ctx.row -|= 1,
+                            .stats => state.stats_scroll -|= 3,
                         },
-                        .wheel_down => if (state.tab == .leases) {
-                            table_ctx.row +|= 1;
+                        .wheel_down => switch (state.tab) {
+                            .leases => table_ctx.row +|= 1,
+                            .stats => state.stats_scroll +|= 3,
                         },
                         else => {},
                     }
@@ -791,6 +811,18 @@ fn handleLeaseKey(state: *TuiState, ctx: *vaxis.widgets.Table.TableContext, key:
     state.lease_start = ctx.start;
 }
 
+fn handleStatsKey(state: *TuiState, key: vaxis.Key) void {
+    if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) {
+        state.stats_scroll +|= 1;
+    } else if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) {
+        state.stats_scroll -|= 1;
+    } else if (key.matches(vaxis.Key.page_down, .{})) {
+        state.stats_scroll +|= 20;
+    } else if (key.matches(vaxis.Key.page_up, .{})) {
+        state.stats_scroll -|= 20;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Frame rendering
 // ---------------------------------------------------------------------------
@@ -819,7 +851,7 @@ fn renderFrame(
 
     switch (state.tab) {
         .leases => try renderLeaseTab(server, state, table_ctx, body, fa),
-        .stats => try renderStatsTab(server, body, fa),
+        .stats => try renderStatsTab(server, state, body, fa),
     }
 
     // Status bar (last row)
@@ -860,7 +892,7 @@ fn renderHeader(state: *TuiState, win: vaxis.Window) void {
     _ = win.print(&.{.{ .text = stats_label, .style = if (state.tab == .stats) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
     col += @intCast(stats_label.len);
 
-    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  y:yank  q:quit";
+    const hint = "  j/k:move  /:filter  I/M/H/T/E/P:sort  y:yank  ^R:reload  q:quit";
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
 
@@ -904,6 +936,16 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
         .bg = .{ .rgb = .{ 15, 15, 15 } },
     };
     const now = std.time.timestamp();
+
+    if (now <= state.reload_flash_until) {
+        const flash_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0, 0, 0 } },
+            .bg = .{ .rgb = .{ 80, 180, 255 } },
+            .bold = true,
+        };
+        _ = win.print(&.{.{ .text = " Reloading config... (settings not applied live require a process restart)", .style = flash_style }}, .{ .col_offset = 0, .wrap = .none });
+        return;
+    }
     const uptime_s = now - server.start_time;
     const uptime_h = @divTrunc(uptime_s, 3600);
     const uptime_m = @divTrunc(@rem(uptime_s, 3600), 60);
@@ -933,14 +975,14 @@ const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expires
 //   min       — minimum width before this column is squeezed no further
 //   left_trunc — true = show the END of the string (best for addresses);
 //               false = show the START (best for hostnames, labels)
-const LeaseColSpec = struct { ideal: u16, min: u16, left_trunc: bool };
+const LeaseColSpec = struct { ideal: u16, min: u16, left_trunc: bool, right_align: bool = false };
 const LEASE_COL_SPECS = [6]LeaseColSpec{
     .{ .ideal = 16, .min = 7, .left_trunc = true }, // ip      ("255.255.255.255" = 15 + 1 padding)
     .{ .ideal = 18, .min = 9, .left_trunc = true }, // mac     ("aa:bb:cc:dd:ee:ff" = 17 + 1 padding)
     .{ .ideal = 60, .min = 6, .left_trunc = false }, // hostname (room for FQDNs)
     .{ .ideal = 8, .min = 4, .left_trunc = false }, // type    ("reserved" = 8)
     .{ .ideal = 9, .min = 7, .left_trunc = false }, // expires ("1234h56m" ~ 9)
-    .{ .ideal = 14, .min = 7, .left_trunc = false }, // pool    ("192.168.0.0/24" = 14)
+    .{ .ideal = 18, .min = 10, .left_trunc = false, .right_align = true }, // pool    ("192.168.100.0/24" = 16)
 };
 // Columns reduced in this priority order when terminal is too narrow.
 // Flexible/variable content is reduced first; address columns last.
@@ -964,6 +1006,17 @@ fn calcLeaseColWidths(win_width: u16) [6]u16 {
         total -= cut;
     }
     return widths;
+}
+
+/// Right-align `text` within `width` columns by prepending spaces.
+/// Returns text unchanged if it already fills or exceeds the width.
+fn rightAlignText(fa: std.mem.Allocator, text: []const u8, width: u16) ![]const u8 {
+    if (text.len >= width) return text;
+    const pad = width - @as(u16, @intCast(text.len));
+    const buf = try fa.alloc(u8, width);
+    @memset(buf[0..pad], ' ');
+    @memcpy(buf[pad..], text);
+    return buf;
 }
 
 /// Truncate `text` to fit within `width` terminal columns using a single '…'.
@@ -1009,7 +1062,8 @@ fn drawLeaseTable(
         for (0..6) |ci| {
             if (widths[ci] > 0) {
                 const cell = hdr_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
-                const text = try truncateCell(fa, header_names[ci], widths[ci], false);
+                const raw = try truncateCell(fa, header_names[ci], widths[ci], false);
+                const text = if (LEASE_COL_SPECS[ci].right_align) try rightAlignText(fa, raw, widths[ci]) else raw;
                 _ = cell.print(&.{.{ .text = text, .style = hdr_style }}, .{ .wrap = .none });
             }
             x += @as(i17, widths[ci]) + LEASE_COL_SEP;
@@ -1047,8 +1101,9 @@ fn drawLeaseTable(
         for (0..6) |ci| {
             if (widths[ci] > 0) {
                 const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
-                const lt = LEASE_COL_SPECS[ci].left_trunc;
-                const text = try truncateCell(fa, fields[ci], widths[ci], lt);
+                const spec = LEASE_COL_SPECS[ci];
+                const raw = try truncateCell(fa, fields[ci], widths[ci], spec.left_trunc);
+                const text = if (spec.right_align) try rightAlignText(fa, raw, widths[ci]) else raw;
                 _ = cell.print(&.{.{ .text = text, .style = row_style }}, .{ .wrap = .none });
             }
             x += @as(i17, widths[ci]) + LEASE_COL_SEP;
@@ -1128,9 +1183,15 @@ fn renderLeaseTab(
 
     var rows = std.ArrayList(LeaseRow){};
     for (leases) |lease| {
-        const pool_label = findPoolLabel(server.cfg, lease.ip) orelse "?";
-        const type_str: []const u8 = if (lease.reserved) "reserved" else "dynamic";
-        const hostname_str = lease.hostname orelse "";
+        const is_conflict = std.mem.startsWith(u8, lease.mac, "conflict:");
+
+        const pool = findPool(server.cfg, lease.ip);
+        const pool_cidr = if (pool) |p|
+            try std.fmt.allocPrint(a, "{s}/{d}", .{ p.subnet, p.prefix_len })
+        else
+            "?";
+        const type_str: []const u8 = if (is_conflict) "conflict" else if (lease.reserved) "reserved" else "dynamic";
+        const hostname_str: []const u8 = if (is_conflict) "" else lease.hostname orelse "";
 
         const expires_str = blk: {
             if (lease.reserved) break :blk try a.dupe(u8, "forever");
@@ -1147,17 +1208,17 @@ fn renderLeaseTab(
                 containsIgnoreCase(lease.mac, filter) or
                 containsIgnoreCase(hostname_str, filter) or
                 containsIgnoreCase(type_str, filter) or
-                containsIgnoreCase(pool_label, filter);
+                containsIgnoreCase(pool_cidr, filter);
             if (!match) continue;
         }
 
         try rows.append(a, .{
             .ip = try a.dupe(u8, lease.ip),
-            .mac = try a.dupe(u8, lease.mac),
+            .mac = if (is_conflict) "" else try a.dupe(u8, lease.mac),
             .hostname = try a.dupe(u8, hostname_str),
             .type = type_str,
             .expires = expires_str,
-            .pool = try a.dupe(u8, pool_label),
+            .pool = pool_cidr,
         });
     }
 
@@ -1193,26 +1254,38 @@ fn renderLeaseTab(
     try drawLeaseTable(win, rows.items, table_ctx, &hdr_names, a);
 }
 
-fn findPoolLabel(cfg: *const config_mod.Config, ip_str: []const u8) ?[]const u8 {
+fn findPool(cfg: *const config_mod.Config, ip_str: []const u8) ?*const config_mod.PoolConfig {
     const ip_bytes = config_mod.parseIpv4(ip_str) catch return null;
     const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
-
     for (cfg.pools) |*pool| {
         const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch continue;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        if ((ip_int & pool.subnet_mask) == subnet_int) {
-            return pool.subnet; // static string from config — valid lifetime
-        }
+        if ((ip_int & pool.subnet_mask) == subnet_int) return pool;
     }
     return null;
+}
+
+/// Returns the subnet string for sort/filter purposes.
+fn findPoolLabel(cfg: *const config_mod.Config, ip_str: []const u8) ?[]const u8 {
+    return if (findPool(cfg, ip_str)) |p| p.subnet else null;
 }
 
 // ---------------------------------------------------------------------------
 // Stats tab
 // ---------------------------------------------------------------------------
 
+/// Map a virtual row to a display row given current scroll position.
+/// Returns null if the row is scrolled out of view.
+inline fn statsVr(vr: u16, scroll: u16, height: u16) ?u16 {
+    if (vr < scroll) return null;
+    const dr = vr - scroll;
+    if (dr >= height) return null;
+    return dr;
+}
+
 fn renderStatsTab(
     server: *AdminServer,
+    state: *TuiState,
     win: vaxis.Window,
     fa: std.mem.Allocator,
 ) !void {
@@ -1230,11 +1303,26 @@ fn renderStatsTab(
     const bar_warn: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 180, 0 } } };
     const bar_crit: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 60, 60 } } };
 
-    var row: u16 = 0;
+    // Compute total content height:
+    //   1 (blank) + 1 (pool header) + 3 * n_pools (label + bar + blank) +
+    //   1 (DHCP header) + 8 (DHCP counters) +
+    //   1 (blank) + 1 (defense header) + 5 (defense counters) + 1 (trailing blank)
+    const n_pools: u16 = @intCast(server.cfg.pools.len);
+    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 8 + 1 + 1 + 5 + 1;
+
+    // Clamp scroll so we never scroll past the last line of content.
+    const max_scroll: u16 = if (total_rows > win.height) total_rows - win.height else 0;
+    if (state.stats_scroll > max_scroll) state.stats_scroll = max_scroll;
+    const scroll = state.stats_scroll;
+
+    var vr: u16 = 0;
+
+    vr += 1; // blank line above section header
 
     // ---- Pool stats ----
-    _ = win.print(&.{.{ .text = "  Pool Utilization", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = row, .wrap = .none });
-    row += 1;
+    if (statsVr(vr, scroll, win.height)) |dr|
+        _ = win.print(&.{.{ .text = "  Pool Utilization", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+    vr += 1;
 
     for (server.cfg.pools) |pool| {
         const capacity = poolCapacity(&pool);
@@ -1256,10 +1344,15 @@ fn renderStatsTab(
         const used = active + reserved;
         const available: u64 = if (capacity > used) capacity - used else 0;
 
-        // Pool label line
-        const pool_label = try std.fmt.allocPrint(a, "  {s}/{d}", .{ pool.subnet, pool.prefix_len });
-        _ = win.print(&.{.{ .text = pool_label, .style = val_style }}, .{ .col_offset = 0, .row_offset = row, .wrap = .none });
-        row += 1;
+        // Pool label line: "  subnet/prefix  start – end"
+        const start_str = if (pool.pool_start.len > 0) pool.pool_start else "(auto)";
+        const end_str = if (pool.pool_end.len > 0) pool.pool_end else "(auto)";
+        const pool_label = try std.fmt.allocPrint(a, "  {s}/{d}  {s} \xe2\x80\x93 {s}", .{
+            pool.subnet, pool.prefix_len, start_str, end_str,
+        });
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = pool_label, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
 
         // Bar chart: use up to 40 columns
         const BAR_W: usize = 40;
@@ -1280,15 +1373,15 @@ fn renderStatsTab(
             available,
             expired,
         });
-        _ = win.print(&.{.{ .text = bar_str, .style = bar_style }}, .{ .col_offset = 0, .row_offset = row, .wrap = .none });
-        row += 2;
-
-        if (row >= win.height -| 4) break;
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = bar_str, .style = bar_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 2; // bar row + blank row
     }
 
     // ---- DHCP counters ----
-    _ = win.print(&.{.{ .text = "  DHCP Counters", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = row, .wrap = .none });
-    row += 1;
+    if (statsVr(vr, scroll, win.height)) |dr|
+        _ = win.print(&.{.{ .text = "  DHCP Counters", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+    vr += 1;
 
     const ctr = server.counters;
     const counter_lines = [_]struct { label: []const u8, val: u64 }{
@@ -1303,11 +1396,38 @@ fn renderStatsTab(
     };
 
     for (counter_lines) |cl| {
-        if (row >= win.height) break;
-        const line = try std.fmt.allocPrint(a, "    {s}  {d}", .{ cl.label, cl.val });
-        _ = win.print(&.{.{ .text = line, .style = val_style }}, .{ .col_offset = 0, .row_offset = row, .wrap = .none });
-        row += 1;
+        if (statsVr(vr, scroll, win.height)) |dr| {
+            const line = try std.fmt.allocPrint(a, "    {s}  {d}", .{ cl.label, cl.val });
+            _ = win.print(&.{.{ .text = line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        }
+        vr += 1;
     }
+
+    // ---- Defense counters ----
+    vr += 1; // blank separator
+    if (statsVr(vr, scroll, win.height)) |dr|
+        _ = win.print(&.{.{ .text = "  Defense Counters", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+    vr += 1;
+
+    const defense_lines = [_]struct { label: []const u8, val: u64 }{
+        .{ .label = "PROBE CONFLICT  ", .val = ctr.probe_conflict.load(.monotonic) },
+        .{ .label = "DECLINE QUARANT ", .val = ctr.decline_ip_quarantined.load(.monotonic) },
+        .{ .label = "MAC BLOCKED     ", .val = ctr.decline_mac_blocked.load(.monotonic) },
+        .{ .label = "GLOBAL LIMITED  ", .val = ctr.decline_global_limited.load(.monotonic) },
+        .{ .label = "ALLOC REFUSED   ", .val = ctr.decline_refused.load(.monotonic) },
+    };
+
+    for (defense_lines) |cl| {
+        if (statsVr(vr, scroll, win.height)) |dr| {
+            const line = try std.fmt.allocPrint(a, "    {s}  {d}", .{ cl.label, cl.val });
+            _ = win.print(&.{.{ .text = line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        }
+        vr += 1;
+    }
+
+    // trailing blank line (vr not used after this point)
+    comptime {} // suppress unused-variable lint; vr is intentionally incremented for accounting
+    _ = &vr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,7 +1571,7 @@ test "LeaseSort.ipLess: numeric ordering" {
 test "LeaseSort.expiresLess: timestamp ordering" {
     const mk = struct {
         fn lease(ip: []const u8, exp: i64, res: bool) state_mod.Lease {
-            return .{ .mac = "aa:bb:cc:dd:ee:ff", .ip = ip, .hostname = null, .expires = exp, .reserved = res };
+            return .{ .mac = "aa:bb:cc:dd:ee:ff", .ip = ip, .hostname = null, .expires = exp, .reserved = res, .client_id = null };
         }
     };
     const a = mk.lease("10.0.0.1", 1000, false);
@@ -1463,4 +1583,371 @@ test "LeaseSort.expiresLess: timestamp ordering" {
     try std.testing.expect(!LeaseSort.expiresLess(a, a)); // equal = not less
     try std.testing.expect(LeaseSort.expiresLess(b, r)); // dynamic < reserved (maxInt)
     try std.testing.expect(!LeaseSort.expiresLess(r, a)); // reserved not < dynamic
+}
+
+// ---------------------------------------------------------------------------
+// Regression: SSH read return codes
+// ---------------------------------------------------------------------------
+
+test "SSH_AGAIN is not SSH_ERROR: regression for immediate TUI exit" {
+    // The TUI event loop exits only when ssh_channel_read_timeout returns -1
+    // (SSH_ERROR). SSH_AGAIN (-2) means no data available yet in non-blocking
+    // mode and must NOT break the loop.
+    //
+    // This test pins the libssh constant values so that any change to those
+    // constants (however unlikely) is caught immediately.
+    try std.testing.expectEqual(@as(c_int, -1), c.SSH_ERROR);
+    try std.testing.expectEqual(@as(c_int, -2), c.SSH_AGAIN);
+    // Belt: confirm they are distinct so the if (n_raw == -1) branch works.
+    try std.testing.expect(c.SSH_AGAIN != c.SSH_ERROR);
+}
+
+// ---------------------------------------------------------------------------
+// handleLeaseKey navigation
+// ---------------------------------------------------------------------------
+
+test "handleLeaseKey: j/k move cursor down and up" {
+    var state: TuiState = .{};
+    var ctx: vaxis.widgets.Table.TableContext = .{};
+
+    // Move down from row 0.
+    handleLeaseKey(&state, &ctx, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(u16, 1), ctx.row);
+    handleLeaseKey(&state, &ctx, .{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(u16, 2), ctx.row);
+
+    // Move up.
+    handleLeaseKey(&state, &ctx, .{ .codepoint = 'k' });
+    try std.testing.expectEqual(@as(u16, 1), ctx.row);
+
+    // Move up past 0 saturates at 0.
+    handleLeaseKey(&state, &ctx, .{ .codepoint = 'k' });
+    handleLeaseKey(&state, &ctx, .{ .codepoint = 'k' });
+    try std.testing.expectEqual(@as(u16, 0), ctx.row);
+}
+
+test "handleLeaseKey: page_down and page_up step by 20" {
+    var state: TuiState = .{};
+    var ctx: vaxis.widgets.Table.TableContext = .{};
+
+    handleLeaseKey(&state, &ctx, .{ .codepoint = vaxis.Key.page_down });
+    try std.testing.expectEqual(@as(u16, 20), ctx.row);
+
+    handleLeaseKey(&state, &ctx, .{ .codepoint = vaxis.Key.page_up });
+    try std.testing.expectEqual(@as(u16, 0), ctx.row);
+
+    // page_up from 0 saturates.
+    handleLeaseKey(&state, &ctx, .{ .codepoint = vaxis.Key.page_up });
+    try std.testing.expectEqual(@as(u16, 0), ctx.row);
+}
+
+// ---------------------------------------------------------------------------
+// LeaseSort.lessThan direction
+// ---------------------------------------------------------------------------
+
+test "LeaseSort.lessThan: desc reverses asc order" {
+    const mk = struct {
+        fn lease(ip: []const u8) state_mod.Lease {
+            return .{ .mac = "aa:bb:cc:dd:ee:ff", .ip = ip, .hostname = null, .expires = 9999, .reserved = false, .client_id = null };
+        }
+    };
+    const lo = mk.lease("10.0.0.1");
+    const hi = mk.lease("10.0.0.2");
+
+    // Empty config — pool sort not needed here, testing IP column only.
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &.{};
+
+    const ctx_asc = LeaseSort{ .col = .ip, .dir = .asc, .cfg = &cfg };
+    const ctx_desc = LeaseSort{ .col = .ip, .dir = .desc, .cfg = &cfg };
+
+    try std.testing.expect(ctx_asc.lessThan(lo, hi)); // 10.0.0.1 < 10.0.0.2 asc
+    try std.testing.expect(!ctx_asc.lessThan(hi, lo));
+    try std.testing.expect(!ctx_desc.lessThan(lo, hi)); // desc flips it
+    try std.testing.expect(ctx_desc.lessThan(hi, lo));
+}
+
+test "LeaseSort.lessThan: sort by hostname with null treated as empty" {
+    const mk = struct {
+        fn lease(ip: []const u8, hn: ?[]const u8) state_mod.Lease {
+            return .{ .mac = "aa:bb:cc:dd:ee:ff", .ip = ip, .hostname = hn, .expires = 9999, .reserved = false, .client_id = null };
+        }
+    };
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &.{};
+
+    const ctx = LeaseSort{ .col = .hostname, .dir = .asc, .cfg = &cfg };
+    const a = mk.lease("10.0.0.1", "alpha");
+    const b = mk.lease("10.0.0.2", "beta");
+    const n = mk.lease("10.0.0.3", null); // null hostname sorts as ""
+
+    try std.testing.expect(ctx.lessThan(a, b)); // "alpha" < "beta"
+    try std.testing.expect(!ctx.lessThan(b, a));
+    try std.testing.expect(ctx.lessThan(n, a)); // "" < "alpha"
+    try std.testing.expect(!ctx.lessThan(a, n));
+}
+
+// ---------------------------------------------------------------------------
+// poolCapacity
+// ---------------------------------------------------------------------------
+
+test "poolCapacity: /24 with explicit 100-200 range" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+    pool.pool_start = "192.168.1.100";
+    pool.pool_end = "192.168.1.200";
+    try std.testing.expectEqual(@as(u64, 101), poolCapacity(&pool)); // 200 - 100 + 1
+}
+
+test "poolCapacity: empty range (end < start) returns 0" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+    pool.pool_start = "192.168.1.200";
+    pool.pool_end = "192.168.1.100";
+    try std.testing.expectEqual(@as(u64, 0), poolCapacity(&pool));
+}
+
+test "poolCapacity: empty strings use subnet+1 to broadcast-1" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00; // /24: subnet=.0, broadcast=.255
+    pool.pool_start = "";
+    pool.pool_end = "";
+    // start = .1, end = .254 → 254 addresses
+    try std.testing.expectEqual(@as(u64, 254), poolCapacity(&pool));
+}
+
+// ---------------------------------------------------------------------------
+// isIpInPool
+// ---------------------------------------------------------------------------
+
+test "isIpInPool: address inside /24 subnet" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+    try std.testing.expect(isIpInPool("192.168.1.50", &pool));
+    try std.testing.expect(isIpInPool("192.168.1.1", &pool));
+    try std.testing.expect(isIpInPool("192.168.1.254", &pool));
+}
+
+test "isIpInPool: address outside /24 subnet" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+    try std.testing.expect(!isIpInPool("192.168.2.1", &pool));
+    try std.testing.expect(!isIpInPool("10.0.0.1", &pool));
+}
+
+// ---------------------------------------------------------------------------
+// findPoolLabel
+// ---------------------------------------------------------------------------
+
+test "findPoolLabel: returns subnet string for matching pool" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+
+    var pools = [_]config_mod.PoolConfig{pool};
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &pools;
+
+    const label = findPoolLabel(&cfg, "192.168.1.100");
+    try std.testing.expect(label != null);
+    try std.testing.expectEqualStrings("192.168.1.0", label.?);
+}
+
+test "findPoolLabel: returns null for IP not in any pool" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+
+    var pools = [_]config_mod.PoolConfig{pool};
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &pools;
+
+    try std.testing.expect(findPoolLabel(&cfg, "10.0.0.1") == null);
+}
+
+test "findPoolLabel: matches correct pool among multiple" {
+    var pool1: config_mod.PoolConfig = undefined;
+    pool1.subnet = "192.168.1.0";
+    pool1.subnet_mask = 0xFFFFFF00;
+
+    var pool2: config_mod.PoolConfig = undefined;
+    pool2.subnet = "10.0.0.0";
+    pool2.subnet_mask = 0xFF000000; // /8
+
+    var pools = [_]config_mod.PoolConfig{ pool1, pool2 };
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &pools;
+
+    const l1 = findPoolLabel(&cfg, "192.168.1.50");
+    try std.testing.expect(l1 != null);
+    try std.testing.expectEqualStrings("192.168.1.0", l1.?);
+
+    const l2 = findPoolLabel(&cfg, "10.5.5.5");
+    try std.testing.expect(l2 != null);
+    try std.testing.expectEqualStrings("10.0.0.0", l2.?);
+}
+
+// ---------------------------------------------------------------------------
+// rightAlignText
+// ---------------------------------------------------------------------------
+
+test "rightAlignText: pads short text with leading spaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    const result = try rightAlignText(fa, "10.0.0.0/8", 18);
+    try std.testing.expectEqual(@as(usize, 18), result.len);
+    try std.testing.expectEqualStrings("        10.0.0.0/8", result);
+}
+
+test "rightAlignText: exact fit returns text unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    const result = try rightAlignText(fa, "192.168.100.0/24", 16);
+    try std.testing.expectEqualStrings("192.168.100.0/24", result);
+}
+
+test "rightAlignText: oversized text returned as-is (caller truncates first)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
+
+    const result = try rightAlignText(fa, "192.168.100.0/24", 10);
+    try std.testing.expectEqualStrings("192.168.100.0/24", result);
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine sentinel filtering
+// ---------------------------------------------------------------------------
+
+test "quarantine sentinel detection: conflict: prefix" {
+    // Probe-conflict entries use MAC = "conflict:<ip>".  renderLeaseTab detects
+    // them by this prefix and renders them with type="conflict", blank MAC/hostname.
+    try std.testing.expect(std.mem.startsWith(u8, "conflict:192.168.1.5", "conflict:"));
+    try std.testing.expect(!std.mem.startsWith(u8, "aa:bb:cc:dd:ee:ff", "conflict:"));
+    try std.testing.expect(!std.mem.startsWith(u8, "", "conflict:"));
+}
+
+// ---------------------------------------------------------------------------
+// findPool returns pool struct (CIDR display)
+// ---------------------------------------------------------------------------
+
+test "findPool: returns pool for matching IP" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+    pool.prefix_len = 24;
+
+    var pools = [_]config_mod.PoolConfig{pool};
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &pools;
+
+    const p = findPool(&cfg, "192.168.1.100");
+    try std.testing.expect(p != null);
+    try std.testing.expectEqualStrings("192.168.1.0", p.?.subnet);
+    try std.testing.expectEqual(@as(u8, 24), p.?.prefix_len);
+}
+
+test "findPool: returns null for unmatched IP" {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = "192.168.1.0";
+    pool.subnet_mask = 0xFFFFFF00;
+    pool.prefix_len = 24;
+
+    var pools = [_]config_mod.PoolConfig{pool};
+    var cfg: config_mod.Config = undefined;
+    cfg.pools = &pools;
+
+    try std.testing.expect(findPool(&cfg, "10.0.0.1") == null);
+}
+
+// ---------------------------------------------------------------------------
+// statsVr: virtual-row → display-row mapping
+// ---------------------------------------------------------------------------
+
+test "statsVr: row before scroll returns null" {
+    try std.testing.expect(statsVr(0, 5, 20) == null);
+    try std.testing.expect(statsVr(4, 5, 20) == null);
+}
+
+test "statsVr: row at scroll offset returns 0" {
+    try std.testing.expectEqual(@as(?u16, 0), statsVr(5, 5, 20));
+}
+
+test "statsVr: row within viewport maps correctly" {
+    try std.testing.expectEqual(@as(?u16, 3), statsVr(8, 5, 20));
+    try std.testing.expectEqual(@as(?u16, 19), statsVr(24, 5, 20));
+}
+
+test "statsVr: row at height boundary returns null" {
+    // scroll=5, height=20 → last valid vr is 5+19=24; vr=25 is out
+    try std.testing.expect(statsVr(25, 5, 20) == null);
+    try std.testing.expect(statsVr(100, 5, 20) == null);
+}
+
+test "statsVr: no scroll (scroll=0) maps identity" {
+    try std.testing.expectEqual(@as(?u16, 0), statsVr(0, 0, 10));
+    try std.testing.expectEqual(@as(?u16, 9), statsVr(9, 0, 10));
+    try std.testing.expect(statsVr(10, 0, 10) == null);
+}
+
+// ---------------------------------------------------------------------------
+// handleStatsKey: scroll navigation
+// ---------------------------------------------------------------------------
+
+test "handleStatsKey: j increments scroll" {
+    var state = TuiState{};
+    state.stats_scroll = 5;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = 'j', .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 6), state.stats_scroll);
+}
+
+test "handleStatsKey: k decrements scroll" {
+    var state = TuiState{};
+    state.stats_scroll = 5;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = 'k', .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 4), state.stats_scroll);
+}
+
+test "handleStatsKey: k at zero saturates to 0" {
+    var state = TuiState{};
+    state.stats_scroll = 0;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = 'k', .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 0), state.stats_scroll);
+}
+
+test "handleStatsKey: page_down increments by 20" {
+    var state = TuiState{};
+    state.stats_scroll = 3;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = vaxis.Key.page_down, .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 23), state.stats_scroll);
+}
+
+test "handleStatsKey: page_up decrements by 20, saturates at 0" {
+    var state = TuiState{};
+    state.stats_scroll = 10;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = vaxis.Key.page_up, .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 0), state.stats_scroll);
+}
+
+test "handleStatsKey: down arrow increments scroll" {
+    var state = TuiState{};
+    state.stats_scroll = 0;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = vaxis.Key.down, .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 1), state.stats_scroll);
+}
+
+test "handleStatsKey: up arrow at zero saturates" {
+    var state = TuiState{};
+    state.stats_scroll = 0;
+    handleStatsKey(&state, vaxis.Key{ .codepoint = vaxis.Key.up, .mods = .{} });
+    try std.testing.expectEqual(@as(u16, 0), state.stats_scroll);
 }

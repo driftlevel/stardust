@@ -359,6 +359,7 @@ const DeclineRecord = struct {
 /// Atomic counters for DHCP message types. Incremented from the main loop;
 /// read by the metrics/SSH threads. Counters reset to zero at server start.
 pub const Counters = struct {
+    // DHCP message counters
     discover: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     offer: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     request: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -367,6 +368,12 @@ pub const Counters = struct {
     release: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     decline: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inform: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Defense / security event counters
+    probe_conflict: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_ip_quarantined: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_mac_blocked: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_global_limited: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_refused: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const DHCPServer = struct {
@@ -924,6 +931,7 @@ pub const DHCPServer = struct {
                 std.log.warn("Refusing allocation to {s}: in decline cooldown for {d}s", .{
                     mac_str, rec.cooldown_until - std.time.timestamp(),
                 });
+                _ = self.counters.decline_refused.fetchAdd(1, .monotonic);
                 return null;
             }
         }
@@ -1065,6 +1073,7 @@ pub const DHCPServer = struct {
             .expires = std.time.timestamp() + probe_mod.probe_quarantine_secs,
             .client_id = null,
         }) catch {};
+        _ = self.counters.probe_conflict.fetchAdd(1, .monotonic);
         std.log.warn("Probe conflict: {s} is already in use, quarantining for {d}s", .{
             ip_str, probe_mod.probe_quarantine_secs,
         });
@@ -1662,6 +1671,7 @@ pub const DHCPServer = struct {
                 std.log.warn("DHCPDECLINE: global rate limit reached ({d} in {d}s), ignoring from {s}", .{
                     global_decline_limit, global_decline_window_secs, mac_str,
                 });
+                _ = self.counters.decline_global_limited.fetchAdd(1, .monotonic);
                 return;
             }
             self.global_decline_count += 1;
@@ -1689,6 +1699,7 @@ pub const DHCPServer = struct {
             std.log.warn("Failed to quarantine declined IP {s}: {s}", .{ ip_str, @errorName(err) });
             return;
         };
+        _ = self.counters.decline_ip_quarantined.fetchAdd(1, .monotonic);
         log_v.debug("DHCPDECLINE {s} from {s} (quarantined {d}s)", .{ ip_str, mac_str, quarantine_secs });
 
         // Track declines per MAC. After decline_threshold declines within
@@ -1708,6 +1719,7 @@ pub const DHCPServer = struct {
         if (rec.count >= decline_threshold) {
             rec.cooldown_until = now + decline_cooldown_secs;
             rec.count = 0;
+            _ = self.counters.decline_mac_blocked.fetchAdd(1, .monotonic);
             std.log.warn("DHCPDECLINE: rate-limiting {s} for {d}s after {d} declines in {d}s", .{
                 mac_str, decline_cooldown_secs, decline_threshold, decline_window_secs,
             });

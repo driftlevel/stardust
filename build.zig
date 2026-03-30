@@ -68,7 +68,9 @@ pub fn build(b: *std.Build) void {
     unit_tests.linkSystemLibrary("ssh");
     unit_tests.linkLibC();
     if (b.option([]const u8, "test_filter", "Filter tests by name")) |f| {
-        unit_tests.filters = &.{f};
+        // Allocate on the build arena so the slice outlives the build() function frame.
+        const filter_slice = b.allocator.dupe([]const u8, &.{f}) catch @panic("OOM");
+        unit_tests.filters = filter_slice;
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
