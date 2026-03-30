@@ -20,80 +20,40 @@ jobs:
         with:
           version: "0.15.2"
 
-      # Install libssh-dev on the host for the C headers used by @cImport.
-      # Headers are architecture-independent; the actual .a files for each
-      # musl target come from Alpine packages fetched in the next step.
-      - name: Install libssh headers
-        run: sudo apt-get install -y libssh-dev
+      # Install Nix to build deterministic musl-linked libssh bundles for each
+      # target architecture.  Binary caches at cache.nixos.org supply pre-built
+      # derivations so no source compilation is needed in most cases.
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-      # Pull libssh-static (and its transitive deps: openssl-libs-static,
-      # zlib-static) from Alpine's package CDN for each target architecture.
-      # Alpine uses musl, so these .a files are correct for musl cross-builds.
-      #
-      # apk fetch --arch downloads APKs for a foreign arch without executing
-      # any foreign code — no QEMU required.  A small Python script extracts
-      # the data tar stream from each APK (Alpine APKs are three concatenated
-      # gzip streams: [signature][control][data]).
-      - name: Fetch libssh static libraries for all target arches
+      # Build static libssh bundles for all three target architectures.
+      # --print-out-paths prints the Nix store path; we capture it for later steps.
+      - name: Build libssh static bundles
         run: |
-          mkdir -p libssh-sysroot/{x86_64,aarch64,riscv64}
-
-          docker run --rm -v "$(pwd)/libssh-sysroot:/out" alpine:3 sh -c '
-            set -e
-
-            # Repositories are already configured in the container.
-            # Copy them into each target sysroot so apk can resolve packages.
-            for arch in x86_64 aarch64 riscv64; do
-              mkdir -p /sysroots/$arch/etc/apk
-              cp /etc/apk/repositories /sysroots/$arch/etc/apk/repositories
-            done
-
-            apk add --no-cache python3
-
-            extract_apk_libs() {
-              ARCH=$1
-              DEST=/out/$ARCH
-              SYSROOT=/sysroots/$ARCH
-
-              # Install static packages into a per-arch sysroot (no scripts run).
-              apk add \
-                --arch "$ARCH" \
-                --root "$SYSROOT" \
-                --initdb \
-                --no-scripts \
-                --no-cache \
-                --allow-untrusted \
-                libssh-static openssl-libs-static zlib-static
-
-              # Copy all .a files out for use by the Zig cross-linker.
-              find "$SYSROOT/usr/lib" -maxdepth 1 -name "*.a" \
-                -exec cp {} "$DEST/" \;
-            }
-
-            extract_apk_libs x86_64
-            extract_apk_libs aarch64
-            extract_apk_libs riscv64
-          '
+          echo "LIBSSH_X86=$(nix build .#libssh-x86_64-musl  --no-link --print-out-paths)" >> "$GITHUB_ENV"
+          echo "LIBSSH_ARM=$(nix build .#libssh-aarch64-musl --no-link --print-out-paths)" >> "$GITHUB_ENV"
+          echo "LIBSSH_RISCV=$(nix build .#libssh-riscv64-musl --no-link --print-out-paths)" >> "$GITHUB_ENV"
 
       # Cross-compile static musl binaries for each target platform.
-      # This avoids QEMU emulation entirely — the final image stages only
-      # COPY the pre-built binaries; no instructions execute under emulation.
+      # -Dlibssh_dir points to the Nix bundle with lib/ and include/ subdirs.
       - name: Build x86_64 binary
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl \
-            -Dlibssh_lib_dir=./libssh-sysroot/x86_64
+            -Dlibssh_dir="${{ env.LIBSSH_X86 }}"
           cp zig-out/bin/stardust stardust-amd64
 
       - name: Build arm64 binary
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl \
-            -Dlibssh_lib_dir=./libssh-sysroot/aarch64
+            -Dlibssh_dir="${{ env.LIBSSH_ARM }}"
           cp zig-out/bin/stardust stardust-arm64
 
       - name: Build riscv64 binary
         run: |
           zig build -Doptimize=ReleaseSafe -Dtarget=riscv64-linux-musl \
-            -Dlibssh_lib_dir=./libssh-sysroot/riscv64
+            -Dlibssh_dir="${{ env.LIBSSH_RISCV }}"
           cp zig-out/bin/stardust stardust-riscv64
 
       - uses: docker/setup-buildx-action@v3

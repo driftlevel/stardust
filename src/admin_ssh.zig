@@ -456,6 +456,8 @@ const ReservationForm = struct {
     /// Inline error message (empty = no error).
     err_buf: [80]u8 = [_]u8{0} ** 80,
     err_len: usize = 0,
+    /// True immediately after a successful save; cleared on the next keypress.
+    saved: bool = false,
 
     fn isNew(self: *const ReservationForm) bool {
         return self.orig_mac_len == 0;
@@ -1650,12 +1652,16 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
         }
     }
 
-    _ = win.print(&.{.{ .text = "  Tab/Shift-Tab: next/prev  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 3, .wrap = .none });
+    _ = win.print(&.{.{ .text = "  Tab/Shift-Tab: next/prev  Enter: save  Esc: close", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 3, .wrap = .none });
 
     if (state.form.err_len > 0) {
         _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+    } else if (state.form.saved) {
+        const saved_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 220, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+        _ = win.print(&.{.{ .text = "  Saved!", .style = saved_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+    } else {
+        _ = win.print(&.{.{ .text = "  (hostname optional)", .style = ro_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
     }
-    _ = win.print(&.{.{ .text = "  (hostname optional)", .style = ro_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
 }
 
 /// Save the form: update StateStore + config.yaml. Returns an error message on failure.
@@ -1699,7 +1705,8 @@ fn saveReservation(server: *AdminServer, form: *const ReservationForm) ?[]const 
 
 fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
     var form = &state.form;
-    form.err_len = 0; // clear error on any keypress
+    form.err_len = 0; // clear error/saved on any keypress
+    form.saved = false;
 
     if (key.matches(vaxis.Key.escape, .{})) {
         state.mode = .normal;
@@ -1721,7 +1728,7 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
             @memcpy(form.err_buf[0..form.err_len], err_msg[0..form.err_len]);
             return;
         }
-        state.mode = .normal;
+        form.saved = true;
         return;
     }
 

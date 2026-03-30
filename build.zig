@@ -18,14 +18,14 @@ pub fn build(b: *std.Build) void {
     });
     const vaxis_mod = vaxis_dep.module("vaxis");
 
-    // Optional: path to a directory containing libssh.a (and its static deps)
-    // for cross-compilation targets where pkg-config cannot find the right library.
-    // Example: -Dlibssh_lib_dir=./libssh-sysroot/aarch64
+    // Optional: path to a Nix-built (or manually assembled) bundle directory
+    // containing lib/{libssh,libssl,libcrypto,libz}.a and include/libssh/*.h.
+    // Example: -Dlibssh_dir=$(nix build .#libssh-aarch64-musl --no-link --print-out-paths)
     // When omitted, falls back to pkg-config / system library paths.
-    const libssh_lib_dir = b.option(
+    const libssh_dir = b.option(
         []const u8,
-        "libssh_lib_dir",
-        "Directory containing libssh.a for cross-compilation (bypasses pkg-config)",
+        "libssh_dir",
+        "Bundle directory with lib/ and include/ for libssh cross-compilation (bypasses pkg-config)",
     );
 
     const main_mod = b.createModule(.{
@@ -42,11 +42,9 @@ pub fn build(b: *std.Build) void {
         .root_module = main_mod,
     });
     // Prefer static libssh for the production binary (scratch Docker image has no .so).
-    // Falls back to dynamic if libssh.a is not found on the host.
-    // On Arch: no libssh.a by default — build from source or use AUR.
-    // On Alpine: apk add libssh-static provides libssh.a (used in CI).
-    // On Ubuntu/Debian: libssh-dev includes libssh.a.
-    linkLibssh(exe, libssh_lib_dir);
+    // Cross-compilation uses -Dlibssh_dir pointing to a Nix-built bundle.
+    // Native dev builds fall back to pkg-config (libssh-dev on Ubuntu/Debian).
+    linkLibssh(b, exe, libssh_dir);
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
@@ -65,7 +63,7 @@ pub fn build(b: *std.Build) void {
         .name = "stardust-dev",
         .root_module = dev_mod,
     });
-    linkLibssh(dev_exe, libssh_lib_dir);
+    linkLibssh(b, dev_exe, libssh_dir);
     const dev_step = b.step("dev", "Run with debug optimizations");
     dev_step.dependOn(&b.addRunArtifact(dev_exe).step);
 
@@ -73,7 +71,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = main_mod,
     });
-    linkLibssh(unit_tests, libssh_lib_dir);
+    linkLibssh(b, unit_tests, libssh_dir);
     if (b.option([]const u8, "test_filter", "Filter tests by name")) |f| {
         // Allocate on the build arena so the slice outlives the build() function frame.
         const filter_slice = b.allocator.dupe([]const u8, &.{f}) catch @panic("OOM");
@@ -87,27 +85,26 @@ pub fn build(b: *std.Build) void {
         .name = "check",
         .root_module = main_mod,
     });
-    linkLibssh(check_exe, libssh_lib_dir);
+    linkLibssh(b, check_exe, libssh_dir);
     const check_step = b.step("check", "Type-check the codebase");
     check_step.dependOn(&check_exe.step);
 }
 
 /// Link libssh and its static dependencies.
 ///
-/// When `lib_dir` is provided (cross-compilation path), we add an explicit
-/// library search path and bypass pkg-config — pkg-config on the build host
-/// can only find the host-arch glibc-linked library, which is wrong for musl
-/// cross-compilation targets.  The directory must contain libssh.a and the
-/// transitive static deps (libssl.a, libcrypto.a, libz.a) extracted from
-/// Alpine's libssh-static package for the target architecture.
+/// When `dir` is provided it points to a Nix-built bundle with layout:
+///   <dir>/lib/   — libssh.a, libssl.a, libcrypto.a, libz.a
+///   <dir>/include/ — libssh/*.h headers
+/// We add both paths explicitly and bypass pkg-config, which cannot find
+/// musl-linked libraries for foreign architectures on the build host.
 ///
-/// When `lib_dir` is null, pkg-config discovers everything automatically,
+/// When `dir` is null, pkg-config discovers everything automatically,
 /// which is correct for native builds (dev workstation, CI test runner).
-fn linkLibssh(step: *std.Build.Step.Compile, lib_dir: ?[]const u8) void {
-    if (lib_dir) |d| {
-        step.addLibraryPath(.{ .cwd_relative = d });
+fn linkLibssh(b: *std.Build, step: *std.Build.Step.Compile, dir: ?[]const u8) void {
+    if (dir) |d| {
+        step.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ d, "lib" }) });
+        step.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ d, "include" }) });
         // Bypass pkg-config; explicitly name libssh and its static deps.
-        // Alpine's libssh-static links against OpenSSL and zlib.
         inline for (.{ "ssh", "ssl", "crypto", "z" }) |lib| {
             step.linkSystemLibrary2(lib, .{
                 .preferred_link_mode = .static,
