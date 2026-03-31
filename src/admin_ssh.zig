@@ -1083,15 +1083,15 @@ fn runTui(
                 .mouse => |mouse| {
                     switch (mouse.button) {
                         .left => if (mouse.type == .press) {
-                            // Modal overlays: [X] close button click detection.
+                            // Modal overlays: [X] close + field click detection.
                             if (state.mode != .normal) {
                                 const mr: u16 = if (mouse.row >= 0) @intCast(mouse.row) else 0;
                                 const mc: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
-                                // Check if click is on the [X] button (top-right of modal).
-                                // All modals render [X] at row=modal_y, col=modal_x+BOX_W-4.
                                 const vwin = vx.window();
                                 if (isModalCloseClick(state.mode, vwin.width, vwin.height, mr, mc)) {
                                     state.mode = .normal;
+                                } else {
+                                    handleModalFieldClick(&state, vwin.width, vwin.height, mr);
                                 }
                                 break;
                             }
@@ -2025,7 +2025,7 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     // Dynamic height: 3 fixed fields + blank + [+]add + N options + saved/hints + borders
     const opt_rows: u16 = @intCast(form.option_count);
     const BOX_W: u16 = 58;
-    const BOX_H: u16 = @min(win.height -| 2, 10 + opt_rows); // min 10, grows with options
+    const BOX_H: u16 = @min(win.height -| 2, 11 + opt_rows); // border+title+blank + 3 fields + blank + [+] + N opts + saved + hints + border
     if (win.width < BOX_W or win.height < 10) return;
 
     const col: u16 = (win.width - BOX_W) / 2;
@@ -2099,7 +2099,7 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     var oi: usize = 0;
     while (oi < form.option_count) : (oi += 1) {
         const or_row = add_row + 1 + @as(u16, @intCast(oi));
-        if (or_row >= row + BOX_H - 3) break;
+        if (or_row >= row + BOX_H - 3) break; // leave room for saved + hints + border
         const o = &form.options[oi];
         const is_sel = form.active_field == @as(u8, @intCast(4 + oi));
         const os = if (is_sel) active_style else opt_style;
@@ -2950,6 +2950,59 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
 }
 
 /// Check if a click at (row, col) hits the [X] close button of the current modal.
+/// Handle mouse click on editable fields within modals.
+fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u16) void {
+    const dims = modalDims(state.mode, win_w, win_h);
+    const modal_y = dims.y;
+
+    switch (state.mode) {
+        .reservation_form => {
+            // Rows relative to modal: 3=IP, 4=MAC, 5=Hostname, 7=[+]Add, 8+=options
+            const rel = click_row -| modal_y;
+            if (rel >= 3 and rel <= 5) {
+                state.form.active_field = @intCast(rel - 3);
+                state.form.cursor = state.form.activeLen();
+            } else if (rel == 7) {
+                state.form.active_field = 3; // [+] add
+            } else if (rel >= 8 and rel < 8 + state.form.option_count) {
+                state.form.active_field = @intCast(4 + rel - 8);
+            }
+        },
+        .pool_form => {
+            // Pool form rows start at 2 inside the box, but fields are scrolled.
+            // Map click_row to the field index via the scroll offset and section headers.
+            const rel = click_row -| modal_y;
+            if (rel < 2) return; // title area
+            // Walk through rendered fields to find which one was clicked.
+            var row: u16 = 2;
+            var fi: u8 = state.pool_form.scroll_offset;
+            while (fi < PoolForm.FIELD_COUNT) : (fi += 1) {
+                if (pool_field_meta[fi].section != null) {
+                    row += 1; // blank line
+                    row += 1; // section header
+                }
+                if (row == rel) {
+                    state.pool_form.active_field = fi;
+                    state.pool_form.cursor = poolFormFieldLen(&state.pool_form, fi);
+                    return;
+                }
+                row += 1;
+            }
+        },
+        .res_option_edit => {
+            const rel = click_row -| modal_y;
+            if (rel == 3) {
+                state.form.opt_edit_field = 0;
+                state.form.opt_edit_cursor = state.form.opt_edit_code_len;
+            } else if (rel == 4) {
+                state.form.opt_edit_field = 1;
+                state.form.opt_edit_cursor = state.form.opt_edit_value_len;
+            }
+        },
+        else => {},
+    }
+}
+
 fn isModalCloseClick(mode: TuiMode, win_w: u16, win_h: u16, row: u16, col: u16) bool {
     // Compute the modal's position and width based on mode.
     const dims = modalDims(mode, win_w, win_h);
