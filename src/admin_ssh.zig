@@ -1088,7 +1088,7 @@ fn runTui(
                                 const mr: u16 = if (mouse.row >= 0) @intCast(mouse.row) else 0;
                                 const mc: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
                                 const vwin = vx.window();
-                                if (isModalCloseClick(state.mode, vwin.width, vwin.height, mr, mc)) {
+                                if (isModalCloseClick(state.mode, vwin.width, vwin.height, mr, mc, &state)) {
                                     state.mode = .normal;
                                 } else {
                                     handleModalFieldClick(&state, vwin.width, vwin.height, mr);
@@ -2952,7 +2952,7 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
 /// Check if a click at (row, col) hits the [X] close button of the current modal.
 /// Handle mouse click on editable fields within modals.
 fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u16) void {
-    const dims = modalDims(state.mode, win_w, win_h);
+    const dims = modalDims(state.mode, win_w, win_h, state);
     const modal_y = dims.y;
 
     switch (state.mode) {
@@ -3003,9 +3003,8 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
     }
 }
 
-fn isModalCloseClick(mode: TuiMode, win_w: u16, win_h: u16, row: u16, col: u16) bool {
-    // Compute the modal's position and width based on mode.
-    const dims = modalDims(mode, win_w, win_h);
+fn isModalCloseClick(mode: TuiMode, win_w: u16, win_h: u16, row: u16, col: u16, state: *const TuiState) bool {
+    const dims = modalDims(mode, win_w, win_h, state);
     const modal_y = dims.y;
     const modal_x = dims.x;
     const modal_w = dims.w;
@@ -3013,7 +3012,7 @@ fn isModalCloseClick(mode: TuiMode, win_w: u16, win_h: u16, row: u16, col: u16) 
     return (row == modal_y and col >= modal_x + modal_w -| 4 and col < modal_x + modal_w -| 1);
 }
 
-fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: u16, h: u16 } {
+fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) struct { x: u16, y: u16, w: u16, h: u16 } {
     switch (mode) {
         .pool_form => {
             const w = @max(60, @min(win_w * 4 / 5, win_w -| 4));
@@ -3027,7 +3026,8 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: 
         },
         .reservation_form => {
             const w: u16 = 58;
-            const h: u16 = @min(win_h -| 2, 20); // dynamic in renderReservationForm
+            const opt_rows: u16 = @intCast(state.form.option_count);
+            const h: u16 = @min(win_h -| 2, 11 + opt_rows);
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .delete_confirm => {
