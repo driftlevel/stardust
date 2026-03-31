@@ -1089,7 +1089,14 @@ fn runTui(
                                 const mc: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
                                 const vwin = vx.window();
                                 if (isModalCloseClick(state.mode, vwin.width, vwin.height, mr, mc, &state)) {
-                                    state.mode = .normal;
+                                    // Sub-modals return to their parent; top-level modals return to normal.
+                                    state.mode = switch (state.mode) {
+                                        .res_option_edit => .reservation_form,
+                                        .option_lookup => .res_option_edit,
+                                        .route_list, .route_edit => state.sub_modal_parent,
+                                        .option_list, .option_edit => state.sub_modal_parent,
+                                        else => .normal,
+                                    };
                                 } else {
                                     handleModalFieldClick(&state, vwin.width, vwin.height, mr);
                                 }
@@ -1182,6 +1189,9 @@ fn runTui(
                                         }
                                     }
                                 }
+                            } else if (state.tab == .settings) {
+                                // Click on settings fields — map row to editable field.
+                                handleSettingsClick(&state, term_row, state.settings_scroll);
                             }
                         },
                         .wheel_right => if (state.mode == .normal) {
@@ -1629,13 +1639,14 @@ fn drawLeaseTable(
     };
 
     // --- Data rows ---
-    const alt_bg: vaxis.Color = .{ .rgb = .{ 22, 22, 28 } };
+    const even_bg: vaxis.Color = .{ .rgb = .{ 20, 20, 30 } };
+    const odd_bg: vaxis.Color = .{ .rgb = .{ 26, 26, 36 } };
     for (0..visible) |ri| {
         const row_idx = ctx.start + @as(u16, @intCast(ri));
         if (row_idx >= rows.len) break;
         const row = rows[row_idx];
         const selected = (row_idx == ctx.row);
-        const row_bg: vaxis.Color = if (selected) ctx.active_bg else if (ri % 2 != 0) alt_bg else .default;
+        const row_bg: vaxis.Color = if (selected) ctx.active_bg else if (ri % 2 != 0) odd_bg else even_bg;
         const row_style: vaxis.Style = .{ .bg = row_bg };
 
         const row_win = win.child(.{ .x_off = 0, .y_off = @intCast(ri + 1), .width = win.width, .height = 1 });
@@ -1848,19 +1859,21 @@ fn renderStatsTab(
     win: vaxis.Window,
     fa: std.mem.Allocator,
 ) !void {
-    // Use the caller-supplied frame arena (fa) — same lifetime requirement as
-    // renderLeaseTab: grapheme slices must outlive vx.render().
     const a = fa;
+
+    // Dark background matching modals and settings tab.
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
 
     const now = std.time.timestamp();
     const leases = server.store.listLeases() catch return;
     defer server.store.allocator.free(leases);
 
-    const hdr_style: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 255, 200, 80 } } };
-    const val_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } } };
-    const bar_full: vaxis.Style = .{ .fg = .{ .rgb = .{ 64, 192, 64 } } };
-    const bar_warn: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 180, 0 } } };
-    const bar_crit: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 60, 60 } } };
+    const hdr_style: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const bg: vaxis.Color = .{ .rgb = .{ 20, 20, 30 } };
+    const val_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = bg };
+    const bar_full: vaxis.Style = .{ .fg = .{ .rgb = .{ 64, 192, 64 } }, .bg = bg };
+    const bar_warn: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 180, 0 } }, .bg = bg };
+    const bar_crit: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 60, 60 } }, .bg = bg };
 
     // Compute total content height:
     //   1 (blank) + 1 (pool header) + 3 * n_pools (label + bar + blank) +
@@ -2698,7 +2711,8 @@ fn renderPoolsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa:
     const widths = calcPoolColWidths(@intCast(win.width));
     const hdr_bg: vaxis.Color = .{ .rgb = .{ 30, 30, 50 } };
     const hdr_style: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = hdr_bg };
-    const alt_bg: vaxis.Color = .{ .rgb = .{ 22, 22, 28 } };
+    const even_bg: vaxis.Color = .{ .rgb = .{ 20, 20, 30 } };
+    const odd_bg: vaxis.Color = .{ .rgb = .{ 26, 26, 36 } };
 
     // Clamp selection.
     if (state.pool_row >= pools.len) state.pool_row = @intCast(pools.len - 1);
@@ -2797,7 +2811,7 @@ fn renderPoolsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa:
         if (row_idx >= row_data.items.len) break;
         const rd = row_data.items[row_idx];
         const selected = (row_idx == state.pool_row);
-        const row_bg: vaxis.Color = if (selected) .{ .rgb = .{ 50, 80, 140 } } else if (ri % 2 != 0) alt_bg else .default;
+        const row_bg: vaxis.Color = if (selected) .{ .rgb = .{ 50, 80, 140 } } else if (ri % 2 != 0) odd_bg else even_bg;
         const row_style: vaxis.Style = .{ .bg = row_bg };
 
         const row_win = win.child(.{ .x_off = 0, .y_off = @intCast(ri + 1), .width = win.width, .height = 1 });
@@ -3176,13 +3190,11 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             form.scroll_offset += 1;
         }
 
-        // Clamp: don't scroll past the last field + 1 blank line below it.
+        // Clamp: don't scroll past the last field + 2 blank lines below it.
         const last_field_row = field_rows[PoolForm.FIELD_COUNT - 1];
-        // Find max scroll_offset where last_field_row - scroll_row < field_h - 2
-        // (field_h - 2 leaves room for the last field + 1 blank line).
         var max_so: u8 = 0;
         for (0..PoolForm.FIELD_COUNT) |fj| {
-            if (last_field_row -| field_rows[fj] < field_h -| 2) {
+            if (last_field_row -| field_rows[fj] + 2 < field_h) {
                 max_so = @intCast(fj);
                 break;
             }
@@ -3952,6 +3964,8 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     var lines_buf: [30]Line = undefined;
     var lc: usize = 0;
 
+    lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null }; // blank line above General
+    lc += 1;
     lines_buf[lc] = .{ .label = "-- General --", .value = "", .is_section = true, .edit_idx = null };
     lc += 1;
     lines_buf[lc] = .{ .label = "Listen Address", .value = try std.fmt.allocPrint(fa, "{s}  (restart)", .{cfg.listen_address}), .is_section = false, .edit_idx = null };
@@ -4228,6 +4242,35 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             state.settings_buf_len = n;
             state.settings_cursor = n;
             state.settings_editing = true;
+        }
+    }
+}
+
+fn handleSettingsClick(state: *TuiState, term_row: u16, scroll: u16) void {
+    // The settings lines are rendered with row offset = line_index - scroll.
+    // The body starts at row 1 (below header). So the clicked line index is
+    // term_row - 1 + scroll.
+    if (term_row < 1) return;
+    const line_idx = (term_row - 1) + scroll;
+    // We need to map line_idx to an editable field. The line layout matches
+    // renderSettingsTab. Rather than rebuilding the full lines array, use the
+    // known fixed positions. After the blank line at 0:
+    // 1: --General--, 2: Listen, 3: State Dir, 4: Log Level(0), 5: Random(5),
+    // 6: blank, 7: --SSH--, 8-11: SSH fields,
+    // 12: blank, 13: --Metrics--, 14: Collect(1), 15: HTTP Enable(2), 16: Port(3), 17: Bind(4)
+    const field_map = [_]struct { line: u16, edit: u8 }{
+        .{ .line = 4, .edit = 0 }, // log level
+        .{ .line = 5, .edit = 5 }, // random alloc
+        .{ .line = 14, .edit = 1 }, // collect
+        .{ .line = 15, .edit = 2 }, // http enable
+        .{ .line = 16, .edit = 3 }, // http port
+        .{ .line = 17, .edit = 4 }, // http bind
+    };
+    for (field_map) |fm| {
+        if (line_idx == fm.line) {
+            state.settings_row = fm.edit;
+            state.settings_needs_scroll = true;
+            return;
         }
     }
 }
