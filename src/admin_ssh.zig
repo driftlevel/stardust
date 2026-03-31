@@ -1351,10 +1351,6 @@ fn renderHeader(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
         .settings => "",
     };
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
-    // Right-aligned global shortcuts.
-    const global_hint = "?:help  q:quit ";
-    const rhs_col: u16 = if (win.width > global_hint.len) win.width - @as(u16, @intCast(global_hint.len)) else 0;
-    _ = win.print(&.{.{ .text = global_hint, .style = hint_style }}, .{ .col_offset = rhs_col, .wrap = .none });
 }
 
 fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
@@ -1456,6 +1452,11 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
             _ = win.print(&.{.{ .text = peer_str, .style = style }}, .{ .col_offset = col, .wrap = .none });
         }
     }
+
+    // Right-aligned global shortcuts.
+    const global_hint = "?:help  q:quit ";
+    const rhs_col: u16 = if (win.width > global_hint.len) win.width - @as(u16, @intCast(global_hint.len)) else 0;
+    _ = win.print(&.{.{ .text = global_hint, .style = style }}, .{ .col_offset = rhs_col, .wrap = .none });
 }
 
 // ---------------------------------------------------------------------------
