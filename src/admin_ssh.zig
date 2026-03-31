@@ -668,6 +668,7 @@ const TuiState = struct {
     settings_pending_port_len: usize = 0,
     settings_pending_bind_buf: [64]u8 = [_]u8{0} ** 64,
     settings_pending_bind_len: usize = 0,
+    settings_pending_random_alloc: bool = false,
     // Route/option list sub-modals.
     sub_list_row: u16 = 0,
     sub_edit_field: u8 = 0, // 0=first column, 1=second column
@@ -3714,7 +3715,7 @@ fn handlePoolDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis
 // Settings tab
 // ---------------------------------------------------------------------------
 
-const SETTINGS_EDITABLE_COUNT: u8 = 5;
+const SETTINGS_EDITABLE_COUNT: u8 = 6;
 
 fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const cfg = server.cfg;
@@ -3740,6 +3741,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         if (state.settings_dirty[2]) (if (state.settings_pending_http_enable) "true" else "false") else (if (cfg.metrics.http_enable) "true" else "false"),
         if (state.settings_editing and state.settings_row == 3) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[3]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
         if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[4]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
+        if (state.settings_dirty[5]) (if (state.settings_pending_random_alloc) "true" else "false") else (if (cfg.pool_allocation_random) "true" else "false"),
     };
 
     const LABEL_W: u16 = 20;
@@ -3757,7 +3759,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     lc += 1;
     lines_buf[lc] = .{ .label = "Log Level", .value = edit_vals[0], .is_section = false, .edit_idx = 0 };
     lc += 1;
-    lines_buf[lc] = .{ .label = "Random Alloc", .value = if (cfg.pool_allocation_random) "true" else "false", .is_section = false, .edit_idx = null };
+    lines_buf[lc] = .{ .label = "Random IP Allocation", .value = edit_vals[5], .is_section = false, .edit_idx = 5 };
     lc += 1;
     lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
     lc += 1;
@@ -3856,7 +3858,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         if (is_selected and !is_editing_this) {
             const hint = switch (line.edit_idx.?) {
                 0 => "  \xe2\x86\x90/\xe2\x86\x92 or Space: cycle",
-                1, 2 => "  Space: toggle",
+                1, 2, 5 => "  Space: toggle",
                 3, 4 => "  Enter: edit",
                 else => "",
             };
@@ -3965,6 +3967,11 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                 state.settings_pending_http_enable = !cur;
                 state.settings_dirty[2] = true;
             },
+            5 => {
+                const cur = if (state.settings_dirty[5]) state.settings_pending_random_alloc else cfg.pool_allocation_random;
+                state.settings_pending_random_alloc = !cur;
+                state.settings_dirty[5] = true;
+            },
             else => {},
         }
     } else if (key.matches(vaxis.Key.enter, .{})) {
@@ -4013,6 +4020,7 @@ fn settingsApplyAndReload(server: *AdminServer, state: *TuiState) void {
     if (state.settings_dirty[4]) {
         replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), state.settings_pending_bind_buf[0..state.settings_pending_bind_len]);
     }
+    if (state.settings_dirty[5]) cfg.pool_allocation_random = state.settings_pending_random_alloc;
     // Clear dirty flags.
     state.settings_dirty = [_]bool{false} ** SETTINGS_EDITABLE_COUNT;
     // Save and reload.
