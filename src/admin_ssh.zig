@@ -3807,6 +3807,24 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         }
     }
 
+    // Auto-scroll to keep the selected editable field visible (plus one line past).
+    if (!read_only) {
+        for (lines_buf[0..lc], 0..) |line, li| {
+            if (line.edit_idx != null and line.edit_idx.? == state.settings_row) {
+                const vr = @as(u16, @intCast(li));
+                // If above viewport, scroll up to show it with one line margin.
+                if (vr < state.settings_scroll +| 1) {
+                    state.settings_scroll = vr -| 1;
+                }
+                // If below viewport, scroll down to show it with one line margin.
+                if (vr + 2 > state.settings_scroll + win.height) {
+                    state.settings_scroll = vr + 2 -| win.height;
+                }
+                break;
+            }
+        }
+    }
+
     // Clamp scroll so we can't scroll past the last line.
     const max_scroll: u16 = if (lc > win.height) @intCast(lc - win.height) else 0;
     if (state.settings_scroll > max_scroll) state.settings_scroll = max_scroll;
