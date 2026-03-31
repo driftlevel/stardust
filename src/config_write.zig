@@ -78,6 +78,23 @@ pub fn renderConfig(w: anytype, cfg: *const config_mod.Config) !void {
         try w.writeAll("\n");
     }
 
+    // mac_classes section (only if any are defined)
+    if (cfg.mac_classes.len > 0) {
+        try w.writeAll("mac_classes:\n");
+        for (cfg.mac_classes) |mc| {
+            try w.print("  - name: {s}\n", .{mc.name});
+            try w.print("    match: \"{s}\"\n", .{mc.match});
+            if (mc.dhcp_options.count() > 0) {
+                try w.writeAll("    dhcp_options:\n");
+                var it = mc.dhcp_options.iterator();
+                while (it.next()) |entry| {
+                    try w.print("      {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+                }
+            }
+        }
+        try w.writeAll("\n");
+    }
+
     // pools section
     try w.writeAll("pools:\n");
     for (cfg.pools) |pool| {
@@ -193,6 +210,15 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
             }
             if (r.client_id) |c| {
                 try w.print("        client_id: {s}\n", .{c});
+            }
+            if (r.dhcp_options) |opts| {
+                if (opts.count() > 0) {
+                    try w.writeAll("        dhcp_options:\n");
+                    var oit = opts.iterator();
+                    while (oit.next()) |entry| {
+                        try w.print("          {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+                    }
+                }
             }
         }
     }

@@ -42,6 +42,26 @@ pub const Reservation = struct {
     ip: []const u8,
     hostname: ?[]const u8,
     client_id: ?[]const u8,
+    dhcp_options: ?std.StringHashMap([]const u8) = null,
+};
+
+/// MAC class rule: matches client MACs by prefix pattern and overrides DHCP options.
+/// Applied after pool defaults, before per-reservation overrides.
+pub const MacClass = struct {
+    name: []const u8,
+    match: []const u8, // MAC prefix, e.g. "64:16:7f" or "aa:bb:cc:dd:*"
+    dhcp_options: std.StringHashMap([]const u8),
+
+    pub fn deinit(self: *MacClass, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.match);
+        var it = self.dhcp_options.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.dhcp_options.deinit();
+    }
 };
 
 pub const StaticRoute = struct {
@@ -108,11 +128,19 @@ pub const PoolConfig = struct {
             allocator.free(entry.value_ptr.*);
         }
         self.dhcp_options.deinit();
-        for (self.reservations) |r| {
+        for (self.reservations) |*r| {
             allocator.free(r.mac);
             allocator.free(r.ip);
             if (r.hostname) |h| allocator.free(h);
             if (r.client_id) |c| allocator.free(c);
+            if (r.dhcp_options) |*opts| {
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                opts.deinit();
+            }
         }
         allocator.free(self.reservations);
         allocator.free(self.static_routes);
@@ -131,6 +159,7 @@ pub const Config = struct {
     log_level: LogLevel,
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
     sync: ?SyncConfig,
+    mac_classes: []MacClass = &.{},
     pools: []PoolConfig, // at least one required
     admin_ssh: AdminSSHConfig,
     metrics: MetricsConfig,
@@ -138,6 +167,8 @@ pub const Config = struct {
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.listen_address);
         self.allocator.free(self.state_dir);
+        for (self.mac_classes) |*mc| mc.deinit(self.allocator);
+        self.allocator.free(self.mac_classes);
         for (self.pools) |*pool| pool.deinit(self.allocator);
         self.allocator.free(self.pools);
         if (self.sync) |*s| {
@@ -191,6 +222,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .log_level = parseLogLevel(raw.log_level orelse "info"),
         .pool_allocation_random = false,
         .sync = null,
+        .mac_classes = try allocator.alloc(MacClass, 0),
         .pools = try allocator.alloc(PoolConfig, 0),
         .admin_ssh = .{
             .enable = false,
@@ -220,6 +252,12 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             if (root_map.get("sync")) |sync_val| {
                 if (sync_val.asMap()) |sync_map| {
                     cfg.sync = try parseSyncConfig(allocator, sync_map);
+                }
+            }
+
+            if (root_map.get("mac_classes")) |mc_val| {
+                if (mc_val.asList()) |mc_list| {
+                    cfg.mac_classes = try parseMacClasses(allocator, mc_list);
                 }
             }
 
@@ -618,11 +656,28 @@ fn parseReservations(allocator: std.mem.Allocator, pool: *PoolConfig, list: anyt
         const client_id_owned: ?[]const u8 = if (client_id_str) |c| try allocator.dupe(u8, c) else null;
         errdefer if (client_id_owned) |c| allocator.free(c);
 
+        // Parse optional per-reservation dhcp_options.
+        var res_opts: ?std.StringHashMap([]const u8) = null;
+        if (m.get("dhcp_options")) |opts_val| {
+            if (opts_val.asMap()) |opts_map| {
+                res_opts = std.StringHashMap([]const u8).init(allocator);
+                var oit = opts_map.iterator();
+                while (oit.next()) |entry| {
+                    const ok = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(ok);
+                    const ov = try allocator.dupe(u8, entry.value_ptr.asScalar() orelse "");
+                    errdefer allocator.free(ov);
+                    try res_opts.?.put(ok, ov);
+                }
+            }
+        }
+
         pool.reservations[idx] = .{
             .mac = mac_owned,
             .ip = ip_owned,
             .hostname = hostname_owned,
             .client_id = client_id_owned,
+            .dhcp_options = res_opts,
         };
         idx += 1;
     }
@@ -778,6 +833,42 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
         .multicast = multicast,
         .peers = peers,
     };
+}
+
+fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
+    var classes = try allocator.alloc(MacClass, list.len);
+    var idx: usize = 0;
+    for (list) |item| {
+        const m = item.asMap() orelse continue;
+        const name_str = if (m.get("name")) |v| (v.asScalar() orelse "") else "";
+        const match_str = if (m.get("match")) |v| (v.asScalar() orelse "") else "";
+        if (match_str.len == 0) {
+            std.log.warn("config: mac_class missing 'match', skipping", .{});
+            continue;
+        }
+
+        var opts = std.StringHashMap([]const u8).init(allocator);
+        if (m.get("dhcp_options")) |opts_val| {
+            if (opts_val.asMap()) |opts_map| {
+                var oit = opts_map.iterator();
+                while (oit.next()) |entry| {
+                    const k = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(k);
+                    const v = try allocator.dupe(u8, entry.value_ptr.asScalar() orelse "");
+                    errdefer allocator.free(v);
+                    try opts.put(k, v);
+                }
+            }
+        }
+
+        classes[idx] = .{
+            .name = try allocator.dupe(u8, name_str),
+            .match = try allocator.dupe(u8, match_str),
+            .dhcp_options = opts,
+        };
+        idx += 1;
+    }
+    return allocator.realloc(classes, idx) catch classes[0..idx];
 }
 
 /// Compute a SHA-256 pool hash over all pools' subnets, addresses, reservations,

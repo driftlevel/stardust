@@ -180,6 +180,116 @@ fn resolveDestination(request: []const u8) std.posix.sockaddr.in {
 
 /// Encode an option value string into DHCP wire bytes in dst.
 /// Tries comma-separated IPv4 addresses first; falls back to raw string bytes.
+/// Check if a MAC address matches a MAC class pattern.
+/// Pattern is a prefix — trailing `:*` or `*` is stripped, then the MAC
+/// is compared case-insensitively against the prefix.
+fn matchMacClass(mac: []const u8, pattern: []const u8) bool {
+    // Strip trailing wildcards.
+    var pat = pattern;
+    while (pat.len > 0 and (pat[pat.len - 1] == '*' or pat[pat.len - 1] == ':')) {
+        pat = pat[0 .. pat.len - 1];
+    }
+    if (pat.len == 0) return true; // "*" matches everything
+    if (mac.len < pat.len) return false;
+    // Prefix match, case-insensitive.
+    for (pat, 0..) |pc, i| {
+        const mc = mac[i];
+        if (toLowerAscii(pc) != toLowerAscii(mc)) return false;
+    }
+    // Ensure we matched at an octet boundary (followed by ':' or end of string).
+    if (pat.len == mac.len) return true;
+    return mac[pat.len] == ':';
+}
+
+fn toLowerAscii(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+/// Collect merged DHCP option overrides from all layers:
+///   1. pool.dhcp_options (lowest priority)
+///   2. Matching mac_classes (least-specific match first, then more specific)
+///   3. Per-reservation dhcp_options (highest priority)
+/// Returns a map allocated on `allocator` (caller frees). Values point into
+/// config-owned strings (no duplication needed).
+fn collectOverrides(
+    allocator: std.mem.Allocator,
+    pool: *const config_mod.PoolConfig,
+    mac: []const u8,
+    reservation: ?*const config_mod.Reservation,
+    mac_classes: []const config_mod.MacClass,
+) std.StringHashMap([]const u8) {
+    var overrides = std.StringHashMap([]const u8).init(allocator);
+
+    // Layer 1: pool custom options.
+    var pool_it = pool.dhcp_options.iterator();
+    while (pool_it.next()) |entry| {
+        overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+    }
+
+    // Layer 2: MAC class matches, sorted by specificity (shortest match first).
+    // Collect matching classes with their pattern length, sort, then apply.
+    var matches: [64]struct { idx: usize, specificity: usize } = undefined;
+    var match_count: usize = 0;
+    for (mac_classes, 0..) |*mc, i| {
+        if (matchMacClass(mac, mc.match)) {
+            if (match_count < matches.len) {
+                // Specificity = length of pattern after stripping wildcards.
+                var pat = mc.match;
+                while (pat.len > 0 and (pat[pat.len - 1] == '*' or pat[pat.len - 1] == ':')) {
+                    pat = pat[0 .. pat.len - 1];
+                }
+                matches[match_count] = .{ .idx = i, .specificity = pat.len };
+                match_count += 1;
+            }
+        }
+    }
+    // Sort by specificity ascending (least specific first → most specific last wins).
+    if (match_count > 1) {
+        for (1..match_count) |i| {
+            const key = matches[i];
+            var j = i;
+            while (j > 0 and matches[j - 1].specificity > key.specificity) {
+                matches[j] = matches[j - 1];
+                j -= 1;
+            }
+            matches[j] = key;
+        }
+    }
+    for (matches[0..match_count]) |m| {
+        var mc_it = mac_classes[m.idx].dhcp_options.iterator();
+        while (mc_it.next()) |entry| {
+            overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+        }
+    }
+
+    // Layer 3: per-reservation options (highest priority).
+    if (reservation) |res| {
+        if (res.dhcp_options) |res_opts| {
+            var res_it = res_opts.iterator();
+            while (res_it.next()) |entry| {
+                overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
+    }
+
+    return overrides;
+}
+
+/// Check if an option code (as integer) is present in the override map.
+fn isOverridden(overrides: *const std.StringHashMap([]const u8), code: u8) bool {
+    var buf: [3]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{d}", .{code}) catch return false;
+    return overrides.contains(key);
+}
+
+/// Find a config Reservation by MAC in a pool's reservation list.
+fn findConfigReservation(pool: *const config_mod.PoolConfig, mac: []const u8) ?*const config_mod.Reservation {
+    for (pool.reservations) |*r| {
+        if (std.mem.eql(u8, r.mac, mac)) return r;
+    }
+    return null;
+}
+
 fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     var len: usize = 0;
     var all_valid = true;
@@ -1162,6 +1272,26 @@ pub const DHCPServer = struct {
         logRelayAgentInfo(request);
 
         const prl = getOption(request, .ParameterRequestList);
+
+        // Build MAC string for override matching.
+        var mac_str_for_ov: [17]u8 = undefined;
+        _ = std.fmt.bufPrint(&mac_str_for_ov, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch {};
+
+        // Look up per-MAC reservation for option overrides.
+        const reservation = findConfigReservation(pool, &mac_str_for_ov);
+
+        // Collect merged overrides: pool.dhcp_options → mac_classes → reservation.
+        var overrides = collectOverrides(
+            self.allocator,
+            pool,
+            &mac_str_for_ov,
+            reservation,
+            self.cfg.mac_classes,
+        );
+        defer overrides.deinit();
+
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
         const router_ip = try config_mod.parseIpv4(pool.router);
@@ -1312,8 +1442,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = pool.dhcp_options.iterator();
+        // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
+        var opts_it = overrides.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1473,6 +1603,17 @@ pub const DHCPServer = struct {
 
         const prl = getOption(request, .ParameterRequestList);
 
+        // Collect merged overrides: pool.dhcp_options → mac_classes → reservation.
+        const config_res = findConfigReservation(pool, mac_str);
+        var overrides = collectOverrides(
+            self.allocator,
+            pool,
+            mac_str,
+            config_res,
+            self.cfg.mac_classes,
+        );
+        defer overrides.deinit();
+
         // Build options
         var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
@@ -1627,8 +1768,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = pool.dhcp_options.iterator();
+        // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
+        var opts_it = overrides.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1915,6 +2056,16 @@ pub const DHCPServer = struct {
 
         const prl = getOption(request, .ParameterRequestList);
 
+        // Build MAC string for override matching.
+        const mac_bytes = req_header.chaddr[0..6];
+        var mac_str_buf_inf: [17]u8 = undefined;
+        const mac_str_inf = std.fmt.bufPrint(&mac_str_buf_inf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch "";
+        const config_res_inf = findConfigReservation(pool, mac_str_inf);
+        var overrides = collectOverrides(self.allocator, pool, mac_str_inf, config_res_inf, self.cfg.mac_classes);
+        defer overrides.deinit();
+
         var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
 
@@ -2037,8 +2188,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = pool.dhcp_options.iterator();
+        // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
+        var opts_it = overrides.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -4275,4 +4426,37 @@ test "UEFI HTTP boot: http_boot_url empty => normal TFTP options even with HTTPC
     const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
     try std.testing.expect(opt67 != null);
     try std.testing.expectEqualStrings("pxelinux.0", opt67.?);
+}
+
+// ---------------------------------------------------------------------------
+// MAC class matching tests
+// ---------------------------------------------------------------------------
+
+test "matchMacClass: OUI prefix match" {
+    try std.testing.expect(matchMacClass("64:16:7f:aa:bb:cc", "64:16:7f"));
+}
+
+test "matchMacClass: OUI prefix with trailing wildcard" {
+    try std.testing.expect(matchMacClass("64:16:7f:aa:bb:cc", "64:16:7f:*"));
+}
+
+test "matchMacClass: exact MAC match" {
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:ff"));
+}
+
+test "matchMacClass: no match" {
+    try std.testing.expect(!matchMacClass("64:16:7f:aa:bb:cc", "00:25:90"));
+}
+
+test "matchMacClass: case insensitive" {
+    try std.testing.expect(matchMacClass("AA:BB:CC:dd:ee:ff", "aa:bb:cc"));
+}
+
+test "matchMacClass: wildcard-only matches everything" {
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "*"));
+}
+
+test "matchMacClass: two-octet prefix" {
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "aa:bb"));
+    try std.testing.expect(!matchMacClass("aa:bc:cc:dd:ee:ff", "aa:bb"));
 }
