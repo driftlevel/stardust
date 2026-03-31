@@ -2799,10 +2799,8 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     for (fields, 0..) |meta, fi| {
         if (read_only and meta.sensitive) continue;
         if (meta.section) |sec| {
-            if (lcount > 0) { // blank line before section (except first)
-                lines[lcount] = .{ .text = "", .style = val_style };
-                lcount += 1;
-            }
+            lines[lcount] = .{ .text = "", .style = val_style };
+            lcount += 1;
             lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "", .style = section_style };
             lcount += 1;
         }
@@ -2985,7 +2983,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         var r: u16 = 0;
         for (0..PoolForm.FIELD_COUNT) |fi| {
             if (pool_field_meta[fi].section != null) {
-                if (fi > 0) r += 1; // blank line before section (except first)
+                r += 1; // blank line before section
                 r += 1; // section header itself
             }
             field_rows[fi] = r;
@@ -3010,7 +3008,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             var found = false;
             while (fi < PoolForm.FIELD_COUNT and vis_rows < field_h) : (fi += 1) {
                 if (pool_field_meta[fi].section != null) {
-                    if (fi > 0) vis_rows += 1; // blank line
+                    vis_rows += 1; // blank line before section
                     vis_rows += 1; // header
                 }
                 if (vis_rows >= field_h) break;
@@ -3025,25 +3023,17 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         }
 
         // Clamp: don't scroll past the last field + 1 blank line.
-        // Find the maximum scroll_offset where the last field's row is at most field_h - 2.
-        const total_rows = r; // total rendered rows for all fields
-        if (total_rows > 0 and field_h > 0) {
-            // The last field is at row (total_rows - 1). We want that row visible
-            // within field_h rows, with room for one blank line below.
-            const last_field_row = field_rows[PoolForm.FIELD_COUNT - 1];
-            if (form.scroll_offset > 0) {
-                const scroll_row = field_rows[form.scroll_offset];
-                if (scroll_row > last_field_row + 1) {
-                    // Too far — find the max scroll_offset.
-                    var max_so: u8 = 0;
-                    for (0..PoolForm.FIELD_COUNT) |fj| {
-                        if (field_rows[fj] + field_h > last_field_row + 2) break;
-                        max_so = @intCast(fj);
-                    }
-                    if (form.scroll_offset > max_so) form.scroll_offset = max_so;
-                }
+        const last_field_row = field_rows[PoolForm.FIELD_COUNT - 1];
+        // Find max scroll_offset where last_field_row - scroll_row < field_h - 1.
+        var max_so: u8 = 0;
+        for (0..PoolForm.FIELD_COUNT) |fj| {
+            if (last_field_row -| field_rows[fj] < field_h -| 1) {
+                max_so = @intCast(fj);
+                break;
             }
+            max_so = @intCast(fj);
         }
+        if (form.scroll_offset > max_so) form.scroll_offset = max_so;
     }
 
     var row: u16 = 2; // start below border + title
@@ -3052,7 +3042,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const meta = pool_field_meta[fi];
         // Blank line + section header before each group.
         if (meta.section) |sec| {
-            if (fi > 0 and row < BOX_H - 2) row += 1; // blank line (except first section)
+            if (row < BOX_H - 2) row += 1; // blank line before section
             if (row < BOX_H - 2) {
                 const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
                 _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
