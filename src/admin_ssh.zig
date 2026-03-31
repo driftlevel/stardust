@@ -1198,7 +1198,7 @@ fn runTui(
                                 .settings => state.settings_scroll +|= 1,
                             },
                             .reservation_form => {
-                                if (state.form.active_field < 2) state.form.active_field += 1;
+                                if (state.form.active_field < 3) state.form.active_field += 1;
                             },
                             .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit => {},
                         },
@@ -1984,9 +1984,9 @@ fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.S
 
 /// Render the reservation add/edit form as a centered overlay.
 fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
-    // Layout: title, blank, IP, MAC, Hostname, Options, blank, saved/err, hints, border
+    // Layout: border, title, blank, IP, MAC, Hostname, Options, saved/err, hints, border
     const BOX_W: u16 = 58;
-    const BOX_H: u16 = 13;
+    const BOX_H: u16 = 10;
     if (win.width < BOX_W or win.height < BOX_H) return;
 
     const col: u16 = (win.width - BOX_W) / 2;
@@ -2049,18 +2049,17 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
         }
     }
 
-    // Row 8 (row + BOX_H - 5): blank line
-    // Row 9 (row + BOX_H - 4): saved/error message (right-aligned for saved)
+    // Saved/error on the line above hints.
     if (state.form.err_len > 0) {
-        _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 2, .row_offset = row + BOX_H - 4, .wrap = .none });
+        _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 2, .row_offset = row + BOX_H - 3, .wrap = .none });
     } else if (state.form.saved) {
         const saved_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 220, 80 } }, .bg = bg_color, .bold = true };
-        const saved_x = col + BOX_W -| 9; // "Saved! " right-aligned
-        _ = win.print(&.{.{ .text = "Saved!", .style = saved_style }}, .{ .col_offset = saved_x, .row_offset = row + BOX_H - 4, .wrap = .none });
+        const saved_x = col + BOX_W -| 9;
+        _ = win.print(&.{.{ .text = "Saved!", .style = saved_style }}, .{ .col_offset = saved_x, .row_offset = row + BOX_H - 3, .wrap = .none });
     }
 
-    // Row 10 (row + BOX_H - 3): hints
-    _ = win.print(&.{.{ .text = "  Tab: next/prev  Enter: save  Esc: close", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 3, .wrap = .none });
+    // Hints on the last content row (above bottom border).
+    _ = win.print(&.{.{ .text = "  Tab: next/prev  Enter: save  Esc: close", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
 }
 
 /// Save the form: update StateStore + config.yaml. Returns an error message on failure.
@@ -2869,7 +2868,7 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: 
         },
         .reservation_form => {
             const w: u16 = 58;
-            const h: u16 = 13;
+            const h: u16 = 10;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .delete_confirm => {
