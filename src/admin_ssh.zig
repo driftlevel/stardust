@@ -3767,7 +3767,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         if (state.settings_dirty[5]) (if (state.settings_pending_random_alloc) "true" else "false") else (if (cfg.pool_allocation_random) "true" else "false"),
     };
 
-    const LABEL_W: u16 = 20;
+    const LABEL_W: u16 = 24;
 
     // Build display lines: each is either a section header, read-only field, or editable field.
     const Line = struct { label: []const u8, value: []const u8, is_section: bool, edit_idx: ?u8 };
@@ -3872,7 +3872,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         const is_dirty = is_editable and state.settings_dirty[line.edit_idx.?];
         const dirty_mark: []const u8 = if (is_dirty) "*" else " ";
         _ = win.print(&.{.{ .text = dirty_mark, .style = dirty_style }}, .{ .col_offset = 1, .row_offset = dr, .wrap = .none });
-        const label_text = try std.fmt.allocPrint(fa, " {s:<18}", .{line.label});
+        const label_text = try std.fmt.allocPrint(fa, " {s:<22}", .{line.label});
         _ = win.print(&.{.{ .text = label_text, .style = lbl_style }}, .{ .col_offset = 2, .row_offset = dr, .wrap = .none });
 
         // Value field.
@@ -3923,12 +3923,15 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                 const n = @min(state.settings_buf_len, state.settings_pending_port_buf.len);
                 @memcpy(state.settings_pending_port_buf[0..n], state.settings_buf[0..n]);
                 state.settings_pending_port_len = n;
-                state.settings_dirty[3] = true;
+                // Compare against live config.
+                var live_buf: [6]u8 = undefined;
+                const live = std.fmt.bufPrint(&live_buf, "{d}", .{cfg.metrics.http_port}) catch "";
+                state.settings_dirty[3] = !std.mem.eql(u8, state.settings_pending_port_buf[0..n], live);
             } else if (state.settings_row == 4) {
                 const n = @min(state.settings_buf_len, state.settings_pending_bind_buf.len);
                 @memcpy(state.settings_pending_bind_buf[0..n], state.settings_buf[0..n]);
                 state.settings_pending_bind_len = n;
-                state.settings_dirty[4] = true;
+                state.settings_dirty[4] = !std.mem.eql(u8, state.settings_pending_bind_buf[0..n], cfg.metrics.http_bind);
             }
             state.settings_editing = false;
             return;
@@ -3997,22 +4000,22 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                     idx = (idx + 1) % levels.len;
                 }
                 state.settings_pending_log_level = levels[idx];
-                state.settings_dirty[0] = true;
+                state.settings_dirty[0] = (levels[idx] != cfg.log_level);
             },
             1 => {
                 const cur = if (state.settings_dirty[1]) state.settings_pending_collect else cfg.metrics.collect;
                 state.settings_pending_collect = !cur;
-                state.settings_dirty[1] = true;
+                state.settings_dirty[1] = (state.settings_pending_collect != cfg.metrics.collect);
             },
             2 => {
                 const cur = if (state.settings_dirty[2]) state.settings_pending_http_enable else cfg.metrics.http_enable;
                 state.settings_pending_http_enable = !cur;
-                state.settings_dirty[2] = true;
+                state.settings_dirty[2] = (state.settings_pending_http_enable != cfg.metrics.http_enable);
             },
             5 => {
                 const cur = if (state.settings_dirty[5]) state.settings_pending_random_alloc else cfg.pool_allocation_random;
                 state.settings_pending_random_alloc = !cur;
-                state.settings_dirty[5] = true;
+                state.settings_dirty[5] = (state.settings_pending_random_alloc != cfg.pool_allocation_random);
             },
             else => {},
         }
