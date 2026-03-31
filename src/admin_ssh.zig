@@ -114,6 +114,12 @@ pub const AdminServer = struct {
         counters: *const dhcp_mod.Counters,
         sync_mgr: ?*sync_mod.SyncManager,
     ) !*Self {
+        // Silence libssh's default stderr logging *before* any libssh object is
+        // created.  Also install a no-op callback so that even if a code path
+        // bypasses the level check, nothing reaches stderr.
+        _ = c.ssh_set_log_level(c.SSH_LOG_NOLOG);
+        _ = c.ssh_set_log_callback(sshLogNoop);
+
         const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
@@ -128,6 +134,8 @@ pub const AdminServer = struct {
         };
         return self;
     }
+
+    fn sshLogNoop(_: c_int, _: [*c]const u8, _: [*c]const u8, _: ?*anyopaque) callconv(.c) void {}
 
     pub fn deinit(self: *Self) void {
         self.allocator.destroy(self);
@@ -154,10 +162,6 @@ pub const AdminServer = struct {
     }
 
     fn runInner(self: *Self) !void {
-        // Silence libssh's default stderr logging — it writes raw binary
-        // protocol data that shows up as "[NNB blob data]" in the journal.
-        _ = c.ssh_set_log_level(c.SSH_LOG_NONE);
-
         const bind = c.ssh_bind_new() orelse return error.SshBindFailed;
         defer c.ssh_bind_free(bind);
 
@@ -568,6 +572,7 @@ const TuiState = struct {
     mode: TuiMode = .normal,
     lease_row: u16 = 0,
     lease_start: u16 = 0,
+    lease_prev_ctx_row: u16 = 0, // tracks table_ctx.row from last frame for MAC-follow
     sort_col: SortCol = .expires,
     sort_dir: SortDir = .desc,
     stats_scroll: u16 = 0,
@@ -587,6 +592,10 @@ const TuiState = struct {
     sel_reserved: bool = false,
     // Ctrl+R reload flash: show "Reloading config..." until this timestamp.
     reload_flash_until: i64 = 0,
+    // Double-click detection: timestamp (ms) and row of last left-click.
+    last_click_ms: i64 = 0,
+    last_click_row: u16 = 0,
+    last_click_tab: Tab = .leases,
     // Reservation form (mode == .reservation_form).
     form: ReservationForm = .{},
     // Delete confirm (mode == .delete_confirm): MAC of the reservation to delete.
@@ -597,6 +606,8 @@ const TuiState = struct {
     // Pool tab state.
     pool_row: u16 = 0,
     pool_start: u16 = 0,
+    pool_sort_col: u8 = 255, // 255 = no sort; 0-5 = column index
+    pool_sort_asc: bool = true,
     pool_form: PoolForm = .{},
     pool_confirm: PoolSaveConfirm = .{},
     pool_detail_scroll: u16 = 0,
@@ -898,6 +909,20 @@ fn runTui(
                         if (key.matches('1', .{})) state.tab = .leases;
                         if (key.matches('2', .{})) state.tab = .stats;
                         if (key.matches('3', .{})) state.tab = .pools;
+                        if (key.matches(vaxis.Key.tab, .{})) {
+                            state.tab = switch (state.tab) {
+                                .leases => .stats,
+                                .stats => .pools,
+                                .pools => .leases,
+                            };
+                        }
+                        if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                            state.tab = switch (state.tab) {
+                                .leases => .pools,
+                                .stats => .leases,
+                                .pools => .stats,
+                            };
+                        }
 
                         // Reservation actions (leases tab only).
                         if (state.tab == .leases) {
@@ -937,8 +962,17 @@ fn runTui(
                 .mouse => |mouse| {
                     switch (mouse.button) {
                         .left => if (mouse.type == .press) {
+                            // Modal overlays consume all mouse clicks.
+                            if (state.mode != .normal) break;
                             const term_row: u16 = if (mouse.row >= 0) @intCast(mouse.row) else 0;
                             const term_col: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
+                            const now_ms = std.time.milliTimestamp();
+                            const is_double = (now_ms - state.last_click_ms < 400 and
+                                term_row == state.last_click_row and
+                                state.tab == state.last_click_tab);
+                            state.last_click_ms = now_ms;
+                            state.last_click_row = term_row;
+                            state.last_click_tab = state.tab;
                             if (term_row == 0) {
                                 // Header bar: tab switching.
                                 // Layout: " Stardust "(10) + " [1] Leases "(12) + " [2] Stats "(11) + " [3] Pools "(11)
@@ -949,13 +983,37 @@ fn runTui(
                                 } else if (term_col >= 33 and term_col < 44) {
                                     state.tab = .pools;
                                 }
+                            } else if (state.tab == .pools) {
+                                if (term_row == 1) {
+                                    // Column header: sort by clicked column.
+                                    const pw = calcPoolColWidths(@intCast(vx.window().width));
+                                    const clicked_col = hitTestCol(u16, &pw, LEASE_COL_SEP, term_col);
+                                    if (clicked_col) |col| {
+                                        const ci: u8 = @intCast(col);
+                                        if (state.pool_sort_col == ci) {
+                                            state.pool_sort_asc = !state.pool_sort_asc;
+                                        } else {
+                                            state.pool_sort_col = ci;
+                                            state.pool_sort_asc = true;
+                                        }
+                                    }
+                                } else if (term_row >= 2) {
+                                    const clicked: u32 = (term_row - 2) + state.pool_start;
+                                    if (clicked < server.cfg.pools.len) {
+                                        state.pool_row = @intCast(clicked);
+                                        if (is_double) {
+                                            // Double-click: open detail view.
+                                            state.pool_detail_scroll = 0;
+                                            state.mode = .pool_detail;
+                                        }
+                                    }
+                                }
                             } else if (state.tab == .leases) {
                                 if (term_row == 1) {
                                     // Column header row: sort by clicked column.
-                                    const n_cols: u16 = 6;
-                                    const cw = calcDynColWidth(@intCast(vx.window().width), n_cols);
-                                    const clicked_col: SortCol = if (cw > 0)
-                                        @enumFromInt(@min(term_col / cw, n_cols - 1))
+                                    const lw = calcLeaseColWidths(@intCast(vx.window().width));
+                                    const clicked_col: SortCol = if (hitTestCol(u16, &lw, LEASE_COL_SEP, term_col)) |ci|
+                                        @enumFromInt(@min(ci, 5))
                                     else
                                         .ip;
                                     if (state.sort_col == clicked_col) {
@@ -967,22 +1025,78 @@ fn runTui(
                                 } else if (term_row >= 2) {
                                     // Data row: select it.
                                     const clicked: u32 = (term_row - 2) + table_ctx.start;
-                                    if (clicked <= std.math.maxInt(u16))
+                                    if (clicked <= std.math.maxInt(u16)) {
                                         table_ctx.row = @intCast(clicked);
+                                        if (is_double and state.mode == .normal) {
+                                            // Double-click: open reservation edit form
+                                            // (sel_* fields are updated on next render, so
+                                            // we force an update from the current table_ctx).
+                                            state.form = .{};
+                                            const ip = state.sel_ip[0..state.sel_ip_len];
+                                            const mac = state.sel_mac[0..state.sel_mac_len];
+                                            const hn = state.sel_hostname[0..state.sel_hostname_len];
+                                            @memcpy(state.form.ip_buf[0..ip.len], ip);
+                                            state.form.ip_len = ip.len;
+                                            @memcpy(state.form.mac_buf[0..mac.len], mac);
+                                            state.form.mac_len = mac.len;
+                                            @memcpy(state.form.hostname_buf[0..hn.len], hn);
+                                            state.form.hostname_len = hn.len;
+                                            @memcpy(state.form.orig_mac[0..mac.len], mac);
+                                            state.form.orig_mac_len = mac.len;
+                                            state.mode = .reservation_form;
+                                        }
+                                    }
                                 }
                             }
                         },
-                        .wheel_up => switch (state.tab) {
-                            .leases => table_ctx.row -|= 1,
-                            .stats => state.stats_scroll -|= 3,
-                            .pools => state.pool_row -|= 1,
+                        .wheel_right => if (state.mode == .normal) {
+                            state.tab = switch (state.tab) {
+                                .leases => .leases,
+                                .stats => .leases,
+                                .pools => .stats,
+                            };
                         },
-                        .wheel_down => switch (state.tab) {
-                            .leases => table_ctx.row +|= 1,
-                            .stats => state.stats_scroll +|= 3,
-                            .pools => if (state.pool_row + 1 < server.cfg.pools.len) {
-                                state.pool_row += 1;
+                        .wheel_left => if (state.mode == .normal) {
+                            state.tab = switch (state.tab) {
+                                .leases => .stats,
+                                .stats => .pools,
+                                .pools => .pools,
+                            };
+                        },
+                        .wheel_up => switch (state.mode) {
+                            .pool_detail => state.pool_detail_scroll -|= 3,
+                            .pool_save_confirm => state.pool_confirm.scroll -|= 3,
+                            .pool_form => if (state.pool_form.active_field > 0) {
+                                state.pool_form.active_field -= 1;
                             },
+                            .normal => switch (state.tab) {
+                                .leases => table_ctx.row -|= 1,
+                                .stats => state.stats_scroll -|= 3,
+                                .pools => state.pool_row -|= 1,
+                            },
+                            .reservation_form => {
+                                if (state.form.active_field > 0) state.form.active_field -= 1;
+                            },
+                            // All other modals: swallow scroll.
+                            .delete_confirm, .pool_delete_confirm => {},
+                        },
+                        .wheel_down => switch (state.mode) {
+                            .pool_detail => state.pool_detail_scroll +|= 3,
+                            .pool_save_confirm => state.pool_confirm.scroll +|= 3,
+                            .pool_form => if (state.pool_form.active_field + 1 < PoolForm.FIELD_COUNT) {
+                                state.pool_form.active_field += 1;
+                            },
+                            .normal => switch (state.tab) {
+                                .leases => table_ctx.row +|= 1,
+                                .stats => state.stats_scroll +|= 3,
+                                .pools => if (state.pool_row + 1 < server.cfg.pools.len) {
+                                    state.pool_row += 1;
+                                },
+                            },
+                            .reservation_form => {
+                                if (state.form.active_field < 2) state.form.active_field += 1;
+                            },
+                            .delete_confirm, .pool_delete_confirm => {},
                         },
                         else => {},
                     }
@@ -1263,6 +1377,18 @@ fn calcLeaseColWidths(win_width: u16) [6]u16 {
     return widths;
 }
 
+/// Given column widths and a separator size, return which column index
+/// the terminal column `x` falls within, or null if past all columns.
+fn hitTestCol(comptime T: type, widths: []const T, sep: T, x: u16) ?usize {
+    var edge: u16 = 0;
+    for (widths, 0..) |w, i| {
+        edge += @intCast(w);
+        if (x < edge) return i;
+        edge += @intCast(sep);
+    }
+    return null;
+}
+
 /// Right-align `text` within `width` columns by prepending spaces.
 /// Returns text unchanged if it already fills or exceeds the width.
 fn rightAlignText(fa: std.mem.Allocator, text: []const u8, width: u16) ![]const u8 {
@@ -1477,10 +1603,23 @@ fn renderLeaseTab(
         });
     }
 
-    // Clamp table cursor to the actual number of rows.
+    // Follow the previously selected lease by MAC when data refreshes,
+    // but only if the user didn't navigate since the last frame.
     const n_rows: u16 = if (rows.items.len > 0xFFFF) 0xFFFF else @intCast(rows.items.len);
+    const user_navigated = (table_ctx.row != state.lease_prev_ctx_row);
+    if (!user_navigated and state.sel_mac_len > 0 and n_rows > 0) {
+        const prev_mac = state.sel_mac[0..state.sel_mac_len];
+        for (rows.items, 0..) |row, ri| {
+            if (std.mem.eql(u8, row.mac, prev_mac)) {
+                table_ctx.row = @intCast(ri);
+                break;
+            }
+        }
+    }
+    // Clamp.
     if (n_rows > 0 and table_ctx.row >= n_rows) table_ctx.row = n_rows - 1;
     if (n_rows == 0) table_ctx.row = 0;
+    state.lease_prev_ctx_row = table_ctx.row;
 
     // Update selected-row state (used by yank mode and reservation form).
     if (rows.items.len > 0 and table_ctx.row < rows.items.len) {
@@ -1580,14 +1719,14 @@ fn renderStatsTab(
         _ = win.print(&.{.{ .text = "  Pool Utilization", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
     vr += 1;
 
-    for (server.cfg.pools) |pool| {
-        const capacity = poolCapacity(&pool);
+    for (server.cfg.pools) |*pool| {
+        const capacity = poolCapacity(pool);
 
         var active: u64 = 0;
         var reserved: u64 = 0;
         var expired: u64 = 0;
         for (leases) |lease| {
-            if (!isIpInPool(lease.ip, &pool)) continue;
+            if (!isIpInPool(lease.ip, pool)) continue;
             if (lease.reserved) {
                 reserved += 1;
                 if (lease.expires > now) active += 1;
@@ -1600,11 +1739,10 @@ fn renderStatsTab(
         const used = active + reserved;
         const available: u64 = if (capacity > used) capacity - used else 0;
 
-        // Pool label line: "  subnet/prefix  start – end"
-        const start_str = if (pool.pool_start.len > 0) pool.pool_start else "(auto)";
-        const end_str = if (pool.pool_end.len > 0) pool.pool_end else "(auto)";
-        const pool_label = try std.fmt.allocPrint(a, "  {s}/{d}  {s} \xe2\x80\x93 {s}", .{
-            pool.subnet, pool.prefix_len, start_str, end_str,
+        // Pool label line: "  subnet/prefix  .abbrev – .abbrev"
+        const range_str = fmtAbbrevRange(a, pool) catch "?";
+        const pool_label = try std.fmt.allocPrint(a, "  {s}/{d}  {s}", .{
+            pool.subnet, pool.prefix_len, range_str,
         });
         if (statsVr(vr, scroll, win.height)) |dr|
             _ = win.print(&.{.{ .text = pool_label, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
@@ -1851,10 +1989,8 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
         return;
     }
 
-    if (key.matches(vaxis.Key.enter, .{}) or
-        (key.matches(vaxis.Key.tab, .{}) and form.active_field == 2))
-    {
-        // Save on Enter (any field) or Tab past the last field.
+    if (key.matches(vaxis.Key.enter, .{})) {
+        // Save on Enter only.
         if (server.cfg.admin_ssh.read_only) {
             const msg = "read-only mode — changes not permitted";
             form.err_len = @min(msg.len, form.err_buf.len);
@@ -1947,7 +2083,7 @@ fn handleDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key
     if (key.matches('y', .{})) {
         const mac = state.del_mac[0..state.del_mac_len];
         const ip = state.del_ip[0..state.del_ip_len];
-        server.store.removeLease(mac);
+        server.store.forceRemoveLease(mac);
         if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
             _ = config_write.removeReservation(server.allocator, pool, mac);
             config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
@@ -2144,55 +2280,209 @@ fn copyField(buf: anytype, len: *usize, src: []const u8) void {
 
 // ---- Pool list tab ----
 
-fn renderPoolsTab(server: *AdminServer, state: *TuiState, body: vaxis.Window, fa: std.mem.Allocator) !void {
+/// Format a pool range abbreviating octets that match the subnet.
+/// e.g. subnet=192.168.10.0, start=192.168.10.100, end=192.168.10.200 → ".100 – .200"
+///      subnet=172.20.0.0, start=172.20.0.100, end=172.20.14.200 → ".0.100 – .14.200"
+fn fmtAbbrevRange(fa: std.mem.Allocator, pool: *const config_mod.PoolConfig) ![]const u8 {
+    if (pool.pool_start.len == 0 and pool.pool_end.len == 0) return "auto";
+    const start = if (pool.pool_start.len > 0) pool.pool_start else "(auto)";
+    const end = if (pool.pool_end.len > 0) pool.pool_end else "(auto)";
+    // Find common prefix octets with subnet.
+    const sub_octets = splitOctets(pool.subnet);
+    const start_octets = splitOctets(start);
+    const end_octets = splitOctets(end);
+    // Count matching leading octets (at most 3 — always show at least the last octet).
+    var common: usize = 0;
+    while (common < 3) : (common += 1) {
+        if (common >= sub_octets.count or common >= start_octets.count or common >= end_octets.count) break;
+        if (!std.mem.eql(u8, sub_octets.items[common], start_octets.items[common]) or
+            !std.mem.eql(u8, sub_octets.items[common], end_octets.items[common])) break;
+    }
+    // Build abbreviated strings.
+    const abbrev_start = joinFromOctet(fa, &start_octets, common) catch start;
+    const abbrev_end = joinFromOctet(fa, &end_octets, common) catch end;
+    return std.fmt.allocPrint(fa, "{s} \xe2\x80\x93 {s}", .{ abbrev_start, abbrev_end });
+}
+
+const OctetSplit = struct {
+    items: [4][]const u8,
+    count: usize,
+};
+
+fn splitOctets(s: []const u8) OctetSplit {
+    var result = OctetSplit{ .items = undefined, .count = 0 };
+    var it = std.mem.splitScalar(u8, s, '.');
+    while (it.next()) |part| {
+        if (result.count >= 4) break;
+        result.items[result.count] = part;
+        result.count += 1;
+    }
+    return result;
+}
+
+fn joinFromOctet(fa: std.mem.Allocator, octets: *const OctetSplit, start_idx: usize) ![]const u8 {
+    if (start_idx >= octets.count) return "";
+    var buf: [16]u8 = undefined;
+    var len: usize = 0;
+    var i = start_idx;
+    while (i < octets.count) : (i += 1) {
+        buf[len] = '.';
+        len += 1;
+        const o = octets.items[i];
+        const n = @min(o.len, buf.len - len);
+        @memcpy(buf[len..][0..n], o[0..n]);
+        len += n;
+    }
+    return try fa.dupe(u8, buf[0..len]);
+}
+
+const POOL_COL_NAMES = [_][]const u8{ "subnet", "range", "router", "lease", "res", "dns upd" };
+
+const POOL_COL_SPECS = [6]LeaseColSpec{
+    .{ .ideal = 20, .min = 12, .left_trunc = false }, // subnet  "192.168.100.0/24"
+    .{ .ideal = 34, .min = 10, .left_trunc = false }, // range   "192.168.1.100 - 192.168.1.200"
+    .{ .ideal = 16, .min = 7, .left_trunc = true }, // router
+    .{ .ideal = 8, .min = 5, .left_trunc = false, .right_align = true }, // lease time
+    .{ .ideal = 5, .min = 3, .left_trunc = false, .right_align = true }, // reservations
+    .{ .ideal = 7, .min = 3, .left_trunc = false }, // dns update
+};
+const POOL_COL_REDUCE_ORDER = [6]usize{ 1, 5, 4, 3, 0, 2 }; // range→dns→res→lease→subnet→router
+
+fn calcPoolColWidths(win_width: u16) [6]u16 {
+    var widths: [6]u16 = undefined;
+    for (POOL_COL_SPECS, 0..) |spec, i| widths[i] = spec.ideal;
+    const seps: u16 = (POOL_COL_SPECS.len - 1) * LEASE_COL_SEP;
+    var total: u16 = seps;
+    for (widths) |w| total +|= w;
+    for (POOL_COL_REDUCE_ORDER) |col| {
+        if (total <= win_width) break;
+        const over = total - win_width;
+        const slack = widths[col] - POOL_COL_SPECS[col].min;
+        const cut = @min(over, slack);
+        widths[col] -= cut;
+        total -= cut;
+    }
+    return widths;
+}
+
+fn renderPoolsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const pools = server.cfg.pools;
+    if (win.height < 2 or win.width < 10) return;
+
     if (pools.len == 0) {
-        _ = body.print(&.{.{ .text = "  No pools configured.", .style = .{ .fg = .{ .rgb = .{ 180, 180, 180 } } } }}, .{ .row_offset = 1, .wrap = .none });
+        _ = win.print(&.{.{ .text = "  No pools configured.", .style = .{ .fg = .{ .rgb = .{ 180, 180, 180 } } } }}, .{ .row_offset = 1, .wrap = .none });
         return;
     }
 
-    const hdr_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 200, 255 } }, .bold = true };
-    const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
-    const normal_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } } };
+    const widths = calcPoolColWidths(@intCast(win.width));
+    const hdr_bg: vaxis.Color = .{ .rgb = .{ 30, 30, 50 } };
+    const hdr_style: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = hdr_bg };
+    const alt_bg: vaxis.Color = .{ .rgb = .{ 22, 22, 28 } };
 
     // Clamp selection.
     if (state.pool_row >= pools.len) state.pool_row = @intCast(pools.len - 1);
 
-    const avail_h = body.height;
-    const data_h = if (avail_h > 1) avail_h - 1 else 1; // header row
+    // --- Header row (with sort indicators) ---
+    {
+        const hdr_win = win.child(.{ .y_off = 0, .height = 1, .width = win.width });
+        hdr_win.fill(.{ .style = .{ .bg = hdr_bg } });
+        var x: i17 = 0;
+        for (0..6) |ci| {
+            if (widths[ci] > 0) {
+                const cell = hdr_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
+                const base = POOL_COL_NAMES[ci];
+                const name = if (state.pool_sort_col == ci)
+                    (if (state.pool_sort_asc)
+                        std.fmt.allocPrint(fa, "{s} ^", .{base}) catch base
+                    else
+                        std.fmt.allocPrint(fa, "{s} v", .{base}) catch base)
+                else
+                    base;
+                const raw = try truncateCell(fa, name, widths[ci], false);
+                const text = if (POOL_COL_SPECS[ci].right_align) try rightAlignText(fa, raw, widths[ci]) else raw;
+                _ = cell.print(&.{.{ .text = text, .style = hdr_style }}, .{ .wrap = .none });
+            }
+            x += @as(i17, widths[ci]) + LEASE_COL_SEP;
+        }
+    }
 
-    // Scroll viewport to keep selection visible.
-    if (state.pool_row < state.pool_start) state.pool_start = state.pool_row;
-    if (state.pool_row >= state.pool_start + data_h) state.pool_start = state.pool_row - data_h + 1;
-
-    // Header.
-    const hdr = try std.fmt.allocPrint(fa, "  {s:<20} {s:<30} {s:<16} {s:>7}  {s:>4}  {s:<6}", .{ "Subnet", "Range", "Router", "Lease", "Res", "DNS" });
-    _ = body.print(&.{.{ .text = hdr, .style = hdr_style }}, .{ .row_offset = 0, .wrap = .none });
-
-    // Pool rows.
-    var row: u16 = 0;
-    var i: usize = state.pool_start;
-    while (i < pools.len and row < data_h) : ({
-        i += 1;
-        row += 1;
-    }) {
-        const p = &pools[i];
-        const subnet_label = std.fmt.allocPrint(fa, "{s}/{d}", .{ p.subnet, p.prefix_len }) catch "?";
-        const range_label = if (p.pool_start.len > 0 and p.pool_end.len > 0)
-            std.fmt.allocPrint(fa, "{s} - {s}", .{ p.pool_start, p.pool_end }) catch "?"
-        else
-            "auto";
-        const dns_label: []const u8 = if (p.dns_update.enable) "yes" else "no";
-        const line = try std.fmt.allocPrint(fa, "  {s:<20} {s:<30} {s:<16} {d:>7}  {d:>4}  {s:<6}", .{
-            subnet_label,
-            range_label,
-            p.router,
-            p.lease_time,
-            p.reservations.len,
-            dns_label,
+    // --- Build sortable row data ---
+    const PoolRowData = struct { subnet: []const u8, range: []const u8, router: []const u8, lease: []const u8, res: []const u8, dns: []const u8, orig_idx: usize };
+    var row_data = std.ArrayList(PoolRowData){};
+    for (pools, 0..) |*p, pi| {
+        try row_data.append(fa, .{
+            .subnet = std.fmt.allocPrint(fa, "{s}/{d}", .{ p.subnet, p.prefix_len }) catch "?",
+            .range = fmtAbbrevRange(fa, p) catch "?",
+            .router = p.router,
+            .lease = std.fmt.allocPrint(fa, "{d}", .{p.lease_time}) catch "?",
+            .res = std.fmt.allocPrint(fa, "{d}", .{p.reservations.len}) catch "?",
+            .dns = if (p.dns_update.enable) "yes" else "no",
+            .orig_idx = pi,
         });
-        const style = if (i == state.pool_row) sel_style else normal_style;
-        _ = body.print(&.{.{ .text = line, .style = style }}, .{ .row_offset = 1 + row, .wrap = .none });
+    }
+
+    // Sort if a column is selected.
+    if (state.pool_sort_col < 6) {
+        const SortCtx = struct {
+            col: u8,
+            asc: bool,
+            fn lessThan(ctx: @This(), a: PoolRowData, b: PoolRowData) bool {
+                const af = switch (ctx.col) {
+                    0 => a.subnet,
+                    1 => a.range,
+                    2 => a.router,
+                    3 => a.lease,
+                    4 => a.res,
+                    5 => a.dns,
+                    else => "",
+                };
+                const bf = switch (ctx.col) {
+                    0 => b.subnet,
+                    1 => b.range,
+                    2 => b.router,
+                    3 => b.lease,
+                    4 => b.res,
+                    5 => b.dns,
+                    else => "",
+                };
+                const cmp = std.mem.lessThan(u8, af, bf);
+                return if (ctx.asc) cmp else !cmp;
+            }
+        };
+        std.sort.pdq(PoolRowData, row_data.items, SortCtx{ .col = state.pool_sort_col, .asc = state.pool_sort_asc }, SortCtx.lessThan);
+    }
+
+    // --- Scroll management ---
+    const visible: u16 = win.height -| 1;
+    const n: u16 = if (row_data.items.len > 0xFFFF) 0xFFFF else @intCast(row_data.items.len);
+    if (state.pool_row >= n) state.pool_row = n - 1;
+    if (state.pool_row < state.pool_start) state.pool_start = state.pool_row;
+    if (state.pool_row >= state.pool_start +| visible) state.pool_start = state.pool_row - visible + 1;
+
+    // --- Data rows ---
+    for (0..visible) |ri| {
+        const row_idx = state.pool_start + @as(u16, @intCast(ri));
+        if (row_idx >= row_data.items.len) break;
+        const rd = row_data.items[row_idx];
+        const selected = (row_idx == state.pool_row);
+        const row_bg: vaxis.Color = if (selected) .{ .rgb = .{ 50, 80, 140 } } else if (ri % 2 != 0) alt_bg else .default;
+        const row_style: vaxis.Style = .{ .bg = row_bg };
+
+        const row_win = win.child(.{ .x_off = 0, .y_off = @intCast(ri + 1), .width = win.width, .height = 1 });
+        row_win.fill(.{ .style = row_style });
+
+        const fields = [6][]const u8{ rd.subnet, rd.range, rd.router, rd.lease, rd.res, rd.dns };
+        var x: i17 = 0;
+        for (0..6) |ci| {
+            if (widths[ci] > 0) {
+                const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
+                const spec = POOL_COL_SPECS[ci];
+                const raw = try truncateCell(fa, fields[ci], widths[ci], spec.left_trunc);
+                const text = if (spec.right_align) try rightAlignText(fa, raw, widths[ci]) else raw;
+                _ = cell.print(&.{.{ .text = text, .style = row_style }}, .{ .wrap = .none });
+            }
+            x += @as(i17, widths[ci]) + LEASE_COL_SEP;
+        }
     }
 }
 
@@ -2359,11 +2649,50 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     const field_h = BOX_H - 3;
     const FIELD_W: u16 = 32;
 
-    // Ensure scroll_offset keeps active_field visible.
-    if (form.active_field < form.scroll_offset)
-        form.scroll_offset = form.active_field;
-    if (form.active_field >= form.scroll_offset + @as(u8, @intCast(field_h)))
-        form.scroll_offset = form.active_field - @as(u8, @intCast(field_h)) + 1;
+    // Compute the rendered row for each field, accounting for section headers.
+    // Then pick scroll_offset so active_field is vertically centered.
+    {
+        // First: compute the total rendered rows for each possible scroll_offset.
+        // We need to find the scroll_offset where active_field's row is ~centered.
+        // Strategy: compute the row of active_field relative to scroll_offset=0,
+        // then back-calculate the right scroll_offset.
+        var field_rows: [PoolForm.FIELD_COUNT]u16 = undefined;
+        var r: u16 = 0;
+        for (0..PoolForm.FIELD_COUNT) |fi| {
+            if (pool_field_meta[fi].section != null) r += 1; // section header
+            field_rows[fi] = r;
+            r += 1;
+        }
+        const active_row = field_rows[form.active_field];
+        const half_h = field_h / 2;
+        // We want active_row - scroll_row_offset ≈ half_h.
+        // scroll_row_offset = active_row - half_h (clamped).
+        const target_scroll_row: u16 = if (active_row > half_h) active_row - half_h else 0;
+        // Find the field index whose rendered row is closest to target_scroll_row.
+        var best: u8 = 0;
+        for (0..PoolForm.FIELD_COUNT) |fi| {
+            if (field_rows[fi] <= target_scroll_row) best = @intCast(fi);
+        }
+        form.scroll_offset = best;
+        // Ensure active_field is actually visible: if it rendered past field_h,
+        // advance scroll_offset until it fits.
+        while (form.scroll_offset < form.active_field) {
+            var vis_rows: u16 = 0;
+            var fi: u8 = form.scroll_offset;
+            var found = false;
+            while (fi < PoolForm.FIELD_COUNT and vis_rows < field_h) : (fi += 1) {
+                if (pool_field_meta[fi].section != null) vis_rows += 1;
+                if (vis_rows >= field_h) break;
+                if (fi == form.active_field) {
+                    found = true;
+                    break;
+                }
+                vis_rows += 1;
+            }
+            if (found) break;
+            form.scroll_offset += 1;
+        }
+    }
 
     var row: u16 = 1;
     var fi: u8 = form.scroll_offset;

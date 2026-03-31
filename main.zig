@@ -71,23 +71,41 @@ fn logFn(
         // Escape the comptime format string so {s}/{d}/etc. print literally.
         const safe_fmt = comptime escapeFmtBraces(format);
         const scope_tag = @tagName(scope);
+        var line_buf: [4096]u8 = undefined;
         if (g_journal_stream) {
-            std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ msg.len, scope_tag });
+            const line = std.fmt.bufPrint(&line_buf, sd_prefix ++ "[" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ msg.len, scope_tag }) catch return;
+            writeStderr(line);
         } else {
             var ts_buf: [20]u8 = undefined;
             const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
-            std.debug.print("{s} [" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ ts, msg.len, scope_tag });
+            const line = std.fmt.bufPrint(&line_buf, "{s} [" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ ts, msg.len, scope_tag }) catch return;
+            writeStderr(line);
         }
         return;
     }
 
+    // Format the full log line into a single buffer and write it in one
+    // syscall.  This avoids partial writes that journald could interpret as
+    // binary blobs when the buffered writer inside std.debug.print flushes
+    // mid-line.
+    var line_buf: [4352]u8 = undefined; // 4096 msg + 256 prefix overhead
     if (g_journal_stream) {
-        std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] {s}\n", .{msg});
+        const line = std.fmt.bufPrint(&line_buf, sd_prefix ++ "[" ++ level_str ++ "] {s}\n", .{msg}) catch return;
+        writeStderr(line);
     } else {
         var ts_buf: [20]u8 = undefined;
         const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
-        std.debug.print("{s} [" ++ level_str ++ "] {s}\n", .{ ts, msg });
+        const line = std.fmt.bufPrint(&line_buf, "{s} [" ++ level_str ++ "] {s}\n", .{ ts, msg }) catch return;
+        writeStderr(line);
     }
+}
+
+/// Single write() syscall to stderr.  Atomic for sizes ≤ PIPE_BUF (4096 on Linux),
+/// which avoids journald interpreting partial flushes as binary blobs.
+fn writeStderr(data: []const u8) void {
+    // Debug: if the output is exactly 59 bytes or contains bytes that
+    // journald would consider binary, dump hex to a file for diagnosis.
+    _ = std.posix.write(2, data) catch {};
 }
 
 /// True if any byte is a non-printable control character (excludes \n, \r, \t and UTF-8 high bytes).

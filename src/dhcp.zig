@@ -1668,16 +1668,33 @@ pub const DHCPServer = struct {
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch return;
 
-        // Get IP and hostname from current lease before removing (for DNS cleanup)
+        // Get IP and hostname from current lease before removing (for DNS cleanup).
+        // Copy the strings we need — removeLease frees the originals for non-reserved leases.
         const old_lease = self.store.getLeaseByMac(mac_str);
+        var ip_copy: [16]u8 = undefined;
+        var ip_len: usize = 0;
+        var hn_copy: [256]u8 = undefined;
+        var hn_len: usize = 0;
+        var old_local: bool = false;
+        if (old_lease) |l| {
+            ip_len = @min(l.ip.len, ip_copy.len);
+            @memcpy(ip_copy[0..ip_len], l.ip[0..ip_len]);
+            if (l.hostname) |h| {
+                hn_len = @min(h.len, hn_copy.len);
+                @memcpy(hn_copy[0..hn_len], h[0..hn_len]);
+            }
+            old_local = l.local;
+        }
         // Check if reserved before removal (reserved leases get expires=0, not deleted)
         const is_reserved = if (self.store.leases.get(mac_str)) |l| l.reserved else false;
         self.store.removeLease(mac_str);
-        if (old_lease) |l| {
-            log_v.debug("DHCPRELEASE {s} from {s}", .{ l.ip, mac_str });
-            if (self.shouldHandleDns(l.local)) {
-                if (self.poolForIp(l.ip)) |pool| {
-                    if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(l.ip, l.hostname);
+        if (old_lease != null) {
+            const ip_str = ip_copy[0..ip_len];
+            const hn_str: ?[]const u8 = if (hn_len > 0) hn_copy[0..hn_len] else null;
+            log_v.debug("DHCPRELEASE {s} from {s}", .{ ip_str, mac_str });
+            if (self.shouldHandleDns(old_local)) {
+                if (self.poolForIp(ip_str)) |pool| {
+                    if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(ip_str, hn_str);
                 }
             }
         }
