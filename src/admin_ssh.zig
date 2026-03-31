@@ -3720,77 +3720,273 @@ fn handlePoolDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis
 // Settings tab
 // ---------------------------------------------------------------------------
 
+const SETTINGS_EDITABLE_COUNT: u8 = 5;
+
 fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const cfg = server.cfg;
-    const hdr_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bold = true };
-    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } } };
-    const val_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } } };
-    const ro_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 120, 120, 140 } } };
+    const read_only = cfg.admin_ssh.read_only;
 
-    var row: u16 = 0;
-    const scroll = state.settings_scroll;
+    // Dark background matching modals.
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
 
-    const lines = [_]struct { text: []const u8, style: vaxis.Style }{
-        .{ .text = "  -- General --", .style = hdr_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Listen Address:    {s}  (restart required)", .{cfg.listen_address}), .style = ro_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  State Directory:   {s}", .{cfg.state_dir}), .style = ro_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Log Level:         {s}", .{@tagName(cfg.log_level)}), .style = val_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Random Allocation: {s}", .{if (cfg.pool_allocation_random) "true" else "false"}), .style = ro_style },
-        .{ .text = "", .style = label_style },
-        .{ .text = "  -- Admin SSH --", .style = hdr_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Enable:     {s}", .{if (cfg.admin_ssh.enable) "true" else "false"}), .style = ro_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Port:       {d}", .{cfg.admin_ssh.port}), .style = ro_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Bind:       {s}", .{cfg.admin_ssh.bind}), .style = ro_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Read Only:  {s}", .{if (cfg.admin_ssh.read_only) "true" else "false"}), .style = ro_style },
-        .{ .text = "", .style = label_style },
-        .{ .text = "  -- Metrics --", .style = hdr_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  Collect:     {s}", .{if (cfg.metrics.collect) "true" else "false"}), .style = val_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  HTTP Enable: {s}", .{if (cfg.metrics.http_enable) "true" else "false"}), .style = val_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  HTTP Port:   {d}", .{cfg.metrics.http_port}), .style = val_style },
-        .{ .text = try std.fmt.allocPrint(fa, "  HTTP Bind:   {s}", .{cfg.metrics.http_bind}), .style = val_style },
+    const bg: vaxis.Color = .{ .rgb = .{ 20, 20, 30 } };
+    const sec_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = bg, .bold = true };
+    const lbl_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 140, 140, 170 } }, .bg = bg };
+    const ro_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 120 } }, .bg = bg };
+    const val_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+    const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = bg };
+
+    // Editable field values (read from config live).
+    const edit_vals = [SETTINGS_EDITABLE_COUNT][]const u8{
+        @tagName(cfg.log_level),
+        if (cfg.metrics.collect) "true" else "false",
+        if (cfg.metrics.http_enable) "true" else "false",
+        if (state.settings_editing and state.settings_row == 3) state.settings_buf[0..state.settings_buf_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
+        if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else cfg.metrics.http_bind,
     };
 
-    // Add sync section if configured.
-    var sync_lines: [8]struct { text: []const u8, style: vaxis.Style } = undefined;
-    var sync_count: usize = 0;
+    const LABEL_W: u16 = 20;
+
+    // Build display lines: each is either a section header, read-only field, or editable field.
+    const Line = struct { label: []const u8, value: []const u8, is_section: bool, edit_idx: ?u8 };
+    var lines_buf: [30]Line = undefined;
+    var lc: usize = 0;
+
+    lines_buf[lc] = .{ .label = "-- General --", .value = "", .is_section = true, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Listen Address", .value = try std.fmt.allocPrint(fa, "{s}  (restart)", .{cfg.listen_address}), .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "State Directory", .value = cfg.state_dir, .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Log Level", .value = edit_vals[0], .is_section = false, .edit_idx = 0 };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Random Alloc", .value = if (cfg.pool_allocation_random) "true" else "false", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "-- Admin SSH --", .value = "", .is_section = true, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Enable", .value = if (cfg.admin_ssh.enable) "true" else "false", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Port", .value = try std.fmt.allocPrint(fa, "{d}", .{cfg.admin_ssh.port}), .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Bind", .value = cfg.admin_ssh.bind, .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Read Only", .value = if (cfg.admin_ssh.read_only) "true" else "false", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "-- Metrics --", .value = "", .is_section = true, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Collect", .value = edit_vals[1], .is_section = false, .edit_idx = 1 };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "HTTP Enable", .value = edit_vals[2], .is_section = false, .edit_idx = 2 };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "HTTP Port", .value = edit_vals[3], .is_section = false, .edit_idx = 3 };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "HTTP Bind", .value = edit_vals[4], .is_section = false, .edit_idx = 4 };
+    lc += 1;
+
+    // Sync section.
     if (cfg.sync) |s| {
-        sync_lines[0] = .{ .text = "", .style = label_style };
-        sync_lines[1] = .{ .text = "  -- Sync --", .style = hdr_style };
-        sync_lines[2] = .{ .text = try std.fmt.allocPrint(fa, "  Enable:        true", .{}), .style = ro_style };
-        sync_lines[3] = .{ .text = try std.fmt.allocPrint(fa, "  Group:         {s}", .{s.group_name}), .style = ro_style };
-        sync_lines[4] = .{ .text = try std.fmt.allocPrint(fa, "  Port:          {d}", .{s.port}), .style = ro_style };
+        lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
+        lc += 1;
+        lines_buf[lc] = .{ .label = "-- Sync --", .value = "", .is_section = true, .edit_idx = null };
+        lc += 1;
+        lines_buf[lc] = .{ .label = "Enable", .value = "true", .is_section = false, .edit_idx = null };
+        lc += 1;
+        lines_buf[lc] = .{ .label = "Group", .value = s.group_name, .is_section = false, .edit_idx = null };
+        lc += 1;
+        lines_buf[lc] = .{ .label = "Port", .value = try std.fmt.allocPrint(fa, "{d}", .{s.port}), .is_section = false, .edit_idx = null };
+        lc += 1;
         if (s.multicast) |mc| {
-            sync_lines[5] = .{ .text = try std.fmt.allocPrint(fa, "  Multicast:     {s}", .{mc}), .style = ro_style };
-            sync_count = 6;
+            lines_buf[lc] = .{ .label = "Multicast", .value = mc, .is_section = false, .edit_idx = null };
+            lc += 1;
         } else if (s.peers.len > 0) {
-            sync_lines[5] = .{ .text = try std.fmt.allocPrint(fa, "  Peers:         {s}", .{try std.mem.join(fa, ", ", s.peers)}), .style = ro_style };
-            sync_count = 6;
-        } else {
-            sync_count = 5;
+            lines_buf[lc] = .{ .label = "Peers", .value = try std.mem.join(fa, ", ", s.peers), .is_section = false, .edit_idx = null };
+            lc += 1;
         }
     }
 
-    // Render visible lines.
-    for (lines) |line| {
-        if (row >= scroll and row - scroll < win.height) {
-            _ = win.print(&.{.{ .text = line.text, .style = line.style }}, .{ .row_offset = row - scroll, .wrap = .none });
+    // Render.
+    const scroll = state.settings_scroll;
+    for (lines_buf[0..lc], 0..) |line, li| {
+        const vr = @as(u16, @intCast(li));
+        if (vr < scroll or vr - scroll >= win.height) continue;
+        const dr = vr - scroll;
+
+        if (line.is_section) {
+            _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "  {s}", .{line.label}), .style = sec_style }}, .{ .row_offset = dr, .wrap = .none });
+            continue;
         }
-        row += 1;
+        if (line.label.len == 0) continue; // blank separator
+
+        const is_editable = line.edit_idx != null and !read_only;
+        const is_selected = is_editable and line.edit_idx.? == state.settings_row;
+        const is_editing_this = is_selected and state.settings_editing;
+
+        // Label.
+        const label_text = try std.fmt.allocPrint(fa, "  {s:<18}", .{line.label});
+        _ = win.print(&.{.{ .text = label_text, .style = lbl_style }}, .{ .row_offset = dr, .wrap = .none });
+
+        // Value field.
+        const field_w: u16 = if (win.width > LABEL_W + 4) win.width - LABEL_W - 4 else 10;
+        const style = if (is_editing_this) sel_style else if (is_selected) sel_style else if (is_editable) val_style else ro_style;
+        const val = line.value;
+        const val_trunc = val[0..@min(val.len, field_w)];
+        const pad_n = field_w -| @as(u16, @intCast(val_trunc.len));
+        const padded = try fa.alloc(u8, pad_n);
+        @memset(padded, ' ');
+        _ = win.print(&.{.{ .text = val_trunc, .style = style }}, .{ .col_offset = LABEL_W + 2, .row_offset = dr, .wrap = .none });
+        _ = win.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(val_trunc.len)), .row_offset = dr, .wrap = .none });
+
+        // Cursor for text editing.
+        if (is_editing_this and (state.settings_row == 3 or state.settings_row == 4)) {
+            const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+            const cur = @min(state.settings_cursor, val.len);
+            const ch: []const u8 = if (cur < val.len) val[cur..][0..1] else " ";
+            _ = win.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(cur)), .row_offset = dr, .wrap = .none });
+        }
+
+        // Hint for selected editable field.
+        if (is_selected and !is_editing_this) {
+            const hint = switch (line.edit_idx.?) {
+                0 => "  \xe2\x86\x90/\xe2\x86\x92 or Space: cycle",
+                1, 2 => "  Space: toggle",
+                3, 4 => "  Enter: edit",
+                else => "",
+            };
+            _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(val_trunc.len)) + pad_n, .row_offset = dr, .wrap = .none });
+        }
     }
-    for (sync_lines[0..sync_count]) |line| {
-        if (row >= scroll and row - scroll < win.height) {
-            _ = win.print(&.{.{ .text = line.text, .style = line.style }}, .{ .row_offset = row - scroll, .wrap = .none });
-        }
-        row += 1;
+
+    // Bottom hint.
+    if (win.height > 1) {
+        const bh = if (state.settings_editing) "  Esc: cancel  Enter: save" else "  j/k: navigate  Enter: save config + reload";
+        _ = win.print(&.{.{ .text = bh, .style = hint_style }}, .{ .row_offset = win.height - 1, .wrap = .none });
     }
 }
 
-fn handleSettingsKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
-    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-        state.settings_scroll +|= 1;
-    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-        state.settings_scroll -|= 1;
+fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    const cfg = server.cfg;
+    const read_only = cfg.admin_ssh.read_only;
+
+    if (state.settings_editing) {
+        // Text editing mode (fields 3=port, 4=bind).
+        if (key.matches(vaxis.Key.escape, .{})) {
+            state.settings_editing = false;
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            // Apply the edit.
+            const val = state.settings_buf[0..state.settings_buf_len];
+            if (state.settings_row == 3) {
+                cfg.metrics.http_port = std.fmt.parseInt(u16, val, 10) catch cfg.metrics.http_port;
+            } else if (state.settings_row == 4) {
+                replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), val);
+            }
+            state.settings_editing = false;
+            settingsSaveAndReload(server, state);
+            return;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (state.settings_cursor > 0 and state.settings_buf_len > 0) {
+                const pos = state.settings_cursor;
+                if (pos < state.settings_buf_len) {
+                    std.mem.copyForwards(u8, state.settings_buf[pos - 1 ..], state.settings_buf[pos..state.settings_buf_len]);
+                }
+                state.settings_buf_len -= 1;
+                state.settings_cursor -= 1;
+            }
+        } else if (key.matches(vaxis.Key.left, .{})) {
+            if (state.settings_cursor > 0) state.settings_cursor -= 1;
+        } else if (key.matches(vaxis.Key.right, .{})) {
+            if (state.settings_cursor < state.settings_buf_len) state.settings_cursor += 1;
+        } else if (key.matches(vaxis.Key.home, .{})) {
+            state.settings_cursor = 0;
+        } else if (key.matches(vaxis.Key.end, .{})) {
+            state.settings_cursor = state.settings_buf_len;
+        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+            if (state.settings_buf_len < state.settings_buf.len) {
+                const pos = state.settings_cursor;
+                if (pos < state.settings_buf_len) {
+                    std.mem.copyBackwards(u8, state.settings_buf[pos + 1 ..], state.settings_buf[pos..state.settings_buf_len]);
+                }
+                state.settings_buf[pos] = @intCast(key.codepoint);
+                state.settings_buf_len += 1;
+                state.settings_cursor += 1;
+            }
+        }
+        return;
     }
+
+    // Navigation mode.
+    if (read_only) {
+        // Read-only: only scroll.
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) state.settings_scroll +|= 1;
+        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) state.settings_scroll -|= 1;
+        return;
+    }
+
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
+        if (state.settings_row + 1 < SETTINGS_EDITABLE_COUNT) state.settings_row += 1;
+    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        state.settings_row -|= 1;
+    } else if (key.matches(' ', .{}) or key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.right, .{})) {
+        // Toggle/cycle for fields 0-2.
+        switch (state.settings_row) {
+            0 => { // log_level: cycle
+                const levels = [_]config_mod.LogLevel{ .err, .warn, .info, .verbose, .debug };
+                var idx: usize = 0;
+                for (levels, 0..) |l, i| {
+                    if (l == cfg.log_level) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (key.matches(vaxis.Key.left, .{})) {
+                    idx = if (idx == 0) levels.len - 1 else idx - 1;
+                } else {
+                    idx = (idx + 1) % levels.len;
+                }
+                cfg.log_level = levels[idx];
+                settingsSaveAndReload(server, state);
+            },
+            1 => { // metrics.collect: toggle
+                cfg.metrics.collect = !cfg.metrics.collect;
+                settingsSaveAndReload(server, state);
+            },
+            2 => { // metrics.http_enable: toggle
+                cfg.metrics.http_enable = !cfg.metrics.http_enable;
+                settingsSaveAndReload(server, state);
+            },
+            else => {},
+        }
+    } else if (key.matches(vaxis.Key.enter, .{})) {
+        // Enter text editing for fields 3-4.
+        if (state.settings_row == 3) {
+            const port_str = std.fmt.bufPrint(&state.settings_buf, "{d}", .{cfg.metrics.http_port}) catch "";
+            state.settings_buf_len = port_str.len;
+            state.settings_cursor = port_str.len;
+            state.settings_editing = true;
+        } else if (state.settings_row == 4) {
+            const bind = cfg.metrics.http_bind;
+            const n = @min(bind.len, state.settings_buf.len);
+            @memcpy(state.settings_buf[0..n], bind[0..n]);
+            state.settings_buf_len = n;
+            state.settings_cursor = n;
+            state.settings_editing = true;
+        } else {
+            // For toggle fields, Enter also saves.
+            settingsSaveAndReload(server, state);
+        }
+    }
+}
+
+fn settingsSaveAndReload(server: *AdminServer, state: *TuiState) void {
+    config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch return;
+    triggerReload(state);
 }
 
 // ---------------------------------------------------------------------------
