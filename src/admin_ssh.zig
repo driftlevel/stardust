@@ -1958,46 +1958,26 @@ fn renderStatsTab(
 /// Box is `w` columns wide, `h` rows tall.
 fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.Style) void {
     if (w < 2 or h < 2) return;
-    // Clamp to buffer capacity: (w-2) inner chars * 3 bytes + 6 for corners.
-    const max_inner: u16 = 254; // 254 * 3 + 6 = 768
-    const clamped_w = @min(w, max_inner + 2);
-    _ = &clamped_w; // suppress unused
 
-    // Top and bottom border strings. Each inner cell is 3 bytes (UTF-8 box char).
-    var top_buf: [768]u8 = undefined;
-    var bot_buf: [768]u8 = undefined;
-    const inner = @min(w - 2, max_inner);
-    top_buf[0] = '\xe2';
-    top_buf[1] = '\x94';
-    top_buf[2] = '\x8c'; // ┌
-    var i: usize = 3;
-    var n: usize = 0;
-    while (n < inner) : (n += 1) {
-        top_buf[i] = '\xe2';
-        top_buf[i + 1] = '\x94';
-        top_buf[i + 2] = '\x80'; // ─
-        bot_buf[i] = '\xe2';
-        bot_buf[i + 1] = '\x94';
-        bot_buf[i + 2] = '\x80';
-        i += 3;
+    // Draw character-by-character to avoid UTF-8 string assembly issues.
+    // Corners.
+    _ = win.print(&.{.{ .text = "\xe2\x94\x8c", .style = style }}, .{ .col_offset = col, .row_offset = row, .wrap = .none }); // ┌
+    _ = win.print(&.{.{ .text = "\xe2\x94\x90", .style = style }}, .{ .col_offset = col + w - 1, .row_offset = row, .wrap = .none }); // ┐
+    _ = win.print(&.{.{ .text = "\xe2\x94\x94", .style = style }}, .{ .col_offset = col, .row_offset = row + h - 1, .wrap = .none }); // └
+    _ = win.print(&.{.{ .text = "\xe2\x94\x98", .style = style }}, .{ .col_offset = col + w - 1, .row_offset = row + h - 1, .wrap = .none }); // ┘
+
+    // Top and bottom horizontal edges.
+    var cx: u16 = 1;
+    while (cx < w - 1) : (cx += 1) {
+        _ = win.print(&.{.{ .text = "\xe2\x94\x80", .style = style }}, .{ .col_offset = col + cx, .row_offset = row, .wrap = .none }); // ─
+        _ = win.print(&.{.{ .text = "\xe2\x94\x80", .style = style }}, .{ .col_offset = col + cx, .row_offset = row + h - 1, .wrap = .none }); // ─
     }
-    top_buf[i] = '\xe2';
-    top_buf[i + 1] = '\x94';
-    top_buf[i + 2] = '\x90'; // ┐
-    bot_buf[0] = '\xe2';
-    bot_buf[1] = '\x94';
-    bot_buf[2] = '\x94'; // └
-    bot_buf[i] = '\xe2';
-    bot_buf[i + 1] = '\x94';
-    bot_buf[i + 2] = '\x98'; // ┘
-    _ = win.print(&.{.{ .text = top_buf[0 .. i + 3], .style = style }}, .{ .col_offset = col, .row_offset = row, .wrap = .none });
-    _ = win.print(&.{.{ .text = bot_buf[0 .. i + 3], .style = style }}, .{ .col_offset = col, .row_offset = row + h - 1, .wrap = .none });
 
-    // Side borders.
+    // Left and right vertical edges.
     var r: u16 = 1;
     while (r < h - 1) : (r += 1) {
         _ = win.print(&.{.{ .text = "\xe2\x94\x82", .style = style }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none }); // │
-        _ = win.print(&.{.{ .text = "\xe2\x94\x82", .style = style }}, .{ .col_offset = col + w - 1, .row_offset = row + r, .wrap = .none });
+        _ = win.print(&.{.{ .text = "\xe2\x94\x82", .style = style }}, .{ .col_offset = col + w - 1, .row_offset = row + r, .wrap = .none }); // │
     }
 }
 
