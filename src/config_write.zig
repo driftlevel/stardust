@@ -236,6 +236,7 @@ pub fn upsertReservation(
     ip: []const u8,
     hostname: ?[]const u8,
     client_id: ?[]const u8,
+    dhcp_options: ?std.StringHashMap([]const u8),
 ) !bool {
     // Check if MAC already exists in reservations
     for (pool.reservations) |*r| {
@@ -247,21 +248,70 @@ pub fn upsertReservation(
             r.hostname = if (hostname) |h| try allocator.dupe(u8, h) else null;
             if (r.client_id) |c| allocator.free(c);
             r.client_id = if (client_id) |c| try allocator.dupe(u8, c) else null;
+            // Replace dhcp_options: free old, set new
+            if (r.dhcp_options) |*old_opts| {
+                var oit = old_opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                old_opts.deinit();
+            }
+            r.dhcp_options = if (dhcp_options) |opts| try dupeOptionsMap(allocator, opts) else null;
             return false;
         }
     }
 
-    // Append new entry
-    const new_res = config_mod.Reservation{
-        .mac = try allocator.dupe(u8, mac),
-        .ip = try allocator.dupe(u8, ip),
-        .hostname = if (hostname) |h| try allocator.dupe(u8, h) else null,
-        .client_id = if (client_id) |c| try allocator.dupe(u8, c) else null,
+    // Append new entry — allocate each field with errdefer so realloc failure doesn't leak.
+    const new_mac = try allocator.dupe(u8, mac);
+    errdefer allocator.free(new_mac);
+    const new_ip = try allocator.dupe(u8, ip);
+    errdefer allocator.free(new_ip);
+    const new_hostname = if (hostname) |h| try allocator.dupe(u8, h) else null;
+    errdefer if (new_hostname) |h| allocator.free(h);
+    const new_client_id = if (client_id) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (new_client_id) |c| allocator.free(c);
+    const new_opts = if (dhcp_options) |opts| try dupeOptionsMap(allocator, opts) else null;
+    errdefer if (new_opts) |*o| {
+        var oit = @constCast(o).iterator();
+        while (oit.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        @constCast(o).deinit();
     };
     const new_slice = try allocator.realloc(pool.reservations, pool.reservations.len + 1);
     pool.reservations = new_slice;
-    pool.reservations[pool.reservations.len - 1] = new_res;
+    pool.reservations[pool.reservations.len - 1] = .{
+        .mac = new_mac,
+        .ip = new_ip,
+        .hostname = new_hostname,
+        .client_id = new_client_id,
+        .dhcp_options = new_opts,
+    };
     return true;
+}
+
+/// Deep-copy a StringHashMap([]const u8), duplicating all keys and values.
+fn dupeOptionsMap(allocator: std.mem.Allocator, src: std.StringHashMap([]const u8)) !std.StringHashMap([]const u8) {
+    var dst = std.StringHashMap([]const u8).init(allocator);
+    errdefer {
+        var it = dst.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        dst.deinit();
+    }
+    var it = src.iterator();
+    while (it.next()) |entry| {
+        const k = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(k);
+        const v = try allocator.dupe(u8, entry.value_ptr.*);
+        errdefer allocator.free(v);
+        try dst.put(k, v);
+    }
+    return dst;
 }
 
 /// Remove a reservation from a pool by MAC address.
@@ -271,12 +321,20 @@ pub fn removeReservation(
     pool: *config_mod.PoolConfig,
     mac: []const u8,
 ) bool {
-    for (pool.reservations, 0..) |r, i| {
+    for (pool.reservations, 0..) |*r, i| {
         if (std.mem.eql(u8, r.mac, mac)) {
             allocator.free(r.mac);
             allocator.free(r.ip);
             if (r.hostname) |h| allocator.free(h);
             if (r.client_id) |c| allocator.free(c);
+            if (r.dhcp_options) |*opts| {
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                opts.deinit();
+            }
             // Shift remaining elements down
             for (i + 1..pool.reservations.len) |j| {
                 pool.reservations[j - 1] = pool.reservations[j];
@@ -423,6 +481,160 @@ test "renderConfig round-trips global fields" {
     try std.testing.expect(std.mem.indexOf(u8, out, "port: 2267") != null);
 }
 
+test "renderConfig includes mac_classes" {
+    const allocator = std.testing.allocator;
+
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    try mc_opts.put(
+        try allocator.dupe(u8, "66"),
+        try allocator.dupe(u8, "tftp.phones.local"),
+    );
+    var mac_classes_arr = [_]config_mod.MacClass{.{
+        .name = try allocator.dupe(u8, "IP Phones"),
+        .match = try allocator.dupe(u8, "64:16:7f"),
+        .dhcp_options = mc_opts,
+    }};
+    const mac_classes_slice = try allocator.dupe(config_mod.MacClass, &mac_classes_arr);
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pools = [_]config_mod.PoolConfig{.{
+        .subnet = "10.0.0.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "10.0.0.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+    }};
+
+    var cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = "0.0.0.0",
+        .state_dir = "/tmp",
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = &pools,
+        .mac_classes = mac_classes_slice,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = "0.0.0.0", .read_only = false, .host_key = "", .authorized_keys = "" },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = "127.0.0.1" },
+    };
+    defer {
+        for (cfg.mac_classes) |*mc| mc.deinit(allocator);
+        allocator.free(cfg.mac_classes);
+        pool_opts.deinit();
+    }
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderConfig(buf.writer(allocator), &cfg);
+    const out = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "mac_classes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "  - name: IP Phones") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    match: \"64:16:7f\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    dhcp_options:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      66: tftp.phones.local") != null);
+}
+
+test "renderConfig includes reservation dhcp_options" {
+    const allocator = std.testing.allocator;
+
+    var res_opts = std.StringHashMap([]const u8).init(allocator);
+    try res_opts.put(
+        try allocator.dupe(u8, "67"),
+        try allocator.dupe(u8, "custom-boot.img"),
+    );
+    var reservations = [_]config_mod.Reservation{.{
+        .mac = try allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try allocator.dupe(u8, "10.0.0.50"),
+        .hostname = try allocator.dupe(u8, "myhost"),
+        .client_id = null,
+        .dhcp_options = res_opts,
+    }};
+    const res_slice = try allocator.dupe(config_mod.Reservation, &reservations);
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pools = [_]config_mod.PoolConfig{.{
+        .subnet = "10.0.0.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "10.0.0.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = res_slice,
+        .static_routes = &.{},
+    }};
+
+    const cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = "0.0.0.0",
+        .state_dir = "/tmp",
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = &pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = "0.0.0.0", .read_only = false, .host_key = "", .authorized_keys = "" },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = "127.0.0.1" },
+    };
+    defer {
+        for (res_slice) |*r| {
+            allocator.free(r.mac);
+            allocator.free(r.ip);
+            if (r.hostname) |h| allocator.free(h);
+            if (r.dhcp_options) |*o| {
+                var oit = o.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                o.deinit();
+            }
+        }
+        allocator.free(res_slice);
+        pool_opts.deinit();
+    }
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderConfig(buf.writer(allocator), &cfg);
+    const out = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "    reservations:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      - mac: aa:bb:cc:dd:ee:ff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        ip: 10.0.0.50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        hostname: myhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        dhcp_options:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "          67: custom-boot.img") != null);
+}
+
 test "upsertReservation adds new entry" {
     const allocator = std.testing.allocator;
 
@@ -450,18 +662,26 @@ test "upsertReservation adds new entry" {
         .static_routes = &.{},
     };
     defer {
-        for (pool.reservations) |r| {
+        for (pool.reservations) |*r| {
             allocator.free(r.mac);
             allocator.free(r.ip);
             if (r.hostname) |h| allocator.free(h);
             if (r.client_id) |c| allocator.free(c);
+            if (r.dhcp_options) |*opts| {
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                opts.deinit();
+            }
         }
         allocator.free(pool.reservations);
         pool.dhcp_options.deinit();
     }
     reservations = pool.reservations;
 
-    const added = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "myhost", null);
+    const added = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "myhost", null, null);
     try std.testing.expect(added == true);
     try std.testing.expectEqual(@as(usize, 1), pool.reservations.len);
     try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", pool.reservations[0].mac);
@@ -502,17 +722,25 @@ test "upsertReservation updates existing entry" {
         .static_routes = &.{},
     };
     defer {
-        for (pool.reservations) |r| {
+        for (pool.reservations) |*r| {
             allocator.free(r.mac);
             allocator.free(r.ip);
             if (r.hostname) |h| allocator.free(h);
             if (r.client_id) |c| allocator.free(c);
+            if (r.dhcp_options) |*opts| {
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                opts.deinit();
+            }
         }
         allocator.free(pool.reservations);
         pool.dhcp_options.deinit();
     }
 
-    const added = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.55", "newhost", null);
+    const added = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.55", "newhost", null, null);
     try std.testing.expect(added == false); // updated, not added
     try std.testing.expectEqual(@as(usize, 1), pool.reservations.len);
     try std.testing.expectEqualStrings("192.168.1.55", pool.reservations[0].ip);
@@ -710,4 +938,131 @@ test "removePool removes by index and frees resources" {
     try std.testing.expectEqual(@as(usize, 1), cfg.pools.len);
     try std.testing.expectEqualStrings("172.16.0.0", cfg.pools[0].subnet);
     try std.testing.expectEqual(@as(u32, 1800), cfg.pools[0].lease_time);
+}
+
+test "upsertReservation with dhcp_options" {
+    const allocator = std.testing.allocator;
+
+    var reservations = try allocator.alloc(config_mod.Reservation, 0);
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = reservations,
+        .static_routes = &.{},
+    };
+    defer {
+        for (pool.reservations) |*r| {
+            allocator.free(r.mac);
+            allocator.free(r.ip);
+            if (r.hostname) |h| allocator.free(h);
+            if (r.client_id) |c| allocator.free(c);
+            if (r.dhcp_options) |*opts| {
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                opts.deinit();
+            }
+        }
+        allocator.free(pool.reservations);
+        pool.dhcp_options.deinit();
+    }
+    reservations = pool.reservations;
+
+    // Build source options map
+    var src_opts = std.StringHashMap([]const u8).init(allocator);
+    defer src_opts.deinit();
+    try src_opts.put("66", "tftp.local");
+    try src_opts.put("67", "boot.img");
+
+    // Add reservation with options
+    const added = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "myhost", null, src_opts);
+    try std.testing.expect(added == true);
+    try std.testing.expectEqual(@as(usize, 1), pool.reservations.len);
+    const r = pool.reservations[0];
+    try std.testing.expect(r.dhcp_options != null);
+    try std.testing.expectEqualStrings("tftp.local", r.dhcp_options.?.get("66").?);
+    try std.testing.expectEqualStrings("boot.img", r.dhcp_options.?.get("67").?);
+
+    // Update reservation with different options — old options freed, new stored
+    var new_opts = std.StringHashMap([]const u8).init(allocator);
+    defer new_opts.deinit();
+    try new_opts.put("66", "tftp2.local");
+
+    const updated = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.51", "newhost", null, new_opts);
+    try std.testing.expect(updated == false);
+    const r2 = pool.reservations[0];
+    try std.testing.expect(r2.dhcp_options != null);
+    try std.testing.expectEqualStrings("tftp2.local", r2.dhcp_options.?.get("66").?);
+    try std.testing.expect(r2.dhcp_options.?.get("67") == null); // old key gone
+
+    // Update with null options — clears options
+    const updated2 = try upsertReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff", "192.168.1.51", "newhost", null, null);
+    try std.testing.expect(updated2 == false);
+    try std.testing.expect(pool.reservations[0].dhcp_options == null);
+}
+
+test "removeReservation frees dhcp_options" {
+    const allocator = std.testing.allocator;
+
+    // Create a reservation with dhcp_options
+    var opts = std.StringHashMap([]const u8).init(allocator);
+    try opts.put(try allocator.dupe(u8, "66"), try allocator.dupe(u8, "tftp.local"));
+
+    var initial = [_]config_mod.Reservation{.{
+        .mac = try allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try allocator.dupe(u8, "192.168.1.50"),
+        .hostname = null,
+        .client_id = null,
+        .dhcp_options = opts,
+    }};
+    const res_slice = try allocator.dupe(config_mod.Reservation, &initial);
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = res_slice,
+        .static_routes = &.{},
+    };
+    defer {
+        allocator.free(pool.reservations);
+        pool.dhcp_options.deinit();
+    }
+
+    // removeReservation should free the dhcp_options map without leaking
+    const removed = removeReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(removed == true);
+    try std.testing.expectEqual(@as(usize, 0), pool.reservations.len);
 }

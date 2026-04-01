@@ -2176,6 +2176,34 @@ fn saveReservation(server: *AdminServer, form: *const ReservationForm) ?[]const 
         }
     }
 
+    // Build dhcp_options map from form entries.
+    var opts: ?std.StringHashMap([]const u8) = null;
+    if (form.option_count > 0) {
+        var map = std.StringHashMap([]const u8).init(server.allocator);
+        for (form.options[0..form.option_count]) |opt| {
+            if (opt.code_len == 0) continue;
+            const k = server.allocator.dupe(u8, opt.code_buf[0..opt.code_len]) catch return "OutOfMemory";
+            const v = server.allocator.dupe(u8, opt.value_buf[0..opt.value_len]) catch {
+                server.allocator.free(k);
+                return "OutOfMemory";
+            };
+            map.put(k, v) catch {
+                server.allocator.free(k);
+                server.allocator.free(v);
+                return "OutOfMemory";
+            };
+        }
+        opts = map;
+    }
+    defer if (opts) |*m| {
+        var it = m.iterator();
+        while (it.next()) |entry| {
+            server.allocator.free(entry.key_ptr.*);
+            server.allocator.free(entry.value_ptr.*);
+        }
+        m.deinit();
+    };
+
     // Update StateStore.
     server.store.addReservation(mac, ip, hostname, null) catch |err| {
         return @errorName(err);
@@ -2183,7 +2211,7 @@ fn saveReservation(server: *AdminServer, form: *const ReservationForm) ?[]const 
 
     // Update config.yaml.
     if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
-        _ = config_write.upsertReservation(server.allocator, pool, mac, ip, hostname, null) catch |err| {
+        _ = config_write.upsertReservation(server.allocator, pool, mac, ip, hostname, null, opts) catch |err| {
             return @errorName(err);
         };
         config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
@@ -3660,13 +3688,23 @@ fn buildPoolFromFormInner(
     errdefer allocator.free(pool.boot_filename);
     pool.http_boot_url = try allocator.dupe(u8, form.http_boot_url_buf[0..form.http_boot_url_len]);
     errdefer allocator.free(pool.http_boot_url);
+    const dns_server = try allocator.dupe(u8, form.dns_update_server_buf[0..form.dns_update_server_len]);
+    errdefer allocator.free(dns_server);
+    const dns_zone = try allocator.dupe(u8, form.dns_update_zone_buf[0..form.dns_update_zone_len]);
+    errdefer allocator.free(dns_zone);
+    const dns_rev_zone = try allocator.dupe(u8, "");
+    errdefer allocator.free(dns_rev_zone);
+    const dns_key_name = try allocator.dupe(u8, form.dns_update_key_name_buf[0..form.dns_update_key_name_len]);
+    errdefer allocator.free(dns_key_name);
+    const dns_key_file = try allocator.dupe(u8, form.dns_update_key_file_buf[0..form.dns_update_key_file_len]);
+    errdefer allocator.free(dns_key_file);
     pool.dns_update = .{
         .enable = form.dns_update_enable,
-        .server = try allocator.dupe(u8, form.dns_update_server_buf[0..form.dns_update_server_len]),
-        .zone = try allocator.dupe(u8, form.dns_update_zone_buf[0..form.dns_update_zone_len]),
-        .rev_zone = try allocator.dupe(u8, ""),
-        .key_name = try allocator.dupe(u8, form.dns_update_key_name_buf[0..form.dns_update_key_name_len]),
-        .key_file = try allocator.dupe(u8, form.dns_update_key_file_buf[0..form.dns_update_key_file_len]),
+        .server = dns_server,
+        .zone = dns_zone,
+        .rev_zone = dns_rev_zone,
+        .key_name = dns_key_name,
+        .key_file = dns_key_file,
         .lease_time = lease_time,
     };
     pool.dhcp_options = std.StringHashMap([]const u8).init(allocator);

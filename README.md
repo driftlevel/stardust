@@ -72,6 +72,8 @@ kill -HUP $(pidof stardust)
 | 53 | Message type |
 | 54 | Server identifier |
 | 55 | Parameter Request List filtering — only requested options are sent |
+| 58 | Renewal (T1) time — half of lease time |
+| 59 | Rebinding (T2) time — 87.5% of lease time |
 | 60 | Vendor class identifier (UEFI HTTP boot echo) |
 | 61 | Client identifier — used for lease tracking across MAC changes |
 | 66 | TFTP server name (PXE boot) |
@@ -204,14 +206,14 @@ ssh -p 2267 admin@dhcp-server
 | 1 Leases | Live lease table with sort, filter, yank (copy to clipboard) |
 | 2 Stats | Per-pool capacity bars, DHCP message counters, uptime |
 | 3 Pools | View/edit/add/remove pool configurations with diff preview |
-| 4 Settings | Read-only global config view (general, SSH, metrics, sync) |
+| 4 Settings | Global config (log level, metrics, allocation mode); editable fields with deferred save |
 
 **Capabilities:**
 - Full mouse support — click tabs, sort columns, select rows, scroll
 - Keyboard navigation — j/k, arrows, Tab/Shift-Tab, Home/End
 - Pool editing — scrollable form with all fields; static routes and DHCP
   options edited via sub-modals; diff/confirm screen shows sync impact
-- Reservation management — add/edit/delete with save confirmation
+- Reservation management — add/edit/delete with inline DHCP option editing and option lookup
 - Force-release — evict any lease (dynamic or reserved) from the TUI
 - Config write-back — changes saved atomically and reloaded via SIGHUP
 - `read_only` mode — blocks all writes; hides sensitive key paths

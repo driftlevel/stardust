@@ -658,6 +658,14 @@ fn parseReservations(allocator: std.mem.Allocator, pool: *PoolConfig, list: anyt
 
         // Parse optional per-reservation dhcp_options.
         var res_opts: ?std.StringHashMap([]const u8) = null;
+        errdefer if (res_opts) |*opts| {
+            var oit = opts.iterator();
+            while (oit.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            opts.deinit();
+        };
         if (m.get("dhcp_options")) |opts_val| {
             if (opts_val.asMap()) |opts_map| {
                 res_opts = std.StringHashMap([]const u8).init(allocator);
@@ -848,6 +856,14 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
         }
 
         var opts = std.StringHashMap([]const u8).init(allocator);
+        errdefer {
+            var oit = opts.iterator();
+            while (oit.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            opts.deinit();
+        }
         if (m.get("dhcp_options")) |opts_val| {
             if (opts_val.asMap()) |opts_map| {
                 var oit = opts_map.iterator();
@@ -861,9 +877,13 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
             }
         }
 
+        const name_duped = try allocator.dupe(u8, name_str);
+        errdefer allocator.free(name_duped);
+        const match_duped = try allocator.dupe(u8, match_str);
+
         classes[idx] = .{
-            .name = try allocator.dupe(u8, name_str),
-            .match = try allocator.dupe(u8, match_str),
+            .name = name_duped,
+            .match = match_duped,
             .dhcp_options = opts,
         };
         idx += 1;

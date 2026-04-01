@@ -32,7 +32,7 @@ main.zig → config.zig + state.zig + dns.zig + dhcp.zig + admin_ssh.zig + sync.
 - **src/dns.zig** — RFC 2136 dynamic DNS updates with TSIG authentication (HMAC-SHA256 / HMAC-MD5). Sends A and PTR record updates on lease grant/release. Parses BIND-format key files.
 - **src/probe.zig** — Pre-offer conflict detection. ARP probe (RFC 5227 style, SPA=0.0.0.0) for local networks; ICMP echo for relayed networks.
 - **src/sync.zig** — Active-active lease synchronisation over UDP with AES-256-GCM encryption. HELLO handshake with pool hash verification. Last-write-wins conflict resolution. Periodic lease hash anti-entropy.
-- **src/admin_ssh.zig** — SSH admin TUI server (via libssh + libvaxis). Four tabs (Leases, Stats, Pools, Settings). Pool form with scrollable fields, sub-modals for static routes and DHCP options. Reservation form with cursor editing. All modals have [X] close buttons, borders, and mouse support.
+- **src/admin_ssh.zig** — SSH admin TUI server (via libssh + libvaxis). Four tabs (Leases, Stats, Pools, Settings). Pool form with scrollable fields, sub-modals for static routes and DHCP options. Reservation form with inline DHCP option editing and option lookup modal. Settings tab with editable fields (log level, metrics, allocation mode) and deferred save. All modals have [X] close buttons, borders, and mouse support.
 - **src/config_write.zig** — YAML serializer for Config. Atomic write (temp file + rename). Helpers for pool/reservation mutations used by TUI and sync.
 
 ## Dependencies

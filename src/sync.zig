@@ -683,6 +683,7 @@ pub const SyncManager = struct {
                     incoming.ip,
                     incoming.hostname,
                     incoming.client_id,
+                    null,
                 ) catch |err| {
                     std.log.warn("sync: failed to update config.yaml for reservation {s}: {s}", .{ incoming.mac, @errorName(err) });
                     return;

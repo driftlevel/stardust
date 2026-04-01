@@ -4463,3 +4463,168 @@ test "matchMacClass: two-octet prefix" {
     try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "aa:bb"));
     try std.testing.expect(!matchMacClass("aa:bc:cc:dd:ee:ff", "aa:bb"));
 }
+
+test "collectOverrides: priority pool < mac_class < reservation" {
+    const allocator = std.testing.allocator;
+
+    // Pool options: "66" = "pool-tftp", "15" = "pool.lan"
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    defer pool_opts.deinit();
+    try pool_opts.put("66", "pool-tftp");
+    try pool_opts.put("15", "pool.lan");
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+
+    // MAC class (OUI "aa:bb:cc") overrides "66", adds "67"
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    defer mc_opts.deinit();
+    try mc_opts.put("66", "class-tftp");
+    try mc_opts.put("67", "class-boot.img");
+
+    var mac_classes = [_]config_mod.MacClass{.{
+        .name = "TestClass",
+        .match = "aa:bb:cc",
+        .dhcp_options = mc_opts,
+    }};
+
+    // Reservation overrides "66"
+    var res_opts = std.StringHashMap([]const u8).init(allocator);
+    defer res_opts.deinit();
+    try res_opts.put("66", "res-tftp");
+
+    const reservation = config_mod.Reservation{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = null,
+        .client_id = null,
+        .dhcp_options = res_opts,
+    };
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", &reservation, &mac_classes);
+    defer overrides.deinit();
+
+    // "66" should be reservation value (highest priority)
+    try std.testing.expectEqualStrings("res-tftp", overrides.get("66").?);
+    // "67" should be MAC class value (pool didn't set it)
+    try std.testing.expectEqualStrings("class-boot.img", overrides.get("67").?);
+    // "15" should be pool value (no override from class or reservation)
+    try std.testing.expectEqualStrings("pool.lan", overrides.get("15").?);
+}
+
+test "collectOverrides: most specific MAC class wins" {
+    const allocator = std.testing.allocator;
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    defer pool.dhcp_options.deinit();
+
+    // OUI class (less specific) and exact MAC class (more specific)
+    var oui_opts = std.StringHashMap([]const u8).init(allocator);
+    defer oui_opts.deinit();
+    try oui_opts.put("66", "oui-tftp");
+
+    var exact_opts = std.StringHashMap([]const u8).init(allocator);
+    defer exact_opts.deinit();
+    try exact_opts.put("66", "exact-tftp");
+
+    var mac_classes = [_]config_mod.MacClass{
+        .{ .name = "OUI", .match = "aa:bb:cc", .dhcp_options = oui_opts },
+        .{ .name = "Exact", .match = "aa:bb:cc:dd:ee:ff", .dhcp_options = exact_opts },
+    };
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
+    defer overrides.deinit();
+
+    // More specific (exact MAC) should win over OUI prefix
+    try std.testing.expectEqualStrings("exact-tftp", overrides.get("66").?);
+}
+
+test "collectOverrides: no matches returns pool options only" {
+    const allocator = std.testing.allocator;
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    defer pool_opts.deinit();
+    try pool_opts.put("66", "pool-tftp");
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+
+    // MAC class that doesn't match
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    defer mc_opts.deinit();
+    try mc_opts.put("66", "class-tftp");
+
+    var mac_classes = [_]config_mod.MacClass{.{
+        .name = "Other",
+        .match = "ff:ff:ff",
+        .dhcp_options = mc_opts,
+    }};
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
+    defer overrides.deinit();
+
+    // Only pool option should be present
+    try std.testing.expectEqualStrings("pool-tftp", overrides.get("66").?);
+    try std.testing.expectEqual(@as(usize, 1), overrides.count());
+}
