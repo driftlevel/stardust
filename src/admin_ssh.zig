@@ -593,8 +593,7 @@ const PoolForm = struct {
     err_buf: [120]u8 = [_]u8{0} ** 120,
     err_len: usize = 0,
 
-    const FIELD_COUNT: u8 = 24; // 0..23 (22=Static Routes, 23=DHCP Options)
-    const VISIBLE_ROWS: u8 = 12;
+    const FIELD_COUNT: u8 = pool_field_meta.len;
 
     fn isNew(self: *const PoolForm) bool {
         return self.editing_index == null;
@@ -2962,7 +2961,9 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     // Build lines.
-    var lines: [50]struct { text: []const u8, style: vaxis.Style } = undefined;
+    // Each field = 1 line, each section = 2 lines (blank + header), plus 1 summary.
+    const MAX_LINES = pool_field_meta.len * 3 + 1;
+    var lines: [MAX_LINES]struct { text: []const u8, style: vaxis.Style } = undefined;
     var lcount: usize = 0;
 
     const fields = pool_field_meta;
@@ -3267,7 +3268,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const fw = @as(usize, FIELD_W);
         var vis_start: usize = 0;
         var cursor_vis: usize = 0;
-        if (is_active and fi != 14) {
+        if (is_active and fi != 17) {
             const cur = @min(form.cursor, val.len);
             if (cur >= fw) {
                 vis_start = cur - fw + 1;
@@ -3281,7 +3282,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = row, .wrap = .none });
 
         // Cursor block: show character under cursor with inverted colors.
-        if (is_active and fi != 14) {
+        if (is_active and fi != 17) {
             const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
             const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
             if (cursor_col < BOX_W -| 1) {
