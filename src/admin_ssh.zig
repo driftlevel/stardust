@@ -519,7 +519,7 @@ const OptionEntry = struct {
 const PoolForm = struct {
     editing_index: ?usize = null, // null = new pool
     active_field: u8 = 0,
-    scroll_offset: u8 = 0,
+    scroll_row: u16 = 0,
 
     // --- Network ---
     subnet_buf: [20]u8 = [_]u8{0} ** 20,
@@ -3051,24 +3051,24 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
             }
         },
         .pool_form => {
-            // Pool form rows start at 2 inside the box, but fields are scrolled.
-            // Map click_row to the field index via the scroll offset and section headers.
+            // Map click position to field index using scroll_row.
             const rel = click_row -| modal_y;
             if (rel < 2) return; // title area
-            // Walk through rendered fields to find which one was clicked.
-            var row: u16 = 2;
-            var fi: u8 = state.pool_form.scroll_offset;
+            // The clicked absolute row = scroll_row + (rel - 2).
+            const clicked_abs = state.pool_form.scroll_row + (rel - 2);
+            // Walk through fields to find which one matches.
+            var abs: u16 = 0;
+            var fi: u8 = 0;
             while (fi < PoolForm.FIELD_COUNT) : (fi += 1) {
                 if (pool_field_meta[fi].section != null) {
-                    row += 1; // blank line
-                    row += 1; // section header
+                    abs += 2; // blank line + section header
                 }
-                if (row == rel) {
+                if (abs == clicked_abs) {
                     state.pool_form.active_field = fi;
                     state.pool_form.cursor = poolFormFieldLen(&state.pool_form, fi);
                     return;
                 }
-                row += 1;
+                abs += 1;
             }
         },
         .res_option_edit => {
@@ -3209,10 +3209,10 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     const FIELD_W: u16 = BOX_W -| LABEL_W -| 3; // 1 left border + 2 right margin
 
     // Compute absolute rendered row for each field (accounting for section headers
-    // and blank lines), then set scroll_offset to center the active field while
-    // clamping so the last field always has a blank line below it.
+    // and blank lines), then scroll to center the active field.
+    var field_rows: [PoolForm.FIELD_COUNT]u16 = undefined;
+    var total_rows: u16 = 0;
     {
-        var field_rows: [PoolForm.FIELD_COUNT]u16 = undefined;
         var r: u16 = 0;
         for (0..PoolForm.FIELD_COUNT) |fi| {
             if (pool_field_meta[fi].section != null) {
@@ -3222,47 +3222,54 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             field_rows[fi] = r;
             r += 1;
         }
-        const total_rows = r;
-        const active_row = field_rows[form.active_field];
-
-        // Target: center active field in the visible area.
-        const half = field_h / 2;
-        var scroll_row: u16 = if (active_row > half) active_row - half else 0;
-
-        // Clamp bottom: ensure last field + 1 blank line fits.
-        // max_scroll_row = total_rows - field_h + 1 (the +1 is the blank line).
-        const max_scroll = if (total_rows + 1 > field_h) total_rows + 1 - field_h else 0;
-        if (scroll_row > max_scroll) scroll_row = max_scroll;
-
-        // Map scroll_row back to a field index (scroll_offset).
-        form.scroll_offset = 0;
-        for (0..PoolForm.FIELD_COUNT) |fi| {
-            if (field_rows[fi] <= scroll_row) {
-                form.scroll_offset = @intCast(fi);
-            }
-        }
+        total_rows = r;
     }
+    const active_row = field_rows[form.active_field];
 
-    var row: u16 = 2; // start below border + title
-    var fi: u8 = form.scroll_offset;
-    while (fi < PoolForm.FIELD_COUNT and row < BOX_H - 2) : (fi += 1) {
+    // Target: center active field in the visible area.
+    const half = field_h / 2;
+    var scroll_row: u16 = if (active_row > half) active_row - half else 0;
+
+    // Clamp bottom: ensure last field + 1 blank line fits.
+    const max_scroll = if (total_rows + 1 > field_h) total_rows + 1 - field_h else 0;
+    if (scroll_row > max_scroll) scroll_row = max_scroll;
+
+    form.scroll_row = scroll_row;
+
+    // Render fields, skipping rows above scroll_row.
+    var abs_row: u16 = 0; // absolute row in the virtual content
+    var draw_row: u16 = 2; // screen row (starts below border + title)
+    var fi: u8 = 0;
+    while (fi < PoolForm.FIELD_COUNT and draw_row < BOX_H - 2) : (fi += 1) {
         const meta = pool_field_meta[fi];
         // Blank line + section header before each group.
         if (meta.section) |sec| {
-            if (row < BOX_H - 2) row += 1; // blank line before section
-            if (row < BOX_H - 2) {
-                const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
-                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
-                row += 1;
-                if (row >= BOX_H - 2) break;
+            // blank line
+            if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                draw_row += 1;
             }
+            abs_row += 1;
+            // section header
+            if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
+                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                draw_row += 1;
+            }
+            abs_row += 1;
+            if (draw_row >= BOX_H - 2) break;
+        }
+
+        // Skip fields above scroll viewport.
+        if (abs_row < scroll_row) {
+            abs_row += 1;
+            continue;
         }
 
         const is_active = fi == form.active_field;
         const style = if (is_active) active_style else field_style;
         const val = poolFormFieldVal(form, fi);
         const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
-        _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
 
         // Value field with horizontal scrolling for active field.
         const fw = @as(usize, FIELD_W);
@@ -3279,7 +3286,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const vis_text = val[vis_start..vis_end];
         const pad_len = fw - vis_text.len;
         const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
-        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
 
         // Cursor block: show character under cursor with inverted colors.
         if (is_active and fi != 17) {
@@ -3288,10 +3295,11 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             if (cursor_col < BOX_W -| 1) {
                 const cur_abs = vis_start + cursor_vis;
                 const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
-                _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
             }
         }
-        row += 1;
+        abs_row += 1;
+        draw_row += 1;
     }
 
     // Hint + error (inside border).
