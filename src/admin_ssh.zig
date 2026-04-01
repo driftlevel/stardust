@@ -4457,14 +4457,14 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
 
     const dirty_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 60 } }, .bg = bg, .bold = true };
 
-    // Show pending values if dirty, otherwise live config values.
+    // Edit indices (visual order): 0=log_level, 1=random_alloc, 2=collect, 3=http_enable, 4=http_port, 5=http_bind
     const edit_vals = [SETTINGS_EDITABLE_COUNT][]const u8{
         if (state.settings_dirty[0]) @tagName(state.settings_pending_log_level) else @tagName(cfg.log_level),
-        if (state.settings_dirty[1]) (if (state.settings_pending_collect) "true" else "false") else (if (cfg.metrics.collect) "true" else "false"),
-        if (state.settings_dirty[2]) (if (state.settings_pending_http_enable) "true" else "false") else (if (cfg.metrics.http_enable) "true" else "false"),
-        if (state.settings_editing and state.settings_row == 3) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[3]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
-        if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[4]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
-        if (state.settings_dirty[5]) (if (state.settings_pending_random_alloc) "true" else "false") else (if (cfg.pool_allocation_random) "true" else "false"),
+        if (state.settings_dirty[1]) (if (state.settings_pending_random_alloc) "true" else "false") else (if (cfg.pool_allocation_random) "true" else "false"),
+        if (state.settings_dirty[2]) (if (state.settings_pending_collect) "true" else "false") else (if (cfg.metrics.collect) "true" else "false"),
+        if (state.settings_dirty[3]) (if (state.settings_pending_http_enable) "true" else "false") else (if (cfg.metrics.http_enable) "true" else "false"),
+        if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[4]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
+        if (state.settings_editing and state.settings_row == 5) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[5]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
     };
 
     const LABEL_W: u16 = 24;
@@ -4484,19 +4484,19 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     lc += 1;
     lines_buf[lc] = .{ .label = "Log Level", .value = edit_vals[0], .is_section = false, .edit_idx = 0 };
     lc += 1;
-    lines_buf[lc] = .{ .label = "Random IP Allocation", .value = edit_vals[5], .is_section = false, .edit_idx = 5 };
+    lines_buf[lc] = .{ .label = "Random IP Allocation", .value = edit_vals[1], .is_section = false, .edit_idx = 1 };
     lc += 1;
     lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
     lc += 1;
     lines_buf[lc] = .{ .label = "-- Metrics --", .value = "", .is_section = true, .edit_idx = null };
     lc += 1;
-    lines_buf[lc] = .{ .label = "Collect", .value = edit_vals[1], .is_section = false, .edit_idx = 1 };
+    lines_buf[lc] = .{ .label = "Collect", .value = edit_vals[2], .is_section = false, .edit_idx = 2 };
     lc += 1;
-    lines_buf[lc] = .{ .label = "HTTP Enable", .value = edit_vals[2], .is_section = false, .edit_idx = 2 };
+    lines_buf[lc] = .{ .label = "HTTP Enable", .value = edit_vals[3], .is_section = false, .edit_idx = 3 };
     lc += 1;
-    lines_buf[lc] = .{ .label = "HTTP Port", .value = edit_vals[3], .is_section = false, .edit_idx = 3 };
+    lines_buf[lc] = .{ .label = "HTTP Port", .value = edit_vals[4], .is_section = false, .edit_idx = 4 };
     lc += 1;
-    lines_buf[lc] = .{ .label = "HTTP Bind", .value = edit_vals[4], .is_section = false, .edit_idx = 4 };
+    lines_buf[lc] = .{ .label = "HTTP Bind", .value = edit_vals[5], .is_section = false, .edit_idx = 5 };
     lc += 1;
     lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
     lc += 1;
@@ -4614,26 +4614,34 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     const read_only = cfg.admin_ssh.read_only;
 
     if (state.settings_editing) {
-        // Text editing mode (fields 3=port, 4=bind).
+        // Text editing mode (fields 4=port, 5=bind).
         if (key.matches(vaxis.Key.escape, .{})) {
             state.settings_editing = false;
             return;
         }
         if (key.matches(vaxis.Key.enter, .{})) {
             // Store the edited value as pending (don't apply yet).
-            if (state.settings_row == 3) {
+            if (state.settings_row == 4) {
                 const n = @min(state.settings_buf_len, state.settings_pending_port_buf.len);
                 @memcpy(state.settings_pending_port_buf[0..n], state.settings_buf[0..n]);
                 state.settings_pending_port_len = n;
+                // Validate port.
+                const port_val = std.fmt.parseInt(u16, state.settings_buf[0..n], 10) catch {
+                    // Don't save invalid port — stay in editing mode.
+                    return;
+                };
+                if (port_val == 0) return;
                 // Compare against live config.
                 var live_buf: [6]u8 = undefined;
                 const live = std.fmt.bufPrint(&live_buf, "{d}", .{cfg.metrics.http_port}) catch "";
-                state.settings_dirty[3] = !std.mem.eql(u8, state.settings_pending_port_buf[0..n], live);
-            } else if (state.settings_row == 4) {
+                state.settings_dirty[4] = !std.mem.eql(u8, state.settings_pending_port_buf[0..n], live);
+            } else if (state.settings_row == 5) {
                 const n = @min(state.settings_buf_len, state.settings_pending_bind_buf.len);
                 @memcpy(state.settings_pending_bind_buf[0..n], state.settings_buf[0..n]);
                 state.settings_pending_bind_len = n;
-                state.settings_dirty[4] = !std.mem.eql(u8, state.settings_pending_bind_buf[0..n], cfg.metrics.http_bind);
+                // Validate bind address.
+                _ = config_mod.parseIpv4(state.settings_buf[0..n]) catch return; // stay in editing
+                state.settings_dirty[5] = !std.mem.eql(u8, state.settings_pending_bind_buf[0..n], cfg.metrics.http_bind);
             }
             state.settings_editing = false;
             return;
@@ -4705,19 +4713,19 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                 state.settings_dirty[0] = (levels[idx] != cfg.log_level);
             },
             1 => {
-                const cur = if (state.settings_dirty[1]) state.settings_pending_collect else cfg.metrics.collect;
-                state.settings_pending_collect = !cur;
-                state.settings_dirty[1] = (state.settings_pending_collect != cfg.metrics.collect);
+                const cur = if (state.settings_dirty[1]) state.settings_pending_random_alloc else cfg.pool_allocation_random;
+                state.settings_pending_random_alloc = !cur;
+                state.settings_dirty[1] = (state.settings_pending_random_alloc != cfg.pool_allocation_random);
             },
             2 => {
-                const cur = if (state.settings_dirty[2]) state.settings_pending_http_enable else cfg.metrics.http_enable;
-                state.settings_pending_http_enable = !cur;
-                state.settings_dirty[2] = (state.settings_pending_http_enable != cfg.metrics.http_enable);
+                const cur = if (state.settings_dirty[2]) state.settings_pending_collect else cfg.metrics.collect;
+                state.settings_pending_collect = !cur;
+                state.settings_dirty[2] = (state.settings_pending_collect != cfg.metrics.collect);
             },
-            5 => {
-                const cur = if (state.settings_dirty[5]) state.settings_pending_random_alloc else cfg.pool_allocation_random;
-                state.settings_pending_random_alloc = !cur;
-                state.settings_dirty[5] = (state.settings_pending_random_alloc != cfg.pool_allocation_random);
+            3 => {
+                const cur = if (state.settings_dirty[3]) state.settings_pending_http_enable else cfg.metrics.http_enable;
+                state.settings_pending_http_enable = !cur;
+                state.settings_dirty[3] = (state.settings_pending_http_enable != cfg.metrics.http_enable);
             },
             else => {},
         }
@@ -4735,9 +4743,9 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             return;
         }
         // If nothing dirty but on a text field, enter editing.
-        if (state.settings_row == 3) {
-            const src = if (state.settings_dirty[3]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else std.fmt.bufPrint(&state.settings_buf, "{d}", .{cfg.metrics.http_port}) catch "";
-            if (!state.settings_dirty[3]) {
+        if (state.settings_row == 4) {
+            const src = if (state.settings_dirty[4]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else std.fmt.bufPrint(&state.settings_buf, "{d}", .{cfg.metrics.http_port}) catch "";
+            if (!state.settings_dirty[4]) {
                 state.settings_buf_len = src.len;
             } else {
                 @memcpy(state.settings_buf[0..src.len], src);
@@ -4745,8 +4753,8 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             }
             state.settings_cursor = state.settings_buf_len;
             state.settings_editing = true;
-        } else if (state.settings_row == 4) {
-            const src = if (state.settings_dirty[4]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind;
+        } else if (state.settings_row == 5) {
+            const src = if (state.settings_dirty[5]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind;
             const n = @min(src.len, state.settings_buf.len);
             @memcpy(state.settings_buf[0..n], src[0..n]);
             state.settings_buf_len = n;
@@ -4763,18 +4771,17 @@ fn handleSettingsClick(state: *TuiState, term_row: u16, scroll: u16) void {
     if (term_row < 1) return;
     const line_idx = (term_row - 1) + scroll;
     // We need to map line_idx to an editable field. The line layout matches
-    // renderSettingsTab. Rather than rebuilding the full lines array, use the
-    // known fixed positions. After the blank line at 0:
-    // 1: --General--, 2: Listen, 3: State Dir, 4: Log Level(0), 5: Random(5),
-    // 6: blank, 7: --SSH--, 8-11: SSH fields,
-    // 12: blank, 13: --Metrics--, 14: Collect(1), 15: HTTP Enable(2), 16: Port(3), 17: Bind(4)
+    // renderSettingsTab. After the blank line at 0:
+    // 1: --General--, 2: Listen, 3: State Dir, 4: Log Level(0), 5: Random(1),
+    // 6: blank, 7: --Metrics--, 8: Collect(2), 9: HTTP Enable(3), 10: Port(4), 11: Bind(5),
+    // 12: blank, 13: --Admin SSH--, 14-17: SSH fields (read-only)
     const field_map = [_]struct { line: u16, edit: u8 }{
         .{ .line = 4, .edit = 0 }, // log level
-        .{ .line = 5, .edit = 5 }, // random alloc
-        .{ .line = 14, .edit = 1 }, // collect
-        .{ .line = 15, .edit = 2 }, // http enable
-        .{ .line = 16, .edit = 3 }, // http port
-        .{ .line = 17, .edit = 4 }, // http bind
+        .{ .line = 5, .edit = 1 }, // random alloc
+        .{ .line = 8, .edit = 2 }, // collect
+        .{ .line = 9, .edit = 3 }, // http enable
+        .{ .line = 10, .edit = 4 }, // http port
+        .{ .line = 11, .edit = 5 }, // http bind
     };
     for (field_map) |fm| {
         if (line_idx == fm.line) {
@@ -4787,16 +4794,17 @@ fn handleSettingsClick(state: *TuiState, term_row: u16, scroll: u16) void {
 
 fn settingsApplyAndReload(server: *AdminServer, state: *TuiState) void {
     const cfg = server.cfg;
+    // Indices: 0=log_level, 1=random_alloc, 2=collect, 3=http_enable, 4=http_port, 5=http_bind
     if (state.settings_dirty[0]) cfg.log_level = state.settings_pending_log_level;
-    if (state.settings_dirty[1]) cfg.metrics.collect = state.settings_pending_collect;
-    if (state.settings_dirty[2]) cfg.metrics.http_enable = state.settings_pending_http_enable;
-    if (state.settings_dirty[3]) {
+    if (state.settings_dirty[1]) cfg.pool_allocation_random = state.settings_pending_random_alloc;
+    if (state.settings_dirty[2]) cfg.metrics.collect = state.settings_pending_collect;
+    if (state.settings_dirty[3]) cfg.metrics.http_enable = state.settings_pending_http_enable;
+    if (state.settings_dirty[4]) {
         cfg.metrics.http_port = std.fmt.parseInt(u16, state.settings_pending_port_buf[0..state.settings_pending_port_len], 10) catch cfg.metrics.http_port;
     }
-    if (state.settings_dirty[4]) {
+    if (state.settings_dirty[5]) {
         replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), state.settings_pending_bind_buf[0..state.settings_pending_bind_len]);
     }
-    if (state.settings_dirty[5]) cfg.pool_allocation_random = state.settings_pending_random_alloc;
     // Clear dirty flags.
     state.settings_dirty = [_]bool{false} ** SETTINGS_EDITABLE_COUNT;
     // Save and reload.
