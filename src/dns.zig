@@ -767,7 +767,8 @@ test "signTsig: appends TSIG RR with correct type, class, TTL, and ADCOUNT" {
     pos += 2; // IN
     const msg_len = pos;
 
-    const key = TsigKey{ .algorithm = .hmac_sha256, .secret = "test_secret_key!" };
+    var key_bytes = "test_secret_key!".*;
+    const key = TsigKey{ .algorithm = .hmac_sha256, .secret = &key_bytes, .allocator = std.testing.allocator };
     const signed_len = try signTsig(&msg, msg_len, &key, "dhcp-update");
 
     // ADCOUNT in header must be 1 after signing

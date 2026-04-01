@@ -861,8 +861,8 @@ test "computePoolHash: different pool_start produces different hash" {
     defer cfg2.deinit();
 
     // Change pool_start on cfg2
-    alloc.free(cfg2.pool_start);
-    cfg2.pool_start = try alloc.dupe(u8, "192.168.1.20");
+    alloc.free(cfg2.pools[0].pool_start);
+    cfg2.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.20");
 
     const h1 = config_mod.computePoolHash(&cfg1);
     const h2 = config_mod.computePoolHash(&cfg2);
@@ -946,7 +946,7 @@ test "decrypt rejects replayed timestamp" {
     const Aes = std.crypto.aead.aes_gcm.Aes256Gcm;
     Aes.encrypt(
         buf[ad_size .. ad_size + payload_len],
-        buf[ad_size + payload_len .. ad_size + payload_len + tag_size],
+        buf[ad_size + payload_len ..][0..tag_size],
         "data",
         buf[0..ad_size],
         nonce,
@@ -966,10 +966,11 @@ test "applyLeaseUpdate: newer last_modified wins" {
     defer mgr.peers.deinit(std.testing.allocator);
 
     // Insert an existing lease with last_modified = 100
+    const mac1 = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff");
     try store.leases.put(
-        try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        mac1,
         .{
-            .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .mac = mac1,
             .ip = try alloc.dupe(u8, "192.168.1.10"),
             .hostname = null,
             .expires = std.time.timestamp() + 3600,
@@ -1006,10 +1007,11 @@ test "applyLeaseUpdate: older last_modified discarded" {
     defer mgr.peers.deinit(std.testing.allocator);
 
     // Insert existing lease with last_modified = 500
+    const mac2 = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff");
     try store.leases.put(
-        try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        mac2,
         .{
-            .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .mac = mac2,
             .ip = try alloc.dupe(u8, "192.168.1.10"),
             .hostname = null,
             .expires = std.time.timestamp() + 3600,
@@ -1044,16 +1046,18 @@ test "computeLeaseHash: identical stores produce identical hashes" {
     defer store2.deinit();
 
     // Insert same leases in different order
-    try store1.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"),
+    const mac_s1a = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01");
+    try store1.leases.put(mac_s1a, .{
+        .mac = mac_s1a,
         .ip = try alloc.dupe(u8, "192.168.1.10"),
         .hostname = null,
         .expires = 9999,
         .client_id = null,
         .last_modified = 1,
     });
-    try store1.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"),
+    const mac_s1b = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02");
+    try store1.leases.put(mac_s1b, .{
+        .mac = mac_s1b,
         .ip = try alloc.dupe(u8, "192.168.1.11"),
         .hostname = null,
         .expires = 9999,
@@ -1062,16 +1066,18 @@ test "computeLeaseHash: identical stores produce identical hashes" {
     });
 
     // Insert in reverse order in store2
-    try store2.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"),
+    const mac_s2b = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02");
+    try store2.leases.put(mac_s2b, .{
+        .mac = mac_s2b,
         .ip = try alloc.dupe(u8, "192.168.1.11"),
         .hostname = null,
         .expires = 9999,
         .client_id = null,
         .last_modified = 2,
     });
-    try store2.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"),
+    const mac_s2a = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01");
+    try store2.leases.put(mac_s2a, .{
+        .mac = mac_s2a,
         .ip = try alloc.dupe(u8, "192.168.1.10"),
         .hostname = null,
         .expires = 9999,
@@ -1081,9 +1087,9 @@ test "computeLeaseHash: identical stores produce identical hashes" {
 
     const aes_key = SyncManager.deriveKey("hash-test");
     var mgr1 = makeTestManagerWithStore(aes_key, store1);
-    defer mgr1.peers.deinit();
+    defer mgr1.peers.deinit(std.testing.allocator);
     var mgr2 = makeTestManagerWithStore(aes_key, store2);
-    defer mgr2.peers.deinit();
+    defer mgr2.peers.deinit(std.testing.allocator);
 
     const h1 = mgr1.computeLeaseHash();
     const h2 = mgr2.computeLeaseHash();
@@ -1101,8 +1107,9 @@ test "computeLeaseHash: adding a lease changes the hash" {
 
     const h1 = mgr.computeLeaseHash();
 
-    try store.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+    const mac_h = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff");
+    try store.leases.put(mac_h, .{
+        .mac = mac_h,
         .ip = try alloc.dupe(u8, "192.168.1.10"),
         .hostname = null,
         .expires = 9999,
@@ -1119,30 +1126,33 @@ test "computeLeaseHash: adding a lease changes the hash" {
 // ---------------------------------------------------------------------------
 
 fn makeTestConfig(alloc: std.mem.Allocator) config_mod.Config {
-    return config_mod.Config{
-        .allocator = alloc,
-        .listen_address = alloc.dupe(u8, "0.0.0.0") catch unreachable,
+    const pools = alloc.alloc(config_mod.PoolConfig, 1) catch unreachable;
+    pools[0] = config_mod.PoolConfig{
         .subnet = alloc.dupe(u8, "192.168.1.0") catch unreachable,
         .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
         .router = alloc.dupe(u8, "192.168.1.1") catch unreachable,
+        .pool_start = alloc.dupe(u8, "192.168.1.10") catch unreachable,
+        .pool_end = alloc.dupe(u8, "192.168.1.200") catch unreachable,
         .dns_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .domain_name = alloc.dupe(u8, "") catch unreachable,
         .domain_search = alloc.alloc([]const u8, 0) catch unreachable,
+        .lease_time = 3600,
         .time_offset = null,
         .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .mtu = null,
+        .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
-        .lease_time = 3600,
-        .state_dir = alloc.dupe(u8, "/tmp") catch unreachable,
-        .pool_start = alloc.dupe(u8, "192.168.1.10") catch unreachable,
-        .pool_end = alloc.dupe(u8, "192.168.1.200") catch unreachable,
-        .log_level = .info,
+        .cisco_tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,
             .zone = alloc.dupe(u8, "") catch unreachable,
+            .rev_zone = alloc.dupe(u8, "") catch unreachable,
             .key_name = alloc.dupe(u8, "") catch unreachable,
             .key_file = alloc.dupe(u8, "") catch unreachable,
             .lease_time = 3600,
@@ -1150,8 +1160,17 @@ fn makeTestConfig(alloc: std.mem.Allocator) config_mod.Config {
         .dhcp_options = std.StringHashMap([]const u8).init(alloc),
         .reservations = alloc.alloc(config_mod.Reservation, 0) catch unreachable,
         .static_routes = alloc.alloc(config_mod.StaticRoute, 0) catch unreachable,
+    };
+    return config_mod.Config{
+        .allocator = alloc,
+        .listen_address = alloc.dupe(u8, "0.0.0.0") catch unreachable,
+        .state_dir = alloc.dupe(u8, "/tmp") catch unreachable,
+        .log_level = .info,
         .pool_allocation_random = false,
         .sync = null,
+        .pools = pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = alloc.dupe(u8, "0.0.0.0") catch unreachable, .read_only = false, .host_key = alloc.dupe(u8, "") catch unreachable, .authorized_keys = alloc.dupe(u8, "") catch unreachable },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = alloc.dupe(u8, "127.0.0.1") catch unreachable },
     };
 }
 
@@ -1159,6 +1178,8 @@ fn makeTestManager(aes_key: [32]u8) SyncManager {
     return SyncManager{
         .allocator = std.testing.allocator,
         .cfg = undefined,
+        .full_cfg = undefined,
+        .cfg_path = "",
         .store = undefined,
         .aes_key = aes_key,
         .pool_hash = [_]u8{0} ** 32,
@@ -1166,6 +1187,7 @@ fn makeTestManager(aes_key: [32]u8) SyncManager {
         .peers = std.ArrayList(SyncManager.Peer){},
         .last_full_sync = 0,
         .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
     };
 }
 
@@ -1173,6 +1195,8 @@ fn makeTestManagerWithStore(aes_key: [32]u8, store: *state_mod.StateStore) SyncM
     return SyncManager{
         .allocator = std.testing.allocator,
         .cfg = undefined,
+        .full_cfg = undefined,
+        .cfg_path = "",
         .store = store,
         .aes_key = aes_key,
         .pool_hash = [_]u8{0} ** 32,
@@ -1180,6 +1204,7 @@ fn makeTestManagerWithStore(aes_key: [32]u8, store: *state_mod.StateStore) SyncM
         .peers = std.ArrayList(SyncManager.Peer){},
         .last_full_sync = 0,
         .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
     };
 }
 
@@ -1241,10 +1266,11 @@ test "applyLeaseDelete: removes existing lease" {
     const store = try makeTestStateStore(alloc);
     defer store.deinit();
 
+    const mac_del = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff");
     try store.leases.put(
-        try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        mac_del,
         .{
-            .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .mac = mac_del,
             .ip = try alloc.dupe(u8, "192.168.1.10"),
             .hostname = null,
             .expires = std.time.timestamp() + 3600,
@@ -1303,8 +1329,9 @@ test "computeLeaseHash: reserved lease (expires=0) is included in hash" {
     const h_before = mgr.computeLeaseHash();
 
     // Add a reservation with expires=0.
-    try store.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+    const mac_res = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff");
+    try store.leases.put(mac_res, .{
+        .mac = mac_res,
         .ip = try alloc.dupe(u8, "192.168.1.50"),
         .hostname = null,
         .expires = 0,
@@ -1328,8 +1355,9 @@ test "computeLeaseHash: expired lease is included in hash" {
     const h_before = mgr.computeLeaseHash();
 
     // Add an already-expired lease (expires in the past).
-    try store.leases.put(try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .{
-        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+    const mac_exp = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff");
+    try store.leases.put(mac_exp, .{
+        .mac = mac_exp,
         .ip = try alloc.dupe(u8, "192.168.1.10"),
         .hostname = null,
         .expires = 1, // epoch + 1s, definitely expired

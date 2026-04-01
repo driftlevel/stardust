@@ -757,7 +757,7 @@ fn parseOneStaticRoute(dest_str: []const u8, router_str: []const u8) ?StaticRout
     }
 
     if (prefix_len == 0) {
-        std.log.err("config: static_route '{s}' is a default route (0.0.0.0/0); use the 'router' option instead, skipping", .{dest_str});
+        std.log.warn("config: static_route '{s}' is a default route (0.0.0.0/0); use the 'router' option instead, skipping", .{dest_str});
         return null;
     }
 
@@ -1168,6 +1168,8 @@ pub fn parseIpv4(s: []const u8) ![4]u8 {
         }
     }
     if (idx != 3) return error.InvalidConfig;
+    // Reject trailing dot (e.g. "192.168.1.") — the last octet would be implicitly 0.
+    if (s.len > 0 and s[s.len - 1] == '.') return error.InvalidConfig;
     result[idx] = @intCast(octet);
     return result;
 }
@@ -1365,6 +1367,8 @@ fn makeHashTestConfig(alloc: std.mem.Allocator) Config {
         .pool_allocation_random = false,
         .sync = null,
         .pools = pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = alloc.dupe(u8, "0.0.0.0") catch unreachable, .read_only = false, .host_key = alloc.dupe(u8, "") catch unreachable, .authorized_keys = alloc.dupe(u8, "") catch unreachable },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = alloc.dupe(u8, "127.0.0.1") catch unreachable },
     };
 }
 
@@ -1438,8 +1442,8 @@ test "computePoolHash: adding a reservation changes the hash" {
     alloc.free(c2.pools[0].reservations);
     const res = try alloc.alloc(Reservation, 1);
     res[0] = .{
-        .mac = "aa:bb:cc:dd:ee:ff",
-        .ip = "192.168.1.50",
+        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try alloc.dupe(u8, "192.168.1.50"),
         .hostname = null,
         .client_id = null,
     };
@@ -1457,14 +1461,14 @@ test "computePoolHash: reservation insertion order does not affect hash" {
 
     alloc.free(c1.pools[0].reservations);
     const res1 = try alloc.alloc(Reservation, 2);
-    res1[0] = .{ .mac = "aa:bb:cc:dd:ee:01", .ip = "192.168.1.50", .hostname = null, .client_id = null };
-    res1[1] = .{ .mac = "aa:bb:cc:dd:ee:02", .ip = "192.168.1.51", .hostname = null, .client_id = null };
+    res1[0] = .{ .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"), .ip = try alloc.dupe(u8, "192.168.1.50"), .hostname = null, .client_id = null };
+    res1[1] = .{ .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"), .ip = try alloc.dupe(u8, "192.168.1.51"), .hostname = null, .client_id = null };
     c1.pools[0].reservations = res1;
 
     alloc.free(c2.pools[0].reservations);
     const res2 = try alloc.alloc(Reservation, 2);
-    res2[0] = .{ .mac = "aa:bb:cc:dd:ee:02", .ip = "192.168.1.51", .hostname = null, .client_id = null };
-    res2[1] = .{ .mac = "aa:bb:cc:dd:ee:01", .ip = "192.168.1.50", .hostname = null, .client_id = null };
+    res2[0] = .{ .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:02"), .ip = try alloc.dupe(u8, "192.168.1.51"), .hostname = null, .client_id = null };
+    res2[1] = .{ .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:01"), .ip = try alloc.dupe(u8, "192.168.1.50"), .hostname = null, .client_id = null };
     c2.pools[0].reservations = res2;
 
     try std.testing.expectEqualSlices(u8, &computePoolHash(&c1), &computePoolHash(&c2));

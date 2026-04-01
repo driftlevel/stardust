@@ -2678,6 +2678,8 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .pool_allocation_random = false,
         .sync = null,
         .pools = pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = try allocator.dupe(u8, "0.0.0.0"), .read_only = false, .host_key = try allocator.dupe(u8, ""), .authorized_keys = try allocator.dupe(u8, "") },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = try allocator.dupe(u8, "127.0.0.1") },
     };
 }
 
@@ -2773,6 +2775,8 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .pool_allocation_random = false,
         .sync = null,
         .pools = pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = try allocator.dupe(u8, "0.0.0.0"), .read_only = false, .host_key = try allocator.dupe(u8, ""), .authorized_keys = try allocator.dupe(u8, "") },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = try allocator.dupe(u8, "127.0.0.1") },
     };
 }
 
@@ -2785,7 +2789,7 @@ test "createAck returns null when option 54 does not match our IP" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeRequest(
         &buf,
         [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
@@ -2806,7 +2810,7 @@ test "createAck sends DHCPNAK for IP outside subnet" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeRequest(
         &buf,
         [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
@@ -2829,7 +2833,7 @@ test "createAck stores hostname from option 12" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeRequest(
         &buf,
         [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
@@ -2857,7 +2861,7 @@ test "createAck returns DHCPACK for valid request without option 54" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeRequest(
         &buf,
         [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 },
@@ -2945,7 +2949,7 @@ test "handleDecline quarantines declined IP" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeDecline(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, [4]u8{ 192, 168, 1, 50 });
     const resp = try server.processPacket(buf[0..len]);
     try std.testing.expect(resp == null); // DECLINE generates no response
@@ -2976,7 +2980,7 @@ test "handleDecline removes MAC lease" {
     });
     try std.testing.expect(store.getLeaseByMac("aa:bb:cc:dd:ee:ff") != null);
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeDecline(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, [4]u8{ 192, 168, 1, 50 });
     _ = try server.processPacket(buf[0..len]);
 
@@ -2996,9 +3000,9 @@ test "createOffer uses server_ip not listen_address" {
     // Override server_ip to something different from listen_address
     server.server_ip = [4]u8{ 192, 168, 1, 5 };
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3035,7 +3039,7 @@ test "createAck checks server_ip for option 54" {
 
     server.server_ip = [4]u8{ 192, 168, 1, 5 };
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     // Request directed at a different server — should return null.
     const len = makeRequest(
         &buf,
@@ -3077,9 +3081,9 @@ test "dhcp_options injected into OFFER packet" {
     defer server.deinit();
 
     // Send a DISCOVER
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3137,7 +3141,7 @@ test "handleDecline rate-limits MAC after threshold declines" {
     // Each one should be processed without blocking.
     var i: u32 = 0;
     while (i < decline_threshold) : (i += 1) {
-        var buf = [_]u8{0} ** 512;
+        var buf align(4) = [_]u8{0} ** 512;
         const declined_ip = [4]u8{ 192, 168, 1, @intCast(10 + i) };
 
         // First ACK the IP so handleDecline has a lease to remove.
@@ -3168,7 +3172,7 @@ test "quarantine period is max(lease_time/10, 300)" {
         const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
         defer server.deinit();
 
-        var buf = [_]u8{0} ** 512;
+        var buf align(4) = [_]u8{0} ** 512;
         const len = makeDecline(&buf, [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, [4]u8{ 192, 168, 1, 50 });
         _ = try server.processPacket(buf[0..len]);
 
@@ -3190,7 +3194,7 @@ test "quarantine period is max(lease_time/10, 300)" {
         const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
         defer server.deinit();
 
-        var buf = [_]u8{0} ** 512;
+        var buf align(4) = [_]u8{0} ** 512;
         const len = makeDecline(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, [4]u8{ 192, 168, 1, 60 });
         _ = try server.processPacket(buf[0..len]);
 
@@ -3218,7 +3222,7 @@ test "global decline rate limit drops excess declines" {
     // Send global_decline_limit declines from distinct MACs — all should quarantine.
     var i: u32 = 0;
     while (i < global_decline_limit) : (i += 1) {
-        var buf = [_]u8{0} ** 512;
+        var buf align(4) = [_]u8{0} ** 512;
         const mac = [6]u8{ 0xAA, 0xBB, 0xCC, 0x00, 0x00, @intCast(i) };
         const ip = [4]u8{ 192, 168, 1, @intCast(10 + i) };
         const len = makeDecline(&buf, mac, ip);
@@ -3228,7 +3232,7 @@ test "global decline rate limit drops excess declines" {
 
     // One more decline (new MAC, new IP) should be dropped — no quarantine lease added.
     {
-        var buf = [_]u8{0} ** 512;
+        var buf align(4) = [_]u8{0} ** 512;
         const mac = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         const ip = [4]u8{ 192, 168, 1, @intCast(10 + global_decline_limit) };
         const len = makeDecline(&buf, mac, ip);
@@ -3251,10 +3255,10 @@ test "hops is echoed in OFFER and ACK responses" {
     defer server.deinit();
 
     // Build a DISCOVER with hops=3
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     @memset(&buf, 0);
     {
-        const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+        const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
         hdr.op = 1;
         hdr.htype = 1;
         hdr.hlen = 6;
@@ -3279,7 +3283,7 @@ test "hops is echoed in OFFER and ACK responses" {
     // Build a REQUEST with hops=2
     {
         const len = makeRequest(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 }, [4]u8{ 192, 168, 1, 2 }, [4]u8{ 192, 168, 1, 1 }, null);
-        const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+        const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
         hdr.hops = 2;
         const resp = try server.processPacket(buf[0..len]);
         try std.testing.expect(resp != null);
@@ -3301,7 +3305,7 @@ test "createAck stores client_id from option 61" {
     const mac = [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
     const client_id_bytes = [_]u8{ 0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }; // type=Ethernet + MAC
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeRequest(&buf, mac, [4]u8{ 192, 168, 1, 50 }, [4]u8{ 192, 168, 1, 1 }, null);
     // Append option 61 before the End byte
     var pkt = buf[0..len];
@@ -3379,8 +3383,8 @@ test "createOffer omits options not in PRL" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3409,9 +3413,10 @@ test "createOffer omits options not in PRL" {
     // Subnet mask and router should be present (requested)
     try std.testing.expect(DHCPServer.getOption(resp.?, .SubnetMask) != null);
     try std.testing.expect(DHCPServer.getOption(resp.?, .Router) != null);
-    // DNS and lease time should be absent (not requested)
-    try std.testing.expect(DHCPServer.getOption(resp.?, .DnsServer) == null);
-    try std.testing.expect(DHCPServer.getOption(resp.?, .LeaseTime) == null);
+    // DNS and renewal time should be absent (not requested)
+    // Note: lease time (51) is always sent per RFC 2131 §4.3.1, so we check renewal time (58) instead.
+    try std.testing.expect(DHCPServer.getOption(resp.?, .DomainNameServer) == null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .RenewalTimeValue) == null);
     // MessageType and ServerIdentifier always present
     try std.testing.expect(DHCPServer.getOption(resp.?, .MessageType) != null);
     try std.testing.expect(DHCPServer.getOption(resp.?, .ServerIdentifier) != null);
@@ -3426,9 +3431,9 @@ test "handleInform returns DHCPACK with yiaddr=0" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3513,8 +3518,8 @@ test "DHCPREQUEST for router IP results in DHCPNAK" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3569,6 +3574,18 @@ test "allocateIp returns reserved IP for matching MAC" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
+
+    // Add reservation to pool config so allocateIp finds it when scanning pool.reservations.
+    alloc.free(cfg.pools[0].reservations);
+    const reservations = try alloc.alloc(config_mod.Reservation, 1);
+    reservations[0] = .{
+        .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try alloc.dupe(u8, "192.168.1.50"),
+        .hostname = null,
+        .client_id = null,
+    };
+    cfg.pools[0].reservations = reservations;
+
     const store = try makeTestStore(alloc);
     defer store.deinit();
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
@@ -3632,9 +3649,9 @@ test "createAck: reserved client gets reserved IP and option 12 hostname" {
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "printer");
 
     // Build REQUEST with PRL requesting hostname (12).
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3697,7 +3714,7 @@ test "DHCPNAK: non-matching client denied reserved IP" {
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeRequest(
         &buf,
         [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, // different MAC
@@ -3726,9 +3743,9 @@ test "removeLease on reserved lease keeps entry with expires=0 (RELEASE)" {
     store.leases.getPtr("aa:bb:cc:dd:ee:ff").?.expires = std.time.timestamp() + 3600;
 
     // Build a RELEASE.
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     @memset(&buf, 0);
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3771,9 +3788,9 @@ test "encodeDnsSearchList: single and multiple domains" {
     // Multiple domains concatenated: ["stardust.lan", "local"]
     const domains3 = [_][]const u8{ "stardust.lan", "local" };
     const n3 = encodeDnsSearchList(&buf, &domains3);
-    // "stardust.lan" → \x08stardust\x03lan\x00 = 15 bytes
+    // "stardust.lan" → \x08stardust\x03lan\x00 = 14 bytes
     // "local"        → \x05local\x00            = 7 bytes
-    try std.testing.expectEqual(@as(usize, 22), n3);
+    try std.testing.expectEqual(@as(usize, 21), n3);
     try std.testing.expectEqualSlices(u8, &.{ 8, 's', 't', 'a', 'r', 'd', 'u', 's', 't', 3, 'l', 'a', 'n', 0 }, buf[0..14]);
     try std.testing.expectEqualSlices(u8, &.{ 5, 'l', 'o', 'c', 'a', 'l', 0 }, buf[14..21]);
 }
@@ -3861,8 +3878,8 @@ test "OFFER includes option 33 when PRL requests it" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3904,8 +3921,8 @@ test "OFFER includes option 121 when PRL requests it" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -3948,8 +3965,8 @@ test "OFFER omits static route options when not in PRL" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -4467,7 +4484,7 @@ test "UEFI HTTP boot: DISCOVER with HTTPClient gets option 60 echo and URL in op
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x11 }, "HTTPClient");
     const resp = try server.processPacket(buf[0..len]);
     try std.testing.expect(resp != null);
@@ -4510,7 +4527,7 @@ test "UEFI HTTP boot: DISCOVER without HTTPClient gets normal TFTP options" {
     defer server.deinit();
 
     // No VCI option — regular PXE client
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x22 }, null);
     const resp = try server.processPacket(buf[0..len]);
     try std.testing.expect(resp != null);
@@ -4547,7 +4564,7 @@ test "UEFI HTTP boot: http_boot_url empty => normal TFTP options even with HTTPC
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
+    var buf align(4) = [_]u8{0} ** 512;
     const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x33 }, "HTTPClient");
     const resp = try server.processPacket(buf[0..len]);
     try std.testing.expect(resp != null);
@@ -4623,6 +4640,7 @@ test "collectOverrides: priority pool < mac_class < reservation" {
         .tftp_server_name = "",
         .boot_filename = "",
         .cisco_tftp_servers = &.{},
+        .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
         .reservations = &.{},
@@ -4688,6 +4706,7 @@ test "collectOverrides: most specific MAC class wins" {
         .tftp_server_name = "",
         .boot_filename = "",
         .cisco_tftp_servers = &.{},
+        .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = &.{},
@@ -4743,6 +4762,7 @@ test "collectOverrides: no matches returns pool options only" {
         .tftp_server_name = "",
         .boot_filename = "",
         .cisco_tftp_servers = &.{},
+        .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
         .reservations = &.{},
@@ -4780,8 +4800,8 @@ test "OFFER includes MTU option 26 as big-endian u16" {
     defer server.deinit();
 
     // DISCOVER with PRL requesting option 26
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -4836,8 +4856,8 @@ test "OFFER includes broadcast address option 28 auto-derived from subnet" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;
@@ -4897,8 +4917,8 @@ test "OFFER includes WINS option 44 and Cisco TFTP option 150" {
     const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    var buf = [_]u8{0} ** 512;
-    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
     hdr.op = 1;
     hdr.htype = 1;
     hdr.hlen = 6;

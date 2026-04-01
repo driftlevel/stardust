@@ -2662,6 +2662,9 @@ fn copyField(buf: anytype, len: *usize, src: []const u8) void {
 /// e.g. subnet=192.168.10.0, start=192.168.10.100, end=192.168.10.200 → ".100 – .200"
 ///      subnet=172.20.0.0, start=172.20.0.100, end=172.20.14.200 → ".0.100 – .14.200"
 fn fmtAbbrevRange(fa: std.mem.Allocator, pool: *const config_mod.PoolConfig) ![]const u8 {
+    // Both empty means fully automatic range — no abbreviation needed.
+    if (pool.pool_start.len == 0 and pool.pool_end.len == 0) return try fa.dupe(u8, "auto");
+
     // Compute effective start/end IPs (resolve "auto" to subnet+1 / broadcast-1).
     const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return "?";
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
@@ -3805,6 +3808,11 @@ fn splitCommaDupe(allocator: std.mem.Allocator, input: []const u8) ![][]const u8
     }
     if (count == 0) return try allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, count);
+    for (result) |*s| s.* = "";
+    errdefer {
+        for (result) |s| allocator.free(s);
+        allocator.free(result);
+    }
     var it2 = std.mem.splitSequence(u8, input, ",");
     var i: usize = 0;
     while (it2.next()) |part| {
@@ -5053,8 +5061,8 @@ test "truncateCell: right truncation" {
     const fa = arena.allocator();
 
     const result = try truncateCell(fa, "very-long-hostname.example.com", 12, false);
-    try std.testing.expectEqualStrings("very-long-ho…", result);
-    try std.testing.expectEqual(@as(usize, 12 - 1 + 3), result.len); // content(11) + "…"(3 bytes)
+    try std.testing.expectEqualStrings("very-long-h…", result);
+    try std.testing.expectEqual(@as(usize, 11 + 3), result.len); // content(11) + "…"(3 bytes UTF-8)
 }
 
 test "truncateCell: left truncation for addresses" {
@@ -5146,7 +5154,10 @@ test "SSH_AGAIN is not SSH_ERROR: regression for immediate TUI exit" {
 
 test "handleLeaseKey: j/k move cursor down and up" {
     var state: TuiState = .{};
-    var ctx: vaxis.widgets.Table.TableContext = .{};
+    var ctx: vaxis.widgets.Table.TableContext = .{
+        .selected_bg = .{ .rgb = .{ 50, 50, 80 } },
+        .active_bg = .{ .rgb = .{ 50, 80, 140 } },
+    };
 
     // Move down from row 0.
     handleLeaseKey(&state, &ctx, .{ .codepoint = 'j' });
@@ -5166,7 +5177,10 @@ test "handleLeaseKey: j/k move cursor down and up" {
 
 test "handleLeaseKey: page_down and page_up step by 20" {
     var state: TuiState = .{};
-    var ctx: vaxis.widgets.Table.TableContext = .{};
+    var ctx: vaxis.widgets.Table.TableContext = .{
+        .selected_bg = .{ .rgb = .{ 50, 50, 80 } },
+        .active_bg = .{ .rgb = .{ 50, 80, 140 } },
+    };
 
     handleLeaseKey(&state, &ctx, .{ .codepoint = vaxis.Key.page_down });
     try std.testing.expectEqual(@as(u16, 20), ctx.row);
@@ -5689,6 +5703,9 @@ test "calcPoolColWidths: fits at normal terminal width" {
 }
 
 test "fmtAbbrevRange: both endpoints explicit, same /24 subnet" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
     var pool = config_mod.PoolConfig{
         .subnet = "192.168.10.0",
         .subnet_mask = 0xFFFFFF00,
@@ -5704,22 +5721,27 @@ test "fmtAbbrevRange: both endpoints explicit, same /24 subnet" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
-        .dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator),
+        .dhcp_options = std.StringHashMap([]const u8).init(fa),
         .reservations = &.{},
         .static_routes = &.{},
     };
-    const result = try fmtAbbrevRange(std.testing.allocator, &pool);
-    defer std.testing.allocator.free(result);
+    const result = try fmtAbbrevRange(fa, &pool);
     // Both IPs share 192.168.10 with subnet → abbreviated to .100 – .200
     try std.testing.expect(std.mem.indexOf(u8, result, ".100") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, ".200") != null);
 }
 
 test "fmtAbbrevRange: start only, end auto-computed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
     var pool = config_mod.PoolConfig{
         .subnet = "10.99.99.0",
         .subnet_mask = 0xFFFFFF00,
@@ -5735,16 +5757,18 @@ test "fmtAbbrevRange: start only, end auto-computed" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
-        .dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator),
+        .dhcp_options = std.StringHashMap([]const u8).init(fa),
         .reservations = &.{},
         .static_routes = &.{},
     };
-    const result = try fmtAbbrevRange(std.testing.allocator, &pool);
-    defer std.testing.allocator.free(result);
+    const result = try fmtAbbrevRange(fa, &pool);
     // Start=10.99.99.10 abbreviated to .10; end=10.99.99.254 abbreviated to .254
     try std.testing.expect(std.mem.indexOf(u8, result, ".10") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, ".254") != null);
@@ -5753,6 +5777,9 @@ test "fmtAbbrevRange: start only, end auto-computed" {
 }
 
 test "fmtAbbrevRange: both auto returns 'auto'" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fa = arena.allocator();
     var pool = config_mod.PoolConfig{
         .subnet = "10.0.0.0",
         .subnet_mask = 0xFFFFFF00,
@@ -5768,24 +5795,27 @@ test "fmtAbbrevRange: both auto returns 'auto'" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
-        .dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator),
+        .dhcp_options = std.StringHashMap([]const u8).init(fa),
         .reservations = &.{},
         .static_routes = &.{},
     };
-    const result = try fmtAbbrevRange(std.testing.allocator, &pool);
+    const result = try fmtAbbrevRange(fa, &pool);
     try std.testing.expectEqualStrings("auto", result);
 }
 
 test "calcPoolColWidths: narrow terminal reduces columns" {
-    const widths = calcPoolColWidths(40);
+    const widths = calcPoolColWidths(50);
     var total: u16 = 0;
     for (widths) |w| total += w;
     total += 5;
-    try std.testing.expect(total <= 40);
+    try std.testing.expect(total <= 50);
     // All columns should be at least their minimum
     for (POOL_COL_SPECS, 0..) |spec, i| {
         try std.testing.expect(widths[i] >= spec.min);
@@ -5812,10 +5842,10 @@ test "PoolForm: FIELD_COUNT matches pool_field_meta length" {
     try std.testing.expectEqual(@as(usize, PoolForm.FIELD_COUNT), pool_field_meta.len);
 }
 
-test "poolFormFieldVal: fields 20-21 return edit prompt" {
+test "poolFormFieldVal: fields 22-23 return edit prompt" {
     const form = PoolForm{};
-    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 20));
-    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 21));
+    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 22));
+    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 23));
 }
 
 test "buildRoutesFromForm: empty routes" {

@@ -605,10 +605,11 @@ test "getLeaseByClientId returns lease with matching client_id" {
     const store = try makeTestStore(std.testing.allocator);
     defer store.deinit();
 
+    const mac = try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff");
     try store.leases.put(
-        try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        mac,
         .{
-            .mac = try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .mac = mac,
             .ip = try store.allocator.dupe(u8, "192.168.1.10"),
             .hostname = null,
             .expires = std.time.timestamp() + 3600,
@@ -625,10 +626,11 @@ test "getLeaseByClientId returns null for expired lease" {
     const store = try makeTestStore(std.testing.allocator);
     defer store.deinit();
 
+    const mac = try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff");
     try store.leases.put(
-        try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        mac,
         .{
-            .mac = try store.allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+            .mac = mac,
             .ip = try store.allocator.dupe(u8, "192.168.1.10"),
             .hostname = null,
             .expires = std.time.timestamp() - 1,

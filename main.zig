@@ -333,3 +333,15 @@ pub fn main() !void {
         fatal("DHCP server error: {s}", .{@errorName(err)});
     };
 }
+
+// Ensure the test runner discovers tests in all modules.
+comptime {
+    _ = @import("./src/config.zig");
+    _ = @import("./src/config_write.zig");
+    _ = @import("./src/dhcp.zig");
+    _ = @import("./src/state.zig");
+    _ = @import("./src/dns.zig");
+    _ = @import("./src/sync.zig");
+    _ = @import("./src/metrics.zig");
+    _ = @import("./src/admin_ssh.zig");
+}
