@@ -2962,7 +2962,7 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     // Build lines.
-    var lines: [40]struct { text: []const u8, style: vaxis.Style } = undefined;
+    var lines: [50]struct { text: []const u8, style: vaxis.Style } = undefined;
     var lcount: usize = 0;
 
     const fields = pool_field_meta;
@@ -2988,16 +2988,19 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
             } else "\xe2\x80\x94",
             7 => std.fmt.allocPrint(fa, "{d}", .{pool.lease_time}) catch "?",
             8 => if (pool.time_offset) |off| std.fmt.allocPrint(fa, "{d}", .{off}) catch "?" else "\xe2\x80\x94",
-            9 => if (pool.log_servers.len > 0) (std.mem.join(fa, ", ", pool.log_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            10 => if (pool.ntp_servers.len > 0) (std.mem.join(fa, ", ", pool.ntp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            11 => if (pool.tftp_server_name.len > 0) pool.tftp_server_name else "\xe2\x80\x94",
-            12 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
-            13 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
-            14 => if (pool.dns_update.enable) "yes" else "no",
-            15 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
-            16 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
-            17 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
-            18 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
+            9 => if (pool.mtu) |mtu| std.fmt.allocPrint(fa, "{d}", .{mtu}) catch "?" else "\xe2\x80\x94",
+            10 => if (pool.log_servers.len > 0) (std.mem.join(fa, ", ", pool.log_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
+            11 => if (pool.ntp_servers.len > 0) (std.mem.join(fa, ", ", pool.ntp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
+            12 => if (pool.wins_servers.len > 0) (std.mem.join(fa, ", ", pool.wins_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
+            13 => if (pool.tftp_server_name.len > 0) pool.tftp_server_name else "\xe2\x80\x94",
+            14 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
+            15 => if (pool.cisco_tftp_servers.len > 0) (std.mem.join(fa, ", ", pool.cisco_tftp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
+            16 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
+            17 => if (pool.dns_update.enable) "yes" else "no",
+            18 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
+            19 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
+            20 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
+            21 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
             else => "\xe2\x80\x94",
         };
         const line = std.fmt.allocPrint(fa, "  {s:<18} {s}", .{ meta.label, val }) catch "";
