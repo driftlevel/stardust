@@ -2,3 +2,4 @@
 .opencode
 main
 zig-out
+test_format
