@@ -3205,7 +3205,7 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
         },
         .pool_route_edit => {
             const w: u16 = 48;
-            const h: u16 = 8;
+            const h: u16 = if (state.pool_form.err_len > 0) 9 else 8;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .pool_option_edit => {
@@ -4837,7 +4837,8 @@ fn renderHelp(state: *TuiState, win: vaxis.Window) void {
 fn renderPoolRouteEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const form = &state.pool_form;
     const BOX_W: u16 = 48;
-    const BOX_H: u16 = 8;
+    const has_err = form.err_len > 0;
+    const BOX_H: u16 = if (has_err) 9 else 8;
     if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
@@ -4890,6 +4891,10 @@ fn renderPoolRouteEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocato
         _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 4, .wrap = .none });
     }
 
+    if (has_err) {
+        const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+        _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
+    }
     _ = box.print(&.{.{ .text = "  Tab: switch  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
@@ -4897,12 +4902,53 @@ fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
     var form = &state.pool_form;
 
     if (key.matches(vaxis.Key.escape, .{})) {
+        form.err_len = 0;
         state.mode = .pool_form;
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
+        form.err_len = 0;
+        // Validate network (must be valid CIDR).
+        const dest = form.route_edit_dest[0..form.route_edit_dest_len];
+        if (dest.len == 0) {
+            const msg = "  Network is required";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        }
+        _ = config_mod.parseCidr(dest) catch {
+            const msg = "  Invalid CIDR (e.g. 10.0.0.0/24)";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        };
+        // Validate gateway (must be valid IP on the pool's subnet).
+        const gw = form.route_edit_router[0..form.route_edit_router_len];
+        if (gw.len == 0) {
+            const msg = "  Gateway is required";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        }
+        const gw_ip = config_mod.parseIpv4(gw) catch {
+            const msg = "  Invalid gateway IP";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        };
+        // Check gateway is on the pool's subnet.
+        const pool_subnet = config_mod.parseCidr(form.subnet_buf[0..form.subnet_len]) catch null;
+        if (pool_subnet) |ps| {
+            const gw_int = std.mem.readInt(u32, &gw_ip, .big);
+            const subnet_int = std.mem.readInt(u32, &ps.ip, .big);
+            if (gw_int & ps.mask != subnet_int & ps.mask) {
+                const msg = "  Gateway not on pool subnet";
+                form.err_len = msg.len;
+                @memcpy(form.err_buf[0..msg.len], msg);
+                return;
+            }
+        }
         // Save the route.
-        if (form.route_edit_dest_len == 0) return; // need at least a network
         if (form.route_edit_index) |idx| {
             // Editing existing.
             if (idx < form.route_count) {
