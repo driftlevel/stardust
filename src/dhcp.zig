@@ -79,8 +79,11 @@ pub const OptionCode = enum(u8) {
     LogServer = 7,
     HostName = 12,
     DomainName = 15,
+    InterfaceMTU = 26,
+    BroadcastAddress = 28,
     StaticRoutes = 33, // RFC 2132 §3.3
     NtpServers = 42,
+    NetBIOSNameServers = 44,
     RequestedIPAddress = 50,
     IPAddressLeaseTime = 51,
     MessageType = 53,
@@ -95,6 +98,7 @@ pub const OptionCode = enum(u8) {
     RelayAgentInformation = 82,
     DomainSearch = 119,
     ClasslessStaticRoutes = 121, // RFC 3442
+    CiscoTftp = 150, // Cisco TFTP server address
     End = 255,
     _,
 };
@@ -1408,6 +1412,40 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
+        // Option 26: Interface MTU
+        if (!isOverridden(&overrides, 26)) {
+            if (pool.mtu) |mtu| {
+                if (isRequestedCode(prl, 26) and opts_len + 4 <= opts_buf.len) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.InterfaceMTU);
+                    opts_buf[opts_len + 1] = 2;
+                    const mtu_be = std.mem.nativeToBig(u16, mtu);
+                    @memcpy(opts_buf[opts_len + 2 .. opts_len + 4], &std.mem.toBytes(mtu_be));
+                    opts_len += 4;
+                }
+            }
+        }
+
+        // Option 28: Broadcast Address (auto-derived from subnet)
+        if (!isOverridden(&overrides, 28)) {
+            if (isRequestedCode(prl, 28) and opts_len + 6 <= opts_buf.len) {
+                const bcast_sip = config_mod.parseIpv4(pool.subnet) catch null;
+                if (bcast_sip) |sip| {
+                    const bcast_ip_int = std.mem.readInt(u32, &sip, .big);
+                    const bcast = bcast_ip_int | ~pool.subnet_mask;
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.BroadcastAddress);
+                    opts_buf[opts_len + 1] = 4;
+                    const bcast_be = std.mem.nativeToBig(u32, bcast);
+                    @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &std.mem.toBytes(bcast_be));
+                    opts_len += 6;
+                }
+            }
+        }
+
+        // Option 44: NetBIOS/WINS Name Servers
+        if (!isOverridden(&overrides, 44)) {
+            appendIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers);
+        }
+
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
         if (isHttpClient(request) and pool.http_boot_url.len > 0) {
             // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
@@ -1417,6 +1455,11 @@ pub const DHCPServer = struct {
         } else {
             appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
+
+        // Option 150: Cisco TFTP Server
+        if (!isOverridden(&overrides, 150)) {
+            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.cisco_tftp_servers);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -1724,6 +1767,40 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
+        // Option 26: Interface MTU
+        if (!isOverridden(&overrides, 26)) {
+            if (pool.mtu) |mtu| {
+                if (isRequestedCode(prl, 26) and opts_len + 4 <= opts_buf.len) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.InterfaceMTU);
+                    opts_buf[opts_len + 1] = 2;
+                    const mtu_be = std.mem.nativeToBig(u16, mtu);
+                    @memcpy(opts_buf[opts_len + 2 .. opts_len + 4], &std.mem.toBytes(mtu_be));
+                    opts_len += 4;
+                }
+            }
+        }
+
+        // Option 28: Broadcast Address (auto-derived from subnet)
+        if (!isOverridden(&overrides, 28)) {
+            if (isRequestedCode(prl, 28) and opts_len + 6 <= opts_buf.len) {
+                const bcast_sip = config_mod.parseIpv4(pool.subnet) catch null;
+                if (bcast_sip) |sip| {
+                    const bcast_ip_int = std.mem.readInt(u32, &sip, .big);
+                    const bcast = bcast_ip_int | ~pool.subnet_mask;
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.BroadcastAddress);
+                    opts_buf[opts_len + 1] = 4;
+                    const bcast_be = std.mem.nativeToBig(u32, bcast);
+                    @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &std.mem.toBytes(bcast_be));
+                    opts_len += 6;
+                }
+            }
+        }
+
+        // Option 44: NetBIOS/WINS Name Servers
+        if (!isOverridden(&overrides, 44)) {
+            appendIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers);
+        }
+
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
         if (isHttpClient(request) and pool.http_boot_url.len > 0) {
             // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
@@ -1733,6 +1810,11 @@ pub const DHCPServer = struct {
         } else {
             appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
+
+        // Option 150: Cisco TFTP Server
+        if (!isOverridden(&overrides, 150)) {
+            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.cisco_tftp_servers);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -2156,6 +2238,40 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
+        // Option 26: Interface MTU
+        if (!isOverridden(&overrides, 26)) {
+            if (pool.mtu) |mtu| {
+                if (isRequestedCode(prl, 26) and opts_len + 4 <= opts_buf.len) {
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.InterfaceMTU);
+                    opts_buf[opts_len + 1] = 2;
+                    const mtu_be = std.mem.nativeToBig(u16, mtu);
+                    @memcpy(opts_buf[opts_len + 2 .. opts_len + 4], &std.mem.toBytes(mtu_be));
+                    opts_len += 4;
+                }
+            }
+        }
+
+        // Option 28: Broadcast Address (auto-derived from subnet)
+        if (!isOverridden(&overrides, 28)) {
+            if (isRequestedCode(prl, 28) and opts_len + 6 <= opts_buf.len) {
+                const bcast_sip = config_mod.parseIpv4(pool.subnet) catch null;
+                if (bcast_sip) |sip| {
+                    const bcast_ip_int = std.mem.readInt(u32, &sip, .big);
+                    const bcast = bcast_ip_int | ~pool.subnet_mask;
+                    opts_buf[opts_len] = @intFromEnum(OptionCode.BroadcastAddress);
+                    opts_buf[opts_len + 1] = 4;
+                    const bcast_be = std.mem.nativeToBig(u32, bcast);
+                    @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &std.mem.toBytes(bcast_be));
+                    opts_len += 6;
+                }
+            }
+        }
+
+        // Option 44: NetBIOS/WINS Name Servers
+        if (!isOverridden(&overrides, 44)) {
+            appendIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers);
+        }
+
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
         if (isHttpClient(request) and pool.http_boot_url.len > 0) {
             // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
@@ -2165,6 +2281,11 @@ pub const DHCPServer = struct {
         } else {
             appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
+
+        // Option 150: Cisco TFTP Server
+        if (!isOverridden(&overrides, 150)) {
+            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.cisco_tftp_servers);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -2530,8 +2651,11 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -2588,8 +2712,11 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -2619,8 +2746,11 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -4488,8 +4618,11 @@ test "collectOverrides: priority pool < mac_class < reservation" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
         .reservations = &.{},
@@ -4550,8 +4683,11 @@ test "collectOverrides: most specific MAC class wins" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = &.{},
@@ -4602,8 +4738,11 @@ test "collectOverrides: no matches returns pool options only" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
         .reservations = &.{},

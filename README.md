@@ -66,8 +66,11 @@ kill -HUP $(pidof stardust)
 | 7 | Log servers |
 | 12 | Hostname (from reservation config or client request) |
 | 15 | Domain name |
+| 26 | Interface MTU |
+| 28 | Broadcast address (auto-derived from subnet) |
 | 33 | Static routes |
 | 42 | NTP servers |
+| 44 | NetBIOS/WINS name servers |
 | 51 | Lease time |
 | 53 | Message type |
 | 54 | Server identifier |
@@ -81,6 +84,7 @@ kill -HUP $(pidof stardust)
 | 82 | Relay agent information — parsed and logged at VERBOSE level |
 | 119 | Domain search list (RFC 3397) |
 | 121 | Classless static routes (RFC 3442) |
+| 150 | Cisco TFTP server address |
 
 Arbitrary additional options can be injected via `dhcp_options` in config
 (numeric keys, IPv4 or raw string values).
@@ -311,7 +315,8 @@ fields:
 Each entry in `pools:` is one subnet. Required pool fields: `subnet` (CIDR),
 `router`, `dns_servers`, `lease_time`. Optional: `pool_start`, `pool_end`,
 `domain_name`, `domain_search`, `reservations`, `static_routes`,
-`dhcp_options`, `dns_update`, `http_boot_url`, and all time/NTP/PXE options.
+`dhcp_options`, `dns_update`, `http_boot_url`, `mtu`, `wins_servers`,
+`cisco_tftp_servers`, and all time/NTP/PXE options.
 
 ## Compilation
 

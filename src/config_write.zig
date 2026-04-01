@@ -147,11 +147,26 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
             try w.print("      - {s}\n", .{s});
         }
     }
+    if (pool.mtu) |mtu| {
+        try w.print("    mtu: {d}\n", .{mtu});
+    }
+    if (pool.wins_servers.len > 0) {
+        try w.writeAll("    wins_servers:\n");
+        for (pool.wins_servers) |s| {
+            try w.print("      - {s}\n", .{s});
+        }
+    }
     if (pool.tftp_server_name.len > 0) {
         try w.print("    tftp_server_name: {s}\n", .{pool.tftp_server_name});
     }
     if (pool.boot_filename.len > 0) {
         try w.print("    boot_filename: {s}\n", .{pool.boot_filename});
+    }
+    if (pool.cisco_tftp_servers.len > 0) {
+        try w.writeAll("    cisco_tftp_servers:\n");
+        for (pool.cisco_tftp_servers) |s| {
+            try w.print("      - {s}\n", .{s});
+        }
     }
     if (pool.http_boot_url.len > 0) {
         try w.print("    http_boot_url: {s}\n", .{pool.http_boot_url});
@@ -512,8 +527,11 @@ test "renderConfig includes mac_classes" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -584,8 +602,11 @@ test "renderConfig includes reservation dhcp_options" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -654,8 +675,11 @@ test "upsertReservation adds new entry" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = reservations,
@@ -714,8 +738,11 @@ test "upsertReservation updates existing entry" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = res_slice,
@@ -772,8 +799,11 @@ test "removeReservation removes by MAC" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = res_slice,
@@ -839,8 +869,11 @@ test "addPool appends to pools slice" {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 7200 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -872,8 +905,11 @@ test "removePool removes by index and frees resources" {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -896,8 +932,11 @@ test "removePool removes by index and frees resources" {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 1800 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -959,8 +998,11 @@ test "upsertReservation with dhcp_options" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = reservations,
@@ -1049,8 +1091,11 @@ test "removeReservation frees dhcp_options" {
         .time_servers = &.{},
         .log_servers = &.{},
         .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
         .tftp_server_name = "",
         .boot_filename = "",
+        .cisco_tftp_servers = &.{},
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = res_slice,

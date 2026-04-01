@@ -61,9 +61,20 @@ pools:
     # log_servers:          # syslog servers (option 7)
     #   - "192.168.1.1"
 
+    # Interface MTU (option 26) — useful for jumbo frames, PPPoE (1492), or VPN overlays
+    # mtu: 1500
+
+    # NetBIOS/WINS name servers (option 44)
+    # wins_servers:
+    #   - "192.168.1.1"
+
     # PXE / TFTP network boot (options 66 and 67)
     # tftp_server_name: "192.168.1.1"
     # boot_filename: "pxelinux.0"
+
+    # Cisco TFTP server addresses (option 150) — used by Cisco IP phones
+    # cisco_tftp_servers:
+    #   - "192.168.1.1"
 
     # UEFI HTTP boot — when a client sends option 60 = "HTTPClient",
     # the server echoes option 60 and provides this URL as option 67.

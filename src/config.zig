@@ -86,8 +86,11 @@ pub const PoolConfig = struct {
     time_servers: [][]const u8,
     log_servers: [][]const u8,
     ntp_servers: [][]const u8,
+    mtu: ?u16 = null, // interface MTU (option 26); null = not sent
+    wins_servers: [][]const u8, // NetBIOS/WINS name servers (option 44)
     tftp_server_name: []const u8,
     boot_filename: []const u8,
+    cisco_tftp_servers: [][]const u8, // Cisco TFTP server addresses (option 150)
     /// HTTP/HTTPS URL served as option 67 when the client identifies as a
     /// UEFI HTTP boot client (option 60 = "HTTPClient…").  When non-empty and
     /// the client sends the "HTTPClient" vendor class, this URL overrides
@@ -114,8 +117,12 @@ pub const PoolConfig = struct {
         allocator.free(self.log_servers);
         for (self.ntp_servers) |s| allocator.free(s);
         allocator.free(self.ntp_servers);
+        for (self.wins_servers) |s| allocator.free(s);
+        allocator.free(self.wins_servers);
         allocator.free(self.tftp_server_name);
         allocator.free(self.boot_filename);
+        for (self.cisco_tftp_servers) |s| allocator.free(s);
+        allocator.free(self.cisco_tftp_servers);
         allocator.free(self.http_boot_url);
         allocator.free(self.dns_update.server);
         allocator.free(self.dns_update.zone);
@@ -404,8 +411,11 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -528,6 +538,34 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
             for (pool.ntp_servers) |*s| s.* = "";
             for (list, 0..) |item, i| {
                 pool.ntp_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
+            }
+        }
+    }
+
+    if (pool_map.get("mtu")) |v| {
+        if (v.asScalar()) |s| {
+            pool.mtu = std.fmt.parseInt(u16, s, 10) catch null;
+        }
+    }
+
+    if (pool_map.get("wins_servers")) |v| {
+        if (v.asList()) |list| {
+            allocator.free(pool.wins_servers);
+            pool.wins_servers = try allocator.alloc([]const u8, list.len);
+            for (pool.wins_servers) |*s| s.* = "";
+            for (list, 0..) |item, i| {
+                pool.wins_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
+            }
+        }
+    }
+
+    if (pool_map.get("cisco_tftp_servers")) |v| {
+        if (v.asList()) |list| {
+            allocator.free(pool.cisco_tftp_servers);
+            pool.cisco_tftp_servers = try allocator.alloc([]const u8, list.len);
+            for (pool.cisco_tftp_servers) |*s| s.* = "";
+            for (list, 0..) |item, i| {
+                pool.cisco_tftp_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
         }
     }
@@ -1295,8 +1333,11 @@ fn makeHashTestConfig(alloc: std.mem.Allocator) Config {
         .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .mtu = null,
+        .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .cisco_tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
@@ -1467,8 +1508,11 @@ test "computePoolHash: different pool count produces different hash" {
         .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .mtu = null,
+        .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .cisco_tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
