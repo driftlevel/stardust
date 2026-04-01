@@ -3758,20 +3758,23 @@ fn validatePoolForm(form: *PoolForm) ?[]const u8 {
         if (r_int & si.mask != s_int & si.mask) return "Router not in subnet";
     }
 
-    // Pool start: optional, must be valid IPv4 inside the subnet.
+    // Pool start/end: optional, must be valid IPv4 inside the subnet, start <= end.
+    var ps_int_opt: ?u32 = null;
     if (form.pool_start_len > 0) {
         const ps_ip = config_mod.parseIpv4(form.pool_start_buf[0..form.pool_start_len]) catch return "Invalid pool start IP";
         const ps_int = std.mem.readInt(u32, &ps_ip, .big);
         const s_int = std.mem.readInt(u32, &si.ip, .big);
         if (ps_int & si.mask != s_int & si.mask) return "Pool start not in subnet";
+        ps_int_opt = ps_int;
     }
-
-    // Pool end: optional, must be valid IPv4 inside the subnet.
     if (form.pool_end_len > 0) {
         const pe_ip = config_mod.parseIpv4(form.pool_end_buf[0..form.pool_end_len]) catch return "Invalid pool end IP";
         const pe_int = std.mem.readInt(u32, &pe_ip, .big);
         const s_int = std.mem.readInt(u32, &si.ip, .big);
         if (pe_int & si.mask != s_int & si.mask) return "Pool end not in subnet";
+        if (ps_int_opt) |ps| {
+            if (ps > pe_int) return "Pool start must be <= pool end";
+        }
     }
 
     // Domain name: auto-lowercase, validate characters.
