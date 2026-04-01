@@ -6,8 +6,53 @@ on:
       - "v*"
 
 jobs:
+  changelog:
+    name: Extract changelog
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.extract.outputs.notes }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract changelog for tag
+        id: extract
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          # Find the section header matching this tag (e.g. "## v0.2-alpha1")
+          # and extract everything until the next "## " header or end of file.
+          if ! grep -qE "^## ${TAG}( |$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for ${TAG}. Add a '## ${TAG}' section before tagging."
+            exit 1
+          fi
+
+          # Extract the section body (everything between this header and the next ## or EOF)
+          NOTES=$(awk -v tag="## ${TAG}" '
+            BEGIN { found=0 }
+            $0 ~ "^"tag"( |$)" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          # Strip leading/trailing blank lines
+          NOTES=$(echo "$NOTES" | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba}')
+
+          if [ -z "$NOTES" ]; then
+            echo "::error::CHANGELOG.md entry for ${TAG} is empty. Add release notes before tagging."
+            exit 1
+          fi
+
+          # Write to output using heredoc delimiter
+          {
+            echo "notes<<CHANGELOG_EOF"
+            echo "$NOTES"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.zig_target }}
+    needs: changelog
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -128,7 +173,7 @@ jobs:
 
   release:
     name: Create release
-    needs: build
+    needs: [changelog, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -143,4 +188,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: "dist/*"
-          generate_release_notes: true
+          body: ${{ needs.changelog.outputs.notes }}

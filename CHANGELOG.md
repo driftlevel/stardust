@@ -59,6 +59,60 @@ In-process counters for all DHCP message types, pool utilization, and defense ev
 
 ---
 
-## v0.1-alpha1
+## v0.1-alpha1 (2026-03-28)
 
-Initial release: core DHCP server with DISCOVER/OFFER/REQUEST/ACK/NAK/RELEASE/DECLINE/INFORM, relay agent support, multiple pools, static reservations, lease persistence, SIGHUP reload, RFC 2136 dynamic DNS updates with TSIG, active-active lease sync with AES-256-GCM, pre-offer conflict detection (ARP/ICMP), DHCPDECLINE protection, and static/classless routes.
+Initial feature-complete release of Stardust DHCP server.
+
+### Core DHCP
+
+- Full DISCOVER / OFFER / REQUEST / ACK / NAK flow (RFC 2131)
+- DHCPRELEASE, DHCPDECLINE, and DHCPINFORM handling
+- Relay agent support -- routes responses via `giaddr` (RFC 2131 S4.1)
+- Multiple pools -- serve several subnets from one daemon; relay agent `giaddr` or `ciaddr` selects the correct pool
+- Configurable lease range (`pool_start` / `pool_end`); defaults to full usable subnet
+- Lease state persisted to JSON and restored at startup
+- SIGHUP config reload without dropping the socket
+- Client identifier (option 61) support for lease tracking across MAC changes
+
+### DHCP Options
+
+Subnet mask (1), time offset (2), router (3), time servers (4), DNS servers (6), log servers (7), hostname (12), domain name (15), static routes (33), NTP servers (42), lease time (51), TFTP server (66), boot filename (67), domain search list (119, RFC 3397), classless static routes (121, RFC 3442), and arbitrary custom options via `dhcp_options` map.
+
+### Static Reservations
+
+Pin MAC address or client identifier (option 61) to a fixed IP and optional hostname. Reservations survive lease expiry and DHCPRELEASE.
+
+### Pre-Offer Conflict Detection
+
+- ARP probe (RFC 5227 style) for local clients; ICMP echo for relayed clients
+- Conflicting addresses quarantined for `max(lease_time / 10, 300)` seconds
+
+### DHCPDECLINE Protection
+
+- Per-MAC cooldown after 3 declines within 60 seconds
+- Global rate limit: 20 declines per 5-minute window
+
+### Dynamic DNS Updates (RFC 2136)
+
+- A and PTR record updates on lease grant/release
+- TSIG authentication (HMAC-SHA256 / HMAC-MD5) with BIND key files
+- Anonymous updates when `key_file` is empty
+- Reverse zone auto-derived from subnet prefix length
+
+### Lease Synchronisation (Active-Active)
+
+- UDP lease sync with AES-256-GCM encryption (HKDF-SHA-256 key derivation)
+- HELLO handshake with SHA-256 pool hash verification
+- Last-write-wins conflict resolution; periodic lease-hash anti-entropy
+- Multicast or unicast peer discovery
+- DNS failover: lowest-IP server takes over when primary is offline
+
+### Packaging
+
+- systemd unit with `DynamicUser=yes`
+- Multi-arch container images (x86_64, aarch64, riscv64) on GHCR
+- CI and tag-triggered release builds (.deb, .rpm, .tar.gz)
+
+### Bug Fixes (since v0.1-alpha)
+
+- TSIG MAC: added CLASS and TTL to `tsig_vars` per RFC 2845 S4.3.2
