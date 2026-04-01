@@ -9,7 +9,7 @@
 #   docker run --rm --network host \
 #     -v /etc/stardust/config.yaml:/etc/stardust/config.yaml:ro \
 #     -v stardust-state:/var/lib/stardust \
-#     ghcr.io/ryannoblett/stardust
+#     ghcr.io/driftlevel/stardust
 #
 # DHCP requires --network host (broadcast on 255.255.255.255 does not work
 # through Docker's default bridge NAT) and CAP_NET_BIND_SERVICE + CAP_NET_RAW
@@ -28,7 +28,7 @@ ARG TARGETARCH
 LABEL org.opencontainers.image.title="stardust"
 LABEL org.opencontainers.image.description="Lightweight DHCP server (RFC 2131/2132)"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.source="https://github.com/ryannoblett/stardust"
+LABEL org.opencontainers.image.source="https://github.com/driftlevel/stardust"
 
 COPY --from=dirs /etc/stardust/  /etc/stardust/
 COPY --from=dirs /var/lib/stardust/ /var/lib/stardust/

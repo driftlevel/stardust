@@ -1,6 +1,6 @@
 # Stardust
 
-[![CI](https://github.com/ryannoblett/stardust/actions/workflows/ci.yml/badge.svg)](https://github.com/ryannoblett/stardust/actions/workflows/ci.yml)
+[![CI](https://github.com/driftlevel/stardust/actions/workflows/ci.yml/badge.svg)](https://github.com/driftlevel/stardust/actions/workflows/ci.yml)
 
 A lightweight DHCP server (RFC 2131/2132) written in Zig. Designed for
 small-to-medium networks where you want a fast, single-binary daemon with
@@ -318,7 +318,7 @@ Each entry in `pools:` is one subnet. Required pool fields: `subnet` (CIDR),
 Requires **Zig 0.15.2** and **libssh** (for the SSH admin TUI).
 
 ```bash
-git clone https://github.com/ryannoblett/stardust
+git clone https://github.com/driftlevel/stardust
 cd stardust
 zig build                        # release build
 zig build -Doptimize=ReleaseSafe # optimised, safety checks kept
@@ -344,7 +344,7 @@ Multi-arch images (x86\_64, aarch64, riscv64) are published to the GitHub
 Container Registry on every release:
 
 ```bash
-docker pull ghcr.io/ryannoblett/stardust:latest
+docker pull ghcr.io/driftlevel/stardust:latest
 ```
 
 The image is built on `scratch` — it contains only the statically-linked
@@ -358,7 +358,7 @@ docker run -d --name stardust \
   --restart unless-stopped \
   -v /etc/stardust/config.yaml:/etc/stardust/config.yaml:ro \
   -v stardust-state:/var/lib/stardust \
-  ghcr.io/ryannoblett/stardust:latest
+  ghcr.io/driftlevel/stardust:latest
 ```
 
 `--network host` is required — DHCP uses 255.255.255.255 broadcasts that
