@@ -3428,7 +3428,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             const r = &form.routes[ri];
             const dest = r.dest_buf[0..r.dest_len];
             const router = r.router_buf[0..r.router_len];
-            const line = std.fmt.allocPrint(fa, "    {s:<18} via {s}", .{
+            const line = std.fmt.allocPrint(fa, "  {s:<18} via {s}", .{
                 if (dest.len > 0) dest else "...",
                 if (router.len > 0) router else "...",
             }) catch "";
@@ -3438,8 +3438,8 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
             const opt_padded = try fa.alloc(u8, opt_pad);
             @memset(opt_padded, ' ');
-            _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-            _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+            _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+            _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
         } else if (fi >= form.firstOptionField()) {
             // Existing option entry.
             const oi = fi - form.firstOptionField();
@@ -3447,7 +3447,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                 const o = &form.options[oi];
                 const code = o.code_buf[0..o.code_len];
                 const val = o.value_buf[0..o.value_len];
-                const line = std.fmt.allocPrint(fa, "    {s:<6} {s}", .{
+                const line = std.fmt.allocPrint(fa, "  {s:<6} {s}", .{
                     if (code.len > 0) code else "?",
                     if (val.len > 0) val else "?",
                 }) catch "";
@@ -3457,8 +3457,8 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                 const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
                 const opt_padded = try fa.alloc(u8, opt_pad);
                 @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
             }
         }
         abs_row += 1;
@@ -3466,10 +3466,12 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     }
 
     // Hint + error (inside border).
-    const is_inline = form.active_field >= PoolForm.REGULAR_FIELD_COUNT and
-        form.active_field != form.addRouteField() and form.active_field != form.addOptionField();
+    const is_add_btn = form.active_field == form.addRouteField() or form.active_field == form.addOptionField();
+    const is_inline = form.active_field >= PoolForm.REGULAR_FIELD_COUNT and !is_add_btn;
     const hint_text = if (is_inline)
         "  Enter:edit  d:delete  Tab:next  Esc:cancel"
+    else if (is_add_btn)
+        "  Enter:add  Tab:next  Shift-Tab:prev  Esc:cancel"
     else
         "  Tab:next  Shift-Tab:prev  Enter:review  Esc:cancel";
     _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
