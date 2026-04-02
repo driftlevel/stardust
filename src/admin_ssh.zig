@@ -2646,7 +2646,7 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "Pool Start" }, // 2
     .{ .label = "Pool End" }, // 3
     .{ .label = "Domain Name", .section = "Naming" }, // 4
-    .{ .label = "Lease Time", .section = "Timing" }, // 5
+    .{ .label = "Lease Time", .section = "Network Options" }, // 5
     .{ .label = "Time Offset" }, // 6
     .{ .label = "MTU" }, // 7
     .{ .label = "Boot Filename", .section = "Boot" }, // 8
@@ -3207,7 +3207,7 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     }
     // Inline server sections (shown after regular fields).
     const inline_sections = [_]struct { label: []const u8, items: []const []const u8 }{
-        .{ .label = "Domain Search", .items = pool.domain_search },
+        .{ .label = "Domains", .items = pool.domain_search },
         .{ .label = "DNS Servers", .items = pool.dns_servers },
         .{ .label = "Log Servers", .items = pool.log_servers },
         .{ .label = "NTP Servers", .items = pool.ntp_servers },
@@ -3291,7 +3291,9 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
                         abs += 2; // blank line + section header
                     }
                 } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
-                    abs += 2; // blank line + section header
+                    abs += 1; // blank line
+                    const has_hdr = (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField());
+                    if (has_hdr) abs += 1; // section header
                 }
                 if (abs == clicked_abs) {
                     form.active_field = fi;
@@ -3502,7 +3504,9 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                 }
             } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
                 r += 1; // blank line
-                r += 1; // section header
+                // Section header only for group leaders.
+                const has_header = (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField());
+                if (has_header) r += 1;
             }
             field_rows[fi] = r;
             r += 1;
@@ -3541,16 +3545,19 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                 if (draw_row >= BOX_H - 2) break;
             }
         } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
-            // Inline section header.
-            const sec_name: []const u8 = if (fi == form.addDomainSearchField()) "Domain Search" else if (fi == form.addDnsField()) "DNS Servers" else if (fi == form.addLogField()) "Log Servers" else if (fi == form.addNtpField()) "NTP Servers" else if (fi == form.addWinsField()) "WINS Servers" else if (fi == form.addTftpField()) "TFTP Servers" else if (fi == form.addRouteField()) "Routes" else "DHCP Options";
+            // Inline section: blank line, optional section header, then [+] Add button.
+            // Section headers only for the first field in each group.
+            const sec_name: ?[]const u8 = if (fi == form.addDomainSearchField()) "Domains" else if (fi == form.addDnsField()) "Services" else if (fi == form.addTftpField()) "Boot" else if (fi == form.addRouteField()) "Routes" else if (fi == form.addOptionField()) "DHCP Options" else null;
             if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
             abs_row += 1;
-            if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec_name}) catch "";
-                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-                draw_row += 1;
+            if (sec_name) |sn| {
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                    const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sn}) catch "";
+                    _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                    draw_row += 1;
+                }
+                abs_row += 1;
             }
-            abs_row += 1;
             if (draw_row >= BOX_H - 2) break;
         }
 
@@ -3599,7 +3606,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             }
         } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
             // [+] Add button.
-            const add_label: []const u8 = if (fi == form.addDomainSearchField()) "  Domain Search  " else if (fi == form.addDnsField()) "  DNS Servers    " else if (fi == form.addLogField()) "  Log Servers    " else if (fi == form.addNtpField()) "  NTP Servers    " else if (fi == form.addWinsField()) "  WINS Servers   " else if (fi == form.addTftpField()) "  TFTP Servers   " else if (fi == form.addRouteField()) "  Routes         " else "  DHCP Options   ";
+            const add_label: []const u8 = if (fi == form.addDomainSearchField()) "  Domains        " else if (fi == form.addDnsField()) "  DNS Servers    " else if (fi == form.addLogField()) "  Log Servers    " else if (fi == form.addNtpField()) "  NTP Servers    " else if (fi == form.addWinsField()) "  WINS Servers   " else if (fi == form.addTftpField()) "  TFTP Servers   " else if (fi == form.addRouteField()) "  Routes         " else "  DHCP Options   ";
             _ = box.print(&.{.{ .text = add_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
             // Check if at max capacity.
             const at_max = if (fi == form.addDomainSearchField()) form.domain_search_count >= form.domain_search.len else if (fi == form.addDnsField()) form.dns_servers_count >= form.dns_servers.len else if (fi == form.addLogField()) form.log_servers_count >= form.log_servers.len else if (fi == form.addNtpField()) form.ntp_servers_count >= form.ntp_servers.len else if (fi == form.addWinsField()) form.wins_servers_count >= form.wins_servers.len else if (fi == form.addTftpField()) form.tftp_servers_count >= form.tftp_servers.len else if (fi == form.addRouteField()) form.route_count >= form.routes.len else form.option_count >= form.options.len;
@@ -4292,7 +4299,7 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
         if (form.domain_search_count > 0 and confirm.change_count < confirm.changes.len) {
             var buf: [32]u8 = undefined;
             const n = std.fmt.bufPrint(&buf, "{d} domain(s)", .{form.domain_search_count}) catch "domains";
-            confirm.changes[confirm.change_count] = .{ .label = "Domain Search", .old_val = "", .new_val = n, .kind = .drift };
+            confirm.changes[confirm.change_count] = .{ .label = "Domains", .old_val = "", .new_val = n, .kind = .drift };
             confirm.change_count += 1;
         }
         const new_srv_counts = [_]struct { label: []const u8, count: usize }{
@@ -4366,7 +4373,7 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
             var new_buf: [32]u8 = undefined;
             const old_n = std.fmt.bufPrint(&old_buf, "{d} domain(s)", .{tmp_form.domain_search_count}) catch "?";
             const new_n = std.fmt.bufPrint(&new_buf, "{d} domain(s)", .{form.domain_search_count}) catch "?";
-            confirm.changes[confirm.change_count] = .{ .label = "Domain Search", .old_val = old_n, .new_val = new_n, .kind = .drift };
+            confirm.changes[confirm.change_count] = .{ .label = "Domains", .old_val = old_n, .new_val = new_n, .kind = .drift };
             confirm.change_count += 1;
         }
     } else {
@@ -4378,7 +4385,7 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
             }
         }
         if (ds_differ and confirm.change_count < confirm.changes.len) {
-            confirm.changes[confirm.change_count] = .{ .label = "Domain Search", .old_val = "(modified)", .new_val = "(modified)", .kind = .drift };
+            confirm.changes[confirm.change_count] = .{ .label = "Domains", .old_val = "(modified)", .new_val = "(modified)", .kind = .drift };
             confirm.change_count += 1;
         }
     }

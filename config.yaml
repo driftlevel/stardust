@@ -41,24 +41,22 @@ pools:
     # DHCP lease time in seconds
     lease_time: 3600
 
-    # DNS servers (option 6) — max 8, order matters (clients try in order).
-    # Accepts IP addresses or domain names (resolved to IP at send time).
-    dns_servers:
-      - "8.8.8.8"
-      - "8.8.4.4"
-
-    # Domain name and search list (options 15 and 119)
+    # Naming — domain name (option 15) and domain search list (option 119)
     domain_name: "stardust.lan"
     # domain_search:
     #   - "stardust.lan"
     #   - "internal.example.com"
 
-    # Time configuration
-    # time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000=UTC-5, 3600=UTC+1
+    # Services — DNS, NTP, syslog, and WINS servers.
+    # All accept IP addresses or domain names (resolved to IP at send time).
+
+    # DNS servers (option 6) — max 8, order matters (clients try in order).
+    dns_servers:
+      - "8.8.8.8"
+      - "8.8.4.4"
 
     # NTP servers (option 42, also serves option 4) — max 4.
     # Order is randomized per client to spread load.
-    # Accepts IP addresses or domain names.
     # ntp_servers:
     #   - "ntp1.example.com"
     #   - "ntp2.example.com"
@@ -68,24 +66,21 @@ pools:
     # time_servers:         # RFC 868 (option 4); overrides ntp_servers for option 4 only
     #   - "192.168.1.1"    # usually not needed — ntp_servers is preferred
 
-    # Syslog servers (option 7) — max 4.
-    # Order is randomized per client to spread load.
-    # Accepts IP addresses or domain names.
+    # Syslog servers (option 7) — max 4, randomized per client.
     # log_servers:
     #   - "syslog1.example.com"
     #   - "syslog2.example.com"
 
-    # Interface MTU (option 26) — useful for jumbo frames, PPPoE (1492), or VPN overlays
-    # mtu: 1500
-
-    # NetBIOS/WINS name servers (option 44) — max 2.
-    # Order is randomized per client to spread load.
-    # Accepts IP addresses or domain names.
+    # NetBIOS/WINS name servers (option 44) — max 2, randomized per client.
     # wins_servers:
     #   - "dc1.example.com"
     #   - "dc2.example.com"
 
-    # TFTP servers (option 66 sends first entry, option 150 sends all) — max 4, order matters.
+    # Network options
+    # time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000=UTC-5, 3600=UTC+1
+    # mtu: 1500             # interface MTU (option 26); useful for jumbo frames, PPPoE, VPN
+
+    # Boot — TFTP servers (option 66 sends first entry, option 150 sends all) — max 4, order matters.
     # Accepts IP addresses or domain names.
     # tftp_servers:
     #   - "tftp1.example.com"
