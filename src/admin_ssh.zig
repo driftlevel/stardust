@@ -4448,8 +4448,9 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
     var tmp_form: PoolForm = .{};
     populatePoolForm(&tmp_form, pool);
 
-    // Sync-breaking field indices: subnet(0), pool_start(2), pool_end(3), lease_time(4)
-    const sync_fields = [_]u8{ 0, 2, 3, 4 };
+    // Sync-breaking: subnet(0), pool_start(2), pool_end(3), mtu(5)
+    // MTU mismatch causes packet fragmentation; lease_time(4) is config drift only.
+    const sync_fields = [_]u8{ 0, 2, 3, 5 };
 
     var fi: u8 = 0;
     while (fi < PoolForm.REGULAR_FIELD_COUNT) : (fi += 1) {
