@@ -632,77 +632,106 @@ const PoolForm = struct {
 
     const REGULAR_FIELD_COUNT: u8 = pool_field_meta.len;
 
+    /// Which kind of navigable item the active_field corresponds to.
+    const ActiveFieldKind = enum { field, add_button, inline_entry };
+    const ActiveFieldInfo = struct {
+        kind: ActiveFieldKind,
+        /// For .field: pool_field_meta index.  For .add_button/.inline_entry: undefined.
+        field_idx: u8 = 0,
+        /// For .add_button/.inline_entry: which inline target.
+        inline_target: ?InlineTarget = null,
+        /// For .inline_entry: which entry within that section.
+        entry_index: usize = 0,
+    };
+
+    /// Walk pool_layout to determine what kind of item the given active_field is.
+    fn activeFieldInfo(self: *const PoolForm, af: u8) ActiveFieldInfo {
+        var pos: u8 = 0;
+        for (pool_layout) |item| {
+            switch (item.kind) {
+                .section => {},
+                .field => {
+                    if (pos == af) return .{ .kind = .field, .field_idx = item.field_idx.? };
+                    pos += 1;
+                },
+                .inline_section => {
+                    const target = item.inline_target.?;
+                    if (pos == af) return .{ .kind = .add_button, .inline_target = target };
+                    pos += 1;
+                    const count = self.inlineCount(target);
+                    if (af < pos + @as(u8, @intCast(count))) {
+                        return .{ .kind = .inline_entry, .inline_target = target, .entry_index = af - pos };
+                    }
+                    pos += @intCast(count);
+                },
+            }
+        }
+        return .{ .kind = .field, .field_idx = 0 };
+    }
+
+    /// Return the active_field index for the [+] Add button or first entry of a target.
+    fn fieldPosition(self: *const PoolForm, target: InlineTarget, which: enum { add_button, first_entry }) u8 {
+        var pos: u8 = 0;
+        for (pool_layout) |item| {
+            switch (item.kind) {
+                .section => {},
+                .field => {
+                    pos += 1;
+                },
+                .inline_section => {
+                    const t = item.inline_target.?;
+                    if (t == target) {
+                        return if (which == .add_button) pos else pos + 1;
+                    }
+                    pos += 1; // [+] button
+                    pos += @intCast(self.inlineCount(t));
+                },
+            }
+        }
+        return pos;
+    }
+
+    fn inlineCount(self: *const PoolForm, target: InlineTarget) usize {
+        return switch (target) {
+            .domain_search => self.domain_search_count,
+            .dns => self.dns_servers_count,
+            .wins => self.wins_servers_count,
+            .ntp => self.ntp_servers_count,
+            .log => self.log_servers_count,
+            .tftp => self.tftp_servers_count,
+            .routes => self.route_count,
+            .options => self.option_count,
+        };
+    }
+
+    fn inlineMax(target: InlineTarget) usize {
+        return switch (target) {
+            .domain_search => 16,
+            .dns => 8,
+            .wins => 2,
+            .ntp => 4,
+            .log => 4,
+            .tftp => 4,
+            .routes => 32,
+            .options => 32,
+        };
+    }
+
     fn totalFields(self: *const PoolForm) u8 {
-        // regular fields + [+]DS + ds entries + [+]DNS + dns entries + [+]Log + log entries
-        // + [+]NTP + ntp entries + [+]WINS + wins entries + [+]TFTP + tftp entries
-        // + [+]Route + route entries + [+]Option + option entries
-        return @intCast(pool_field_meta.len + 1 + self.domain_search_count + 1 + self.dns_servers_count + 1 + self.log_servers_count + 1 + self.ntp_servers_count + 1 + self.wins_servers_count + 1 + self.tftp_servers_count + 1 + self.route_count + 1 + self.option_count);
-    }
-
-    fn addDomainSearchField(self: *const PoolForm) u8 {
-        _ = self;
-        return REGULAR_FIELD_COUNT; // first field after the regular text fields
-    }
-
-    fn firstDomainSearchField(self: *const PoolForm) u8 {
-        _ = self;
-        return REGULAR_FIELD_COUNT + 1;
-    }
-
-    fn addDnsField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 1 + self.domain_search_count);
-    }
-
-    fn firstDnsField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 2 + self.domain_search_count);
-    }
-
-    fn addLogField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 2 + self.domain_search_count + self.dns_servers_count);
-    }
-
-    fn firstLogField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 3 + self.domain_search_count + self.dns_servers_count);
-    }
-
-    fn addNtpField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 3 + self.domain_search_count + self.dns_servers_count + self.log_servers_count);
-    }
-
-    fn firstNtpField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 4 + self.domain_search_count + self.dns_servers_count + self.log_servers_count);
-    }
-
-    fn addWinsField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 4 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count);
-    }
-
-    fn firstWinsField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 5 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count);
-    }
-
-    fn addTftpField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 5 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count);
-    }
-
-    fn firstTftpField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 6 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count);
-    }
-
-    fn addRouteField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 6 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count);
-    }
-
-    fn firstRouteField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 7 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count);
-    }
-
-    fn addOptionField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 7 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count + self.route_count);
-    }
-
-    fn firstOptionField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 8 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count + self.route_count);
+        var pos: u8 = 0;
+        for (pool_layout) |item| {
+            switch (item.kind) {
+                .section => {},
+                .field => {
+                    pos += 1;
+                },
+                .inline_section => {
+                    pos += 1; // [+] button
+                    pos += @intCast(self.inlineCount(item.inline_target.?));
+                },
+            }
+        }
+        return pos;
     }
 
     fn isNew(self: *const PoolForm) bool {
@@ -1250,7 +1279,7 @@ fn runTui(
                                             handleFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
                                         } else if (state.mode == .pool_form) {
                                             const pf = &state.pool_form;
-                                            if (pf.active_field == pf.addDomainSearchField() or pf.active_field == pf.addDnsField() or pf.active_field == pf.addLogField() or pf.active_field == pf.addNtpField() or pf.active_field == pf.addWinsField() or pf.active_field == pf.addTftpField() or pf.active_field == pf.addRouteField() or pf.active_field == pf.addOptionField()) {
+                                            if (pf.activeFieldInfo(pf.active_field).kind == .add_button) {
                                                 handlePoolFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
                                             }
                                         }
@@ -1371,7 +1400,7 @@ fn runTui(
                             .pool_save_confirm => state.pool_confirm.scroll -|= 3,
                             .pool_form => if (state.pool_form.active_field > 0) {
                                 state.pool_form.active_field -= 1;
-                                state.pool_form.cursor = poolFormFieldLen(&state.pool_form, state.pool_form.active_field);
+                                state.pool_form.cursor = activeFieldCursorLen(&state.pool_form, state.pool_form.active_field);
                             },
                             .normal => switch (state.tab) {
                                 .leases => table_ctx.row -|= 1,
@@ -1391,7 +1420,7 @@ fn runTui(
                             .pool_save_confirm => state.pool_confirm.scroll +|= 3,
                             .pool_form => if (state.pool_form.active_field + 1 < state.pool_form.totalFields()) {
                                 state.pool_form.active_field += 1;
-                                state.pool_form.cursor = poolFormFieldLen(&state.pool_form, state.pool_form.active_field);
+                                state.pool_form.cursor = activeFieldCursorLen(&state.pool_form, state.pool_form.active_field);
                             },
                             .normal => switch (state.tab) {
                                 .leases => table_ctx.row +|= 1,
@@ -2633,29 +2662,77 @@ fn isIpInPool(ip_str: []const u8, pool: *const config_mod.PoolConfig) bool {
 // Pool config tab: list, detail view, edit form, diff/confirm, save logic
 // ---------------------------------------------------------------------------
 
-/// Field metadata for the pool form: label, section header (if first in group).
+/// Field metadata for the pool form: label + flags.  Index order matches
+/// poolFormFieldVal / poolFormFieldBuf switch cases.  Section headers and
+/// visual ordering are controlled by `pool_layout` below.
 const PoolFieldMeta = struct {
     label: []const u8,
-    section: ?[]const u8 = null, // non-null = render section header before this field
-    sensitive: bool = false, // hidden in read_only detail view
+    sensitive: bool = false, // hidden in read-only detail view
 };
 
 const pool_field_meta = [_]PoolFieldMeta{
-    .{ .label = "Subnet", .section = "Network" }, // 0
+    .{ .label = "Subnet" }, // 0
     .{ .label = "Router" }, // 1
     .{ .label = "Pool Start" }, // 2
     .{ .label = "Pool End" }, // 3
-    .{ .label = "Domain Name", .section = "Naming" }, // 4
-    .{ .label = "Lease Time", .section = "Network Options" }, // 5
-    .{ .label = "Time Offset" }, // 6
-    .{ .label = "MTU" }, // 7
-    .{ .label = "Boot Filename", .section = "Boot" }, // 8
+    .{ .label = "Lease Time" }, // 4  (was 5)
+    .{ .label = "MTU" }, // 5  (was 7)
+    .{ .label = "Domain Name" }, // 6  (was 4)
+    .{ .label = "Time Offset" }, // 7  (was 6)
+    .{ .label = "Boot Filename" }, // 8
     .{ .label = "HTTP Boot URL" }, // 9
-    .{ .label = "DNS Upd Enable", .section = "DNS Update" }, // 10
+    .{ .label = "DNS Upd Enable" }, // 10
     .{ .label = "DNS Upd Server" }, // 11
     .{ .label = "DNS Upd Zone" }, // 12
     .{ .label = "DNS Upd Key Name", .sensitive = true }, // 13
     .{ .label = "DNS Upd Key File", .sensitive = true }, // 14
+};
+
+/// A single item in the unified pool form layout.  The layout array drives
+/// both rendering and active-field numbering so that Tab/arrow navigation
+/// follows the visual order exactly.
+const PoolLayoutKind = enum { section, field, inline_section };
+const InlineTarget = enum { domain_search, dns, wins, ntp, log, tftp, routes, options };
+
+const PoolLayoutItem = struct {
+    kind: PoolLayoutKind,
+    label: []const u8 = "",
+    field_idx: ?u8 = null,
+    inline_target: ?InlineTarget = null,
+};
+
+const pool_layout = [_]PoolLayoutItem{
+    .{ .kind = .section, .label = "Network" },
+    .{ .kind = .field, .field_idx = 0 }, // Subnet
+    .{ .kind = .field, .field_idx = 1 }, // Router
+    .{ .kind = .field, .field_idx = 2 }, // Pool Start
+    .{ .kind = .field, .field_idx = 3 }, // Pool End
+    .{ .kind = .field, .field_idx = 4 }, // Lease Time
+    .{ .kind = .field, .field_idx = 5 }, // MTU
+    .{ .kind = .section, .label = "Naming" },
+    .{ .kind = .field, .field_idx = 6 }, // Domain Name
+    .{ .kind = .inline_section, .label = "Search Domains", .inline_target = .domain_search },
+    .{ .kind = .inline_section, .label = "DNS Servers", .inline_target = .dns },
+    .{ .kind = .inline_section, .label = "WINS Servers", .inline_target = .wins },
+    .{ .kind = .section, .label = "Time" },
+    .{ .kind = .inline_section, .label = "NTP Servers", .inline_target = .ntp },
+    .{ .kind = .field, .field_idx = 7 }, // Time Offset
+    .{ .kind = .section, .label = "Logs" },
+    .{ .kind = .inline_section, .label = "Log Servers", .inline_target = .log },
+    .{ .kind = .section, .label = "Boot" },
+    .{ .kind = .inline_section, .label = "TFTP Servers", .inline_target = .tftp },
+    .{ .kind = .field, .field_idx = 8 }, // Boot Filename
+    .{ .kind = .field, .field_idx = 9 }, // HTTP Boot URL
+    .{ .kind = .section, .label = "DNS Updates" },
+    .{ .kind = .field, .field_idx = 10 }, // DNS Upd Enable
+    .{ .kind = .field, .field_idx = 11 }, // DNS Upd Server
+    .{ .kind = .field, .field_idx = 12 }, // DNS Upd Zone
+    .{ .kind = .field, .field_idx = 13 }, // DNS Upd Key Name
+    .{ .kind = .field, .field_idx = 14 }, // DNS Upd Key File
+    .{ .kind = .section, .label = "Routes" },
+    .{ .kind = .inline_section, .label = "Static Routes", .inline_target = .routes },
+    .{ .kind = .section, .label = "Other" },
+    .{ .kind = .inline_section, .label = "DHCP Options", .inline_target = .options },
 };
 
 /// Return the string value of a pool form field by index.
@@ -2665,10 +2742,10 @@ fn poolFormFieldVal(form: *const PoolForm, idx: u8) []const u8 {
         1 => form.router_buf[0..form.router_len],
         2 => form.pool_start_buf[0..form.pool_start_len],
         3 => form.pool_end_buf[0..form.pool_end_len],
-        4 => form.domain_name_buf[0..form.domain_name_len],
-        5 => form.lease_time_buf[0..form.lease_time_len],
-        6 => form.time_offset_buf[0..form.time_offset_len],
-        7 => form.mtu_buf[0..form.mtu_len],
+        4 => form.lease_time_buf[0..form.lease_time_len],
+        5 => form.mtu_buf[0..form.mtu_len],
+        6 => form.domain_name_buf[0..form.domain_name_len],
+        7 => form.time_offset_buf[0..form.time_offset_len],
         8 => form.boot_filename_buf[0..form.boot_filename_len],
         9 => form.http_boot_url_buf[0..form.http_boot_url_len],
         10 => if (form.dns_update_enable) "yes" else "no",
@@ -2687,10 +2764,10 @@ fn poolFormFieldBuf(form: *PoolForm, idx: u8) ?struct { buf: []u8, len: *usize }
         1 => .{ .buf = &form.router_buf, .len = &form.router_len },
         2 => .{ .buf = &form.pool_start_buf, .len = &form.pool_start_len },
         3 => .{ .buf = &form.pool_end_buf, .len = &form.pool_end_len },
-        4 => .{ .buf = &form.domain_name_buf, .len = &form.domain_name_len },
-        5 => .{ .buf = &form.lease_time_buf, .len = &form.lease_time_len },
-        6 => .{ .buf = &form.time_offset_buf, .len = &form.time_offset_len },
-        7 => .{ .buf = &form.mtu_buf, .len = &form.mtu_len },
+        4 => .{ .buf = &form.lease_time_buf, .len = &form.lease_time_len },
+        5 => .{ .buf = &form.mtu_buf, .len = &form.mtu_len },
+        6 => .{ .buf = &form.domain_name_buf, .len = &form.domain_name_len },
+        7 => .{ .buf = &form.time_offset_buf, .len = &form.time_offset_len },
         8 => .{ .buf = &form.boot_filename_buf, .len = &form.boot_filename_len },
         9 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
         // 10 = boolean toggle, not a text buffer
@@ -3174,15 +3251,50 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     var lines: [MAX_LINES]struct { text: []const u8, style: vaxis.Style } = undefined;
     var lcount: usize = 0;
 
-    const fields = pool_field_meta;
-    for (fields, 0..) |meta, fi| {
-        if (read_only and meta.sensitive) continue;
-        if (meta.section) |sec| {
-            lines[lcount] = .{ .text = "", .style = val_style };
-            lcount += 1;
-            lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "", .style = section_style };
-            lcount += 1;
+    // Render using pool_layout for correct section headers and ordering.
+    for (pool_layout) |item| {
+        switch (item.kind) {
+            .section => {
+                lines[lcount] = .{ .text = "", .style = val_style };
+                lcount += 1;
+                lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  -- {s} --", .{item.label}) catch "", .style = section_style };
+                lcount += 1;
+                continue;
+            },
+            .inline_section => {
+                // Render inline entries for this section.
+                const items: []const []const u8 = switch (item.inline_target.?) {
+                    .domain_search => pool.domain_search,
+                    .dns => pool.dns_servers,
+                    .wins => pool.wins_servers,
+                    .ntp => pool.ntp_servers,
+                    .log => pool.log_servers,
+                    .tftp => pool.tftp_servers,
+                    .routes => &.{}, // handled separately below
+                    .options => &.{}, // handled separately below
+                };
+                if (item.inline_target.? == .routes) {
+                    if (pool.static_routes.len > 0) {
+                        lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  {s:<18} {d} configured", .{ item.label, pool.static_routes.len }) catch "", .style = val_style };
+                        lcount += 1;
+                    }
+                } else if (item.inline_target.? == .options) {
+                    if (pool.dhcp_options.count() > 0) {
+                        lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  {s:<18} {d} configured", .{ item.label, pool.dhcp_options.count() }) catch "", .style = val_style };
+                        lcount += 1;
+                    }
+                } else if (items.len > 0) {
+                    const joined = std.mem.join(fa, ", ", items) catch "\xe2\x80\x94";
+                    lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  {s:<18} {s}", .{ item.label, joined }) catch "", .style = val_style };
+                    lcount += 1;
+                }
+                continue;
+            },
+            .field => {},
         }
+        const fi = item.field_idx.?;
+        const meta = pool_field_meta[fi];
+        if (read_only and meta.sensitive) continue;
         const val: []const u8 = switch (fi) {
             0 => std.fmt.allocPrint(fa, "{s}/{d}", .{ pool.subnet, pool.prefix_len }) catch "?",
             1 => pool.router,
@@ -3202,7 +3314,7 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
             else => "\xe2\x80\x94",
         };
         const line = std.fmt.allocPrint(fa, "  {s:<18} {s}", .{ meta.label, val }) catch "";
-        lines[lcount] = .{ .text = line, .style = if (meta.section != null) val_style else val_style };
+        lines[lcount] = .{ .text = line, .style = val_style };
         lcount += 1;
     }
     // Inline server sections (shown after regular fields).
@@ -3274,33 +3386,50 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
             }
         },
         .pool_form => {
-            // Map click position to field index using scroll_row.
+            // Map click position to field index using scroll_row and pool_layout walk.
             const rel = click_row -| modal_y;
             if (rel < 2) return; // title area
-            // The clicked absolute row = scroll_row + (rel - 2).
             const clicked_abs = state.pool_form.scroll_row + (rel - 2);
-            // Walk through all fields (regular + inline routes/options) to find which one matches.
-            var abs: u16 = 0;
             const form = &state.pool_form;
-            const total = form.totalFields();
-            var fi: u8 = 0;
-            while (fi < total) : (fi += 1) {
-                // Section headers for regular fields.
-                if (fi < PoolForm.REGULAR_FIELD_COUNT) {
-                    if (pool_field_meta[fi].section != null) {
-                        abs += 2; // blank line + section header
-                    }
-                } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
-                    abs += 1; // blank line
-                    const has_hdr = (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField());
-                    if (has_hdr) abs += 1; // section header
+            var abs: u16 = 0;
+            var pos: u8 = 0; // navigable field index
+            for (pool_layout) |item| {
+                switch (item.kind) {
+                    .section => {
+                        abs += 2; // blank line + header
+                    },
+                    .field => {
+                        if (abs == clicked_abs) {
+                            form.active_field = pos;
+                            form.cursor = activeFieldCursorLen(form, pos);
+                            return;
+                        }
+                        abs += 1;
+                        pos += 1;
+                    },
+                    .inline_section => {
+                        const target = item.inline_target.?;
+                        const count = form.inlineCount(target);
+                        // [+] Add button
+                        if (abs == clicked_abs) {
+                            form.active_field = pos;
+                            form.cursor = 0;
+                            return;
+                        }
+                        abs += 1;
+                        pos += 1;
+                        // Entries
+                        for (0..count) |_| {
+                            if (abs == clicked_abs) {
+                                form.active_field = pos;
+                                form.cursor = 0;
+                                return;
+                            }
+                            abs += 1;
+                            pos += 1;
+                        }
+                    },
                 }
-                if (abs == clicked_abs) {
-                    form.active_field = fi;
-                    form.cursor = poolFormFieldLen(form, fi);
-                    return;
-                }
-                abs += 1;
             }
         },
         .pool_server_edit => {
@@ -3485,35 +3614,39 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
 
     const opt_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 200 } }, .bg = .{ .rgb = .{ 30, 30, 42 } } };
 
-    // Compute absolute rendered row for each field (accounting for section headers,
-    // blank lines, and inline route/option entries).
-    const total_field_count = form.totalFields();
-    // Max possible rows: each regular field can have a 2-row section header, plus
-    // domain search/route/option sections each have a 2-row header, plus all entries.
-    const MAX_FIELD_ROWS = pool_field_meta.len * 3 + 16 + 8 + 4 + 4 + 2 + 4 + 32 + 32 + 40;
-    var field_rows: [MAX_FIELD_ROWS]u16 = undefined;
+    // Compute the absolute row for the active field by walking pool_layout.
+    // Each .section = 2 rows (blank + header), .field = 1 row,
+    // .inline_section = 1 row ([+]) + N entry rows.
+    var active_row: u16 = 0;
     var total_rows: u16 = 0;
     {
         var r: u16 = 0;
-        var fi: u8 = 0;
-        while (fi < total_field_count) : (fi += 1) {
-            if (fi < PoolForm.REGULAR_FIELD_COUNT) {
-                if (pool_field_meta[fi].section != null) {
-                    r += 1; // blank line before section
-                    r += 1; // section header
-                }
-            } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
-                r += 1; // blank line
-                // Section header only for group leaders.
-                const has_header = (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField());
-                if (has_header) r += 1;
+        var pos: u8 = 0;
+        for (pool_layout) |item| {
+            switch (item.kind) {
+                .section => {
+                    r += 2;
+                },
+                .field => {
+                    if (pos == form.active_field) active_row = r;
+                    r += 1;
+                    pos += 1;
+                },
+                .inline_section => {
+                    const count = form.inlineCount(item.inline_target.?);
+                    if (pos == form.active_field) active_row = r;
+                    r += 1; // [+] button
+                    pos += 1;
+                    for (0..count) |_| {
+                        if (pos == form.active_field) active_row = r;
+                        r += 1;
+                        pos += 1;
+                    }
+                },
             }
-            field_rows[fi] = r;
-            r += 1;
         }
         total_rows = r;
     }
-    const active_row = field_rows[form.active_field];
 
     // Target: center active field in the visible area.
     const half = field_h / 2;
@@ -3525,238 +3658,172 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
 
     form.scroll_row = scroll_row;
 
-    // Render fields, skipping rows above scroll_row.
+    // ---- Render by walking pool_layout ----
     var abs_row: u16 = 0; // absolute row in the virtual content
     var draw_row: u16 = 2; // screen row (starts below border + title)
-    var fi: u8 = 0;
-    while (fi < total_field_count and draw_row < BOX_H - 2) : (fi += 1) {
-        // Section headers.
-        if (fi < PoolForm.REGULAR_FIELD_COUNT) {
-            const meta = pool_field_meta[fi];
-            if (meta.section) |sec| {
+    var pos: u8 = 0; // navigable field index
+
+    for (pool_layout) |item| {
+        if (draw_row >= BOX_H - 2) break;
+        switch (item.kind) {
+            .section => {
+                // Blank line.
                 if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
                 abs_row += 1;
+                // Section header.
                 if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                    const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
+                    const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{item.label}) catch "";
                     _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
                     draw_row += 1;
                 }
                 abs_row += 1;
-                if (draw_row >= BOX_H - 2) break;
-            }
-        } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
-            // Inline section: blank line, optional section header, then [+] Add button.
-            // Section headers only for the first field in each group.
-            const sec_name: ?[]const u8 = if (fi == form.addDomainSearchField()) "Domains" else if (fi == form.addDnsField()) "Services" else if (fi == form.addTftpField()) "Boot" else if (fi == form.addRouteField()) "Routes" else if (fi == form.addOptionField()) "DHCP Options" else null;
-            if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
-            abs_row += 1;
-            if (sec_name) |sn| {
+            },
+            .field => {
+                const fi = item.field_idx.?;
+                const is_active = pos == form.active_field;
+                const is_bool = fi == 10;
                 if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                    const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sn}) catch "";
-                    _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                    const meta = pool_field_meta[fi];
+                    const style = if (is_active) active_style else field_style;
+                    const val = poolFormFieldVal(form, fi);
+                    const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
+                    _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+
+                    // Value field with horizontal scrolling for active field.
+                    const fw = @as(usize, FIELD_W);
+                    var vis_start: usize = 0;
+                    var cursor_vis: usize = 0;
+                    if (is_active and !is_bool) {
+                        const cur = @min(form.cursor, val.len);
+                        if (cur >= fw) {
+                            vis_start = cur - fw + 1;
+                        }
+                        cursor_vis = cur - vis_start;
+                    }
+                    const vis_end = @min(val.len, vis_start + fw);
+                    const vis_text = val[vis_start..vis_end];
+                    const pad_len = fw - vis_text.len;
+                    const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
+                    _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+
+                    // Cursor block: show character under cursor with inverted colors.
+                    if (is_active and !is_bool) {
+                        const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+                        const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
+                        if (cursor_col < BOX_W -| 1) {
+                            const cur_abs = vis_start + cursor_vis;
+                            const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
+                            _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
+                        }
+                    }
                     draw_row += 1;
                 }
                 abs_row += 1;
-            }
-            if (draw_row >= BOX_H - 2) break;
-        }
+                pos += 1;
+            },
+            .inline_section => {
+                const target = item.inline_target.?;
+                const count = form.inlineCount(target);
+                const is_add_active = pos == form.active_field;
 
-        // Skip fields above scroll viewport.
-        if (abs_row < scroll_row) {
-            abs_row += 1;
-            continue;
-        }
-
-        const is_active = fi == form.active_field;
-
-        if (fi < PoolForm.REGULAR_FIELD_COUNT) {
-            // Regular text field.
-            const meta = pool_field_meta[fi];
-            const style = if (is_active) active_style else field_style;
-            const val = poolFormFieldVal(form, fi);
-            const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
-            _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-
-            // Value field with horizontal scrolling for active field.
-            const fw = @as(usize, FIELD_W);
-            var vis_start: usize = 0;
-            var cursor_vis: usize = 0;
-            if (is_active and fi != 10) {
-                const cur = @min(form.cursor, val.len);
-                if (cur >= fw) {
-                    vis_start = cur - fw + 1;
+                // [+] Add button.
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                    const add_label = std.fmt.allocPrint(fa, "  {s:<17}", .{item.label}) catch "";
+                    _ = box.print(&.{.{ .text = add_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                    const at_max = count >= PoolForm.inlineMax(target);
+                    if (at_max) {
+                        const max_text = std.fmt.allocPrint(fa, "(max {d})", .{PoolForm.inlineMax(target)}) catch "(max)";
+                        const grey_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+                        _ = box.print(&.{.{ .text = max_text, .style = grey_style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                    } else {
+                        const add_fs = if (is_add_active) active_style else field_style;
+                        _ = box.print(&.{.{ .text = "[+] Add", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                    }
+                    draw_row += 1;
                 }
-                cursor_vis = cur - vis_start;
-            }
-            const vis_end = @min(val.len, vis_start + fw);
-            const vis_text = val[vis_start..vis_end];
-            const pad_len = fw - vis_text.len;
-            const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
-            _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                abs_row += 1;
+                pos += 1;
 
-            // Cursor block: show character under cursor with inverted colors.
-            if (is_active and fi != 10) {
-                const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
-                const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
-                if (cursor_col < BOX_W -| 1) {
-                    const cur_abs = vis_start + cursor_vis;
-                    const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
-                    _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
+                // Inline entries.
+                for (0..count) |ei| {
+                    if (draw_row >= BOX_H - 2) break;
+                    const is_entry_active = pos == form.active_field;
+                    if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                        const line_text: []const u8 = switch (target) {
+                            .domain_search => blk: {
+                                const d = &form.domain_search[ei];
+                                const t = d.buf[0..d.len];
+                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (t.len > 0) t else "..."}) catch "";
+                            },
+                            .dns => blk: {
+                                const d = &form.dns_servers[ei];
+                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                            },
+                            .wins => blk: {
+                                const d = &form.wins_servers[ei];
+                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                            },
+                            .ntp => blk: {
+                                const d = &form.ntp_servers[ei];
+                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                            },
+                            .log => blk: {
+                                const d = &form.log_servers[ei];
+                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                            },
+                            .tftp => blk: {
+                                const d = &form.tftp_servers[ei];
+                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                            },
+                            .routes => blk: {
+                                const r = &form.routes[ei];
+                                const dest = r.dest_buf[0..r.dest_len];
+                                const router = r.router_buf[0..r.router_len];
+                                break :blk std.fmt.allocPrint(fa, "  {s:<18} via {s}", .{
+                                    if (dest.len > 0) dest else "...",
+                                    if (router.len > 0) router else "...",
+                                }) catch "";
+                            },
+                            .options => blk: {
+                                const o = &form.options[ei];
+                                const code = o.code_buf[0..o.code_len];
+                                const val = o.value_buf[0..o.value_len];
+                                break :blk std.fmt.allocPrint(fa, "  {s:<6} {s}", .{
+                                    if (code.len > 0) code else "?",
+                                    if (val.len > 0) val else "?",
+                                }) catch "";
+                            },
+                        };
+                        const os = if (is_entry_active) active_style else opt_style;
+                        const opt_w = LABEL_W + FIELD_W;
+                        const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
+                        const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                        const opt_padded = try fa.alloc(u8, opt_pad);
+                        @memset(opt_padded, ' ');
+                        _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                        _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+                        draw_row += 1;
+                    }
+                    abs_row += 1;
+                    pos += 1;
                 }
-            }
-        } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
-            // [+] Add button.
-            const add_label: []const u8 = if (fi == form.addDomainSearchField()) "  Domains        " else if (fi == form.addDnsField()) "  DNS Servers    " else if (fi == form.addLogField()) "  Log Servers    " else if (fi == form.addNtpField()) "  NTP Servers    " else if (fi == form.addWinsField()) "  WINS Servers   " else if (fi == form.addTftpField()) "  TFTP Servers   " else if (fi == form.addRouteField()) "  Routes         " else "  DHCP Options   ";
-            _ = box.print(&.{.{ .text = add_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-            // Check if at max capacity.
-            const at_max = if (fi == form.addDomainSearchField()) form.domain_search_count >= form.domain_search.len else if (fi == form.addDnsField()) form.dns_servers_count >= form.dns_servers.len else if (fi == form.addLogField()) form.log_servers_count >= form.log_servers.len else if (fi == form.addNtpField()) form.ntp_servers_count >= form.ntp_servers.len else if (fi == form.addWinsField()) form.wins_servers_count >= form.wins_servers.len else if (fi == form.addTftpField()) form.tftp_servers_count >= form.tftp_servers.len else if (fi == form.addRouteField()) form.route_count >= form.routes.len else form.option_count >= form.options.len;
-            if (at_max) {
-                const max_n: usize = if (fi == form.addDomainSearchField()) form.domain_search.len else if (fi == form.addDnsField()) form.dns_servers.len else if (fi == form.addLogField()) form.log_servers.len else if (fi == form.addNtpField()) form.ntp_servers.len else if (fi == form.addWinsField()) form.wins_servers.len else if (fi == form.addTftpField()) form.tftp_servers.len else if (fi == form.addRouteField()) form.routes.len else form.options.len;
-                const max_text = std.fmt.allocPrint(fa, "(max {d})", .{max_n}) catch "(max)";
-                const grey_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
-                _ = box.print(&.{.{ .text = max_text, .style = grey_style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
-            } else {
-                const add_fs = if (is_active) active_style else field_style;
-                _ = box.print(&.{.{ .text = "[+] Add", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstDomainSearchField() and fi < form.addDnsField()) {
-            // Existing domain search entry.
-            const di = fi - form.firstDomainSearchField();
-            if (di < form.domain_search_count) {
-                const d = &form.domain_search[di];
-                const ds_text = d.buf[0..d.len];
-                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (ds_text.len > 0) ds_text else "..."}) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstDnsField() and fi < form.addLogField()) {
-            // Existing DNS server entry.
-            const di = fi - form.firstDnsField();
-            if (di < form.dns_servers_count) {
-                const d = &form.dns_servers[di];
-                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstLogField() and fi < form.addNtpField()) {
-            const di = fi - form.firstLogField();
-            if (di < form.log_servers_count) {
-                const d = &form.log_servers[di];
-                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstNtpField() and fi < form.addWinsField()) {
-            const di = fi - form.firstNtpField();
-            if (di < form.ntp_servers_count) {
-                const d = &form.ntp_servers[di];
-                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstWinsField() and fi < form.addTftpField()) {
-            const di = fi - form.firstWinsField();
-            if (di < form.wins_servers_count) {
-                const d = &form.wins_servers[di];
-                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstTftpField() and fi < form.addRouteField()) {
-            const di = fi - form.firstTftpField();
-            if (di < form.tftp_servers_count) {
-                const d = &form.tftp_servers[di];
-                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
-        } else if (fi >= form.firstRouteField() and fi < form.addOptionField()) {
-            // Existing route entry.
-            const ri = fi - form.firstRouteField();
-            const r = &form.routes[ri];
-            const dest = r.dest_buf[0..r.dest_len];
-            const router = r.router_buf[0..r.router_len];
-            const line = std.fmt.allocPrint(fa, "  {s:<18} via {s}", .{
-                if (dest.len > 0) dest else "...",
-                if (router.len > 0) router else "...",
-            }) catch "";
-            const os = if (is_active) active_style else opt_style;
-            const opt_w = LABEL_W + FIELD_W;
-            const opt_trunc = line[0..@min(line.len, opt_w)];
-            const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-            const opt_padded = try fa.alloc(u8, opt_pad);
-            @memset(opt_padded, ' ');
-            _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-            _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-        } else if (fi >= form.firstOptionField()) {
-            // Existing option entry.
-            const oi = fi - form.firstOptionField();
-            if (oi < form.option_count) {
-                const o = &form.options[oi];
-                const code = o.code_buf[0..o.code_len];
-                const val = o.value_buf[0..o.value_len];
-                const line = std.fmt.allocPrint(fa, "  {s:<6} {s}", .{
-                    if (code.len > 0) code else "?",
-                    if (val.len > 0) val else "?",
-                }) catch "";
-                const os = if (is_active) active_style else opt_style;
-                const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line[0..@min(line.len, opt_w)];
-                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-                const opt_padded = try fa.alloc(u8, opt_pad);
-                @memset(opt_padded, ' ');
-                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
-            }
+            },
         }
-        abs_row += 1;
-        draw_row += 1;
     }
 
     // Hint + error (inside border).
-    const is_add_btn = form.active_field == form.addDomainSearchField() or form.active_field == form.addDnsField() or form.active_field == form.addLogField() or form.active_field == form.addNtpField() or form.active_field == form.addWinsField() or form.active_field == form.addTftpField() or form.active_field == form.addRouteField() or form.active_field == form.addOptionField();
-    const is_inline = form.active_field >= PoolForm.REGULAR_FIELD_COUNT and !is_add_btn;
+    const af_info = form.activeFieldInfo(form.active_field);
+    const is_add_btn = af_info.kind == .add_button;
+    const is_inline_entry = af_info.kind == .inline_entry;
     // Check if active entry is in a reorderable section (DNS or TFTP).
-    const is_reorderable = is_inline and ((form.active_field >= form.firstDnsField() and form.active_field < form.addLogField() and form.dns_servers_count > 1) or (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField() and form.tftp_servers_count > 1));
+    const is_reorderable = is_inline_entry and if (af_info.inline_target) |t| switch (t) {
+        .dns => form.dns_servers_count > 1,
+        .tftp => form.tftp_servers_count > 1,
+        else => false,
+    } else false;
     const hint_text: []const u8 = if (is_reorderable)
         "  Enter:edit  d:delete  +/-:reorder  Esc:cancel"
-    else if (is_inline)
+    else if (is_inline_entry)
         "  Enter:edit  d:delete  Tab:next  Esc:cancel"
     else if (is_add_btn)
         "  Enter:add  Tab:next  Shift-Tab:prev  Esc:cancel"
@@ -3819,236 +3886,193 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
 
-    // 'd' deletes selected inline entry (domain search, server, route, or option).
-    if (key.matches('d', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
-        if (form.active_field >= form.firstDomainSearchField() and form.active_field < form.addDnsField()) {
-            deleteInlineEntry(InlineEntry, &form.domain_search, &form.domain_search_count, form.active_field - form.firstDomainSearchField());
-            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            return;
-        }
-        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
-            deleteInlineEntry(InlineEntry, &form.dns_servers, &form.dns_servers_count, form.active_field - form.firstDnsField());
-            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            return;
-        }
-        if (form.active_field >= form.firstLogField() and form.active_field < form.addNtpField()) {
-            deleteInlineEntry(InlineEntry, &form.log_servers, &form.log_servers_count, form.active_field - form.firstLogField());
-            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            return;
-        }
-        if (form.active_field >= form.firstNtpField() and form.active_field < form.addWinsField()) {
-            deleteInlineEntry(InlineEntry, &form.ntp_servers, &form.ntp_servers_count, form.active_field - form.firstNtpField());
-            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            return;
-        }
-        if (form.active_field >= form.firstWinsField() and form.active_field < form.addTftpField()) {
-            deleteInlineEntry(InlineEntry, &form.wins_servers, &form.wins_servers_count, form.active_field - form.firstWinsField());
-            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            return;
-        }
-        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
-            deleteInlineEntry(InlineEntry, &form.tftp_servers, &form.tftp_servers_count, form.active_field - form.firstTftpField());
-            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            return;
-        }
-        if (form.active_field >= form.firstRouteField() and form.active_field < form.addOptionField()) {
-            // Delete a route.
-            const ri = form.active_field - form.firstRouteField();
-            if (ri < form.route_count) {
-                var i: usize = ri;
-                while (i + 1 < form.route_count) : (i += 1) {
-                    form.routes[i] = form.routes[i + 1];
+    // Determine what the active_field points to via pool_layout walk.
+    const af_info = form.activeFieldInfo(form.active_field);
+
+    // 'd' deletes selected inline entry.
+    if (key.matches('d', .{}) and af_info.kind == .inline_entry) {
+        const target = af_info.inline_target.?;
+        const ei = af_info.entry_index;
+        switch (target) {
+            .domain_search => deleteInlineEntry(InlineEntry, &form.domain_search, &form.domain_search_count, ei),
+            .dns => deleteInlineEntry(InlineEntry, &form.dns_servers, &form.dns_servers_count, ei),
+            .log => deleteInlineEntry(InlineEntry, &form.log_servers, &form.log_servers_count, ei),
+            .ntp => deleteInlineEntry(InlineEntry, &form.ntp_servers, &form.ntp_servers_count, ei),
+            .wins => deleteInlineEntry(InlineEntry, &form.wins_servers, &form.wins_servers_count, ei),
+            .tftp => deleteInlineEntry(InlineEntry, &form.tftp_servers, &form.tftp_servers_count, ei),
+            .routes => {
+                if (ei < form.route_count) {
+                    var i: usize = ei;
+                    while (i + 1 < form.route_count) : (i += 1) {
+                        form.routes[i] = form.routes[i + 1];
+                    }
+                    form.route_count -= 1;
                 }
-                form.route_count -= 1;
-                if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            }
-            return;
-        }
-        if (form.active_field >= form.firstOptionField()) {
-            // Delete an option.
-            const oi = form.active_field - form.firstOptionField();
-            if (oi < form.option_count) {
-                var i: usize = oi;
-                while (i + 1 < form.option_count) : (i += 1) {
-                    form.options[i] = form.options[i + 1];
+            },
+            .options => {
+                if (ei < form.option_count) {
+                    var i: usize = ei;
+                    while (i + 1 < form.option_count) : (i += 1) {
+                        form.options[i] = form.options[i + 1];
+                    }
+                    form.option_count -= 1;
                 }
-                form.option_count -= 1;
-                if (form.active_field >= form.totalFields()) form.active_field -|= 1;
-            }
-            return;
+            },
         }
+        if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+        return;
     }
 
     // '+' moves an entry down (DNS and TFTP only).
-    if (key.matches('+', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
-        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
-            const di = form.active_field - form.firstDnsField();
-            if (di + 1 < form.dns_servers_count) {
-                const tmp = form.dns_servers[di];
-                form.dns_servers[di] = form.dns_servers[di + 1];
-                form.dns_servers[di + 1] = tmp;
-                form.active_field += 1;
+    if (key.matches('+', .{}) and af_info.kind == .inline_entry) {
+        if (af_info.inline_target) |target| {
+            const di = af_info.entry_index;
+            switch (target) {
+                .dns => {
+                    if (di + 1 < form.dns_servers_count) {
+                        const tmp = form.dns_servers[di];
+                        form.dns_servers[di] = form.dns_servers[di + 1];
+                        form.dns_servers[di + 1] = tmp;
+                        form.active_field += 1;
+                    }
+                    return;
+                },
+                .tftp => {
+                    if (di + 1 < form.tftp_servers_count) {
+                        const tmp = form.tftp_servers[di];
+                        form.tftp_servers[di] = form.tftp_servers[di + 1];
+                        form.tftp_servers[di + 1] = tmp;
+                        form.active_field += 1;
+                    }
+                    return;
+                },
+                else => {},
             }
-            return;
-        }
-        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
-            const di = form.active_field - form.firstTftpField();
-            if (di + 1 < form.tftp_servers_count) {
-                const tmp = form.tftp_servers[di];
-                form.tftp_servers[di] = form.tftp_servers[di + 1];
-                form.tftp_servers[di + 1] = tmp;
-                form.active_field += 1;
-            }
-            return;
         }
     }
 
     // '-' moves an entry up (DNS and TFTP only).
-    if (key.matches('-', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
-        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
-            const di = form.active_field - form.firstDnsField();
-            if (di > 0) {
-                const tmp = form.dns_servers[di];
-                form.dns_servers[di] = form.dns_servers[di - 1];
-                form.dns_servers[di - 1] = tmp;
-                form.active_field -= 1;
+    if (key.matches('-', .{}) and af_info.kind == .inline_entry) {
+        if (af_info.inline_target) |target| {
+            const di = af_info.entry_index;
+            switch (target) {
+                .dns => {
+                    if (di > 0) {
+                        const tmp = form.dns_servers[di];
+                        form.dns_servers[di] = form.dns_servers[di - 1];
+                        form.dns_servers[di - 1] = tmp;
+                        form.active_field -= 1;
+                    }
+                    return;
+                },
+                .tftp => {
+                    if (di > 0) {
+                        const tmp = form.tftp_servers[di];
+                        form.tftp_servers[di] = form.tftp_servers[di - 1];
+                        form.tftp_servers[di - 1] = tmp;
+                        form.active_field -= 1;
+                    }
+                    return;
+                },
+                else => {},
             }
-            return;
-        }
-        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
-            const di = form.active_field - form.firstTftpField();
-            if (di > 0) {
-                const tmp = form.tftp_servers[di];
-                form.tftp_servers[di] = form.tftp_servers[di - 1];
-                form.tftp_servers[di - 1] = tmp;
-                form.active_field -= 1;
-            }
-            return;
         }
     }
 
     if (key.matches(vaxis.Key.enter, .{})) {
-        // [+] Add buttons for inline server sections.
-        if (form.active_field == form.addDomainSearchField()) {
-            if (form.domain_search_count >= form.domain_search.len) return;
-            openServerEdit(form, state, .domain_search, null);
-            return;
-        }
-        if (form.active_field == form.addDnsField()) {
-            if (form.dns_servers_count >= form.dns_servers.len) return;
-            openServerEdit(form, state, .dns, null);
-            return;
-        }
-        if (form.active_field == form.addLogField()) {
-            if (form.log_servers_count >= form.log_servers.len) return;
-            openServerEdit(form, state, .log, null);
-            return;
-        }
-        if (form.active_field == form.addNtpField()) {
-            if (form.ntp_servers_count >= form.ntp_servers.len) return;
-            openServerEdit(form, state, .ntp, null);
-            return;
-        }
-        if (form.active_field == form.addWinsField()) {
-            if (form.wins_servers_count >= form.wins_servers.len) return;
-            openServerEdit(form, state, .wins, null);
-            return;
-        }
-        if (form.active_field == form.addTftpField()) {
-            if (form.tftp_servers_count >= form.tftp_servers.len) return;
-            openServerEdit(form, state, .tftp, null);
-            return;
-        }
-        // Existing inline server entries -> edit.
-        if (form.active_field >= form.firstDomainSearchField() and form.active_field < form.addDnsField()) {
-            const di = form.active_field - form.firstDomainSearchField();
-            if (di < form.domain_search_count) {
-                openServerEdit(form, state, .domain_search, di);
+        // [+] Add buttons.
+        if (af_info.kind == .add_button) {
+            const target = af_info.inline_target.?;
+            switch (target) {
+                .domain_search, .dns, .log, .ntp, .wins, .tftp => {
+                    // Check capacity.
+                    if (form.inlineCount(target) >= PoolForm.inlineMax(target)) return;
+                    // Map InlineTarget to ServerEditTarget for the server edit modal.
+                    const set: ServerEditTarget = switch (target) {
+                        .domain_search => .domain_search,
+                        .dns => .dns,
+                        .log => .log,
+                        .ntp => .ntp,
+                        .wins => .wins,
+                        .tftp => .tftp,
+                        else => unreachable,
+                    };
+                    openServerEdit(form, state, set, null);
+                    return;
+                },
+                .routes => {
+                    form.err_len = 0;
+                    form.route_edit_dest_len = 0;
+                    form.route_edit_router_len = 0;
+                    form.route_edit_field = 0;
+                    form.route_edit_cursor = 0;
+                    form.route_edit_index = null;
+                    state.mode = .pool_route_edit;
+                    return;
+                },
+                .options => {
+                    form.err_len = 0;
+                    form.opt_edit_code_len = 0;
+                    form.opt_edit_value_len = 0;
+                    form.opt_edit_field = 0;
+                    form.opt_edit_cursor = 0;
+                    form.opt_edit_index = null;
+                    state.mode = .pool_option_edit;
+                    return;
+                },
             }
-            return;
         }
-        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
-            const di = form.active_field - form.firstDnsField();
-            if (di < form.dns_servers_count) openServerEdit(form, state, .dns, di);
-            return;
-        }
-        if (form.active_field >= form.firstLogField() and form.active_field < form.addNtpField()) {
-            const di = form.active_field - form.firstLogField();
-            if (di < form.log_servers_count) openServerEdit(form, state, .log, di);
-            return;
-        }
-        if (form.active_field >= form.firstNtpField() and form.active_field < form.addWinsField()) {
-            const di = form.active_field - form.firstNtpField();
-            if (di < form.ntp_servers_count) openServerEdit(form, state, .ntp, di);
-            return;
-        }
-        if (form.active_field >= form.firstWinsField() and form.active_field < form.addTftpField()) {
-            const di = form.active_field - form.firstWinsField();
-            if (di < form.wins_servers_count) openServerEdit(form, state, .wins, di);
-            return;
-        }
-        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
-            const di = form.active_field - form.firstTftpField();
-            if (di < form.tftp_servers_count) openServerEdit(form, state, .tftp, di);
-            return;
-        }
-        // [+] Add Route button.
-        if (form.active_field == form.addRouteField()) {
-            form.err_len = 0;
-            form.route_edit_dest_len = 0;
-            form.route_edit_router_len = 0;
-            form.route_edit_field = 0;
-            form.route_edit_cursor = 0;
-            form.route_edit_index = null;
-            state.mode = .pool_route_edit;
-            return;
-        }
-        // Existing route entry -> edit.
-        if (form.active_field >= form.firstRouteField() and form.active_field < form.addOptionField()) {
-            const ri = form.active_field - form.firstRouteField();
-            if (ri < form.route_count) {
-                form.err_len = 0;
-                const r = &form.routes[ri];
-                @memcpy(form.route_edit_dest[0..r.dest_len], r.dest_buf[0..r.dest_len]);
-                form.route_edit_dest_len = r.dest_len;
-                @memcpy(form.route_edit_router[0..r.router_len], r.router_buf[0..r.router_len]);
-                form.route_edit_router_len = r.router_len;
-                form.route_edit_field = 0;
-                form.route_edit_cursor = r.dest_len;
-                form.route_edit_index = ri;
-                state.mode = .pool_route_edit;
+        // Existing inline entries -> edit.
+        if (af_info.kind == .inline_entry) {
+            const target = af_info.inline_target.?;
+            const ei = af_info.entry_index;
+            switch (target) {
+                .domain_search, .dns, .log, .ntp, .wins, .tftp => {
+                    const set: ServerEditTarget = switch (target) {
+                        .domain_search => .domain_search,
+                        .dns => .dns,
+                        .log => .log,
+                        .ntp => .ntp,
+                        .wins => .wins,
+                        .tftp => .tftp,
+                        else => unreachable,
+                    };
+                    openServerEdit(form, state, set, ei);
+                    return;
+                },
+                .routes => {
+                    if (ei < form.route_count) {
+                        form.err_len = 0;
+                        const r = &form.routes[ei];
+                        @memcpy(form.route_edit_dest[0..r.dest_len], r.dest_buf[0..r.dest_len]);
+                        form.route_edit_dest_len = r.dest_len;
+                        @memcpy(form.route_edit_router[0..r.router_len], r.router_buf[0..r.router_len]);
+                        form.route_edit_router_len = r.router_len;
+                        form.route_edit_field = 0;
+                        form.route_edit_cursor = r.dest_len;
+                        form.route_edit_index = ei;
+                        state.mode = .pool_route_edit;
+                    }
+                    return;
+                },
+                .options => {
+                    if (ei < form.option_count) {
+                        form.err_len = 0;
+                        const o = &form.options[ei];
+                        @memcpy(form.opt_edit_code[0..o.code_len], o.code_buf[0..o.code_len]);
+                        form.opt_edit_code_len = o.code_len;
+                        @memcpy(form.opt_edit_value[0..o.value_len], o.value_buf[0..o.value_len]);
+                        form.opt_edit_value_len = o.value_len;
+                        form.opt_edit_field = 0;
+                        form.opt_edit_cursor = o.code_len;
+                        form.opt_edit_index = ei;
+                        state.mode = .pool_option_edit;
+                    }
+                    return;
+                },
             }
-            return;
         }
-        // [+] Add Option button.
-        if (form.active_field == form.addOptionField()) {
-            form.err_len = 0;
-            form.opt_edit_code_len = 0;
-            form.opt_edit_value_len = 0;
-            form.opt_edit_field = 0;
-            form.opt_edit_cursor = 0;
-            form.opt_edit_index = null;
-            state.mode = .pool_option_edit;
-            return;
-        }
-        // Existing option entry -> edit.
-        if (form.active_field >= form.firstOptionField()) {
-            const oi = form.active_field - form.firstOptionField();
-            if (oi < form.option_count) {
-                form.err_len = 0;
-                const o = &form.options[oi];
-                @memcpy(form.opt_edit_code[0..o.code_len], o.code_buf[0..o.code_len]);
-                form.opt_edit_code_len = o.code_len;
-                @memcpy(form.opt_edit_value[0..o.value_len], o.value_buf[0..o.value_len]);
-                form.opt_edit_value_len = o.value_len;
-                form.opt_edit_field = 0;
-                form.opt_edit_cursor = o.code_len;
-                form.opt_edit_index = oi;
-                state.mode = .pool_option_edit;
-            }
-            return;
-        }
-        // Validate all fields before going to review.
+        // Regular field: validate all fields before going to review.
         if (validatePoolForm(form)) |err_msg| {
             form.err_len = @min(err_msg.len, form.err_buf.len);
             @memcpy(form.err_buf[0..form.err_len], err_msg[0..form.err_len]);
@@ -4064,36 +4088,37 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.up, .{})) {
         if (form.active_field > 0) {
             form.active_field -= 1;
-            form.cursor = poolFormFieldLen(form, form.active_field);
+            form.cursor = activeFieldCursorLen(form, form.active_field);
         }
         return;
     }
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
         if (form.active_field + 1 < form.totalFields()) {
             form.active_field += 1;
-            form.cursor = poolFormFieldLen(form, form.active_field);
+            form.cursor = activeFieldCursorLen(form, form.active_field);
         }
         return;
     }
 
-    // Non-text fields: [+] buttons, route entries, option entries.
-    if (form.active_field >= PoolForm.REGULAR_FIELD_COUNT) return;
+    // Non-text fields: [+] buttons, inline entries.
+    if (af_info.kind != .field) return;
 
-    // Field 10 = dns_update_enable: toggle on space or any printable
-    if (form.active_field == 10) {
+    // dns_update_enable (pool_field_meta index 10): toggle on space or any printable
+    if (af_info.field_idx == 10) {
         if (key.codepoint == ' ' or (key.codepoint >= 0x20 and key.codepoint <= 0x7E)) {
             form.dns_update_enable = !form.dns_update_enable;
         }
         return;
     }
 
-    // Cursor movement within field.
+    // Cursor movement within field (uses pool_field_meta index).
+    const fi = af_info.field_idx;
     if (key.matches(vaxis.Key.left, .{})) {
         if (form.cursor > 0) form.cursor -= 1;
         return;
     }
     if (key.matches(vaxis.Key.right, .{})) {
-        if (form.cursor < poolFormFieldLen(form, form.active_field)) form.cursor += 1;
+        if (form.cursor < poolFormFieldLen(form, fi)) form.cursor += 1;
         return;
     }
     if (key.matches(vaxis.Key.home, .{})) {
@@ -4101,13 +4126,13 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
     if (key.matches(vaxis.Key.end, .{})) {
-        form.cursor = poolFormFieldLen(form, form.active_field);
+        form.cursor = poolFormFieldLen(form, fi);
         return;
     }
 
     // Text editing at cursor position.
     if (key.matches(vaxis.Key.backspace, .{})) {
-        if (poolFormFieldBuf(form, form.active_field)) |fb| {
+        if (poolFormFieldBuf(form, fi)) |fb| {
             if (form.cursor > 0 and fb.len.* > 0) {
                 // Shift bytes after cursor left by one.
                 const pos = form.cursor;
@@ -4119,14 +4144,14 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             }
         }
     } else if (key.matches(vaxis.Key.delete, .{})) {
-        if (poolFormFieldBuf(form, form.active_field)) |fb| {
+        if (poolFormFieldBuf(form, fi)) |fb| {
             if (form.cursor < fb.len.*) {
                 std.mem.copyForwards(u8, fb.buf[form.cursor..], fb.buf[form.cursor + 1 .. fb.len.*]);
                 fb.len.* -= 1;
             }
         }
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
-        if (poolFormFieldBuf(form, form.active_field)) |fb| {
+        if (poolFormFieldBuf(form, fi)) |fb| {
             if (fb.len.* < fb.buf.len) {
                 // Shift bytes after cursor right by one, insert character.
                 const pos = form.cursor;
@@ -4143,6 +4168,17 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
 
 fn poolFormFieldLen(form: *const PoolForm, idx: u8) usize {
     return (poolFormFieldVal(form, idx)).len;
+}
+
+/// Return the cursor-relevant text length for a layout-position active_field.
+/// For regular fields, returns the field value length.  For [+] buttons and
+/// inline entries, returns 0 (no cursor positioning needed).
+fn activeFieldCursorLen(form: *const PoolForm, af: u8) usize {
+    const info = form.activeFieldInfo(af);
+    return switch (info.kind) {
+        .field => poolFormFieldLen(form, info.field_idx),
+        .add_button, .inline_entry => 0,
+    };
 }
 
 fn validatePoolForm(form: *PoolForm) ?[]const u8 {
@@ -7434,30 +7470,31 @@ test "PoolForm: totalFields accounts for all inline sections" {
     form.dns_servers_count = 2;
     form.route_count = 2;
     form.option_count = 3;
-    // 15 + 8 + 1 + 2 + 2 + 3 = 31
+    // 15 + 8 + 1 + 2 + 2 + 3 = 31 (same as before; layout doesn't change total)
     try std.testing.expectEqual(@as(u8, 31), form.totalFields());
 }
 
-test "PoolForm: field index helpers" {
+test "PoolForm: fieldPosition helpers" {
     var form = PoolForm{};
     form.domain_search_count = 1;
     form.dns_servers_count = 2;
     form.route_count = 2;
     form.option_count = 1;
-    // 15 regular fields
-    try std.testing.expectEqual(@as(u8, 15), form.addDomainSearchField());
-    try std.testing.expectEqual(@as(u8, 16), form.firstDomainSearchField());
-    // After DS: 15 + 1 + 1 = 17
-    try std.testing.expectEqual(@as(u8, 17), form.addDnsField());
-    try std.testing.expectEqual(@as(u8, 18), form.firstDnsField());
-    // After DNS: 17 + 1 + 2 = 20
-    try std.testing.expectEqual(@as(u8, 20), form.addLogField());
-    // After Log/NTP/WINS/TFTP (all 0): 20+1 + 0 + 1 + 0 + 1 + 0 + 1 + 0 = 24
-    try std.testing.expectEqual(@as(u8, 24), form.addRouteField());
-    try std.testing.expectEqual(@as(u8, 25), form.firstRouteField());
-    // After routes: 24 + 1 + 2 = 27
-    try std.testing.expectEqual(@as(u8, 27), form.addOptionField());
-    try std.testing.expectEqual(@as(u8, 28), form.firstOptionField());
+    // Layout: 6 Network fields, Domain Name, [+]DS + 1 entry, [+]DNS + 2 entries,
+    // [+]WINS, [+]NTP, Time Offset, [+]Log, [+]TFTP, Boot Filename, HTTP Boot URL,
+    // 5 DNS Update fields, [+]Routes + 2 entries, [+]Options + 1 entry.
+    try std.testing.expectEqual(@as(u8, 7), form.fieldPosition(.domain_search, .add_button));
+    try std.testing.expectEqual(@as(u8, 8), form.fieldPosition(.domain_search, .first_entry));
+    try std.testing.expectEqual(@as(u8, 9), form.fieldPosition(.dns, .add_button));
+    try std.testing.expectEqual(@as(u8, 10), form.fieldPosition(.dns, .first_entry));
+    try std.testing.expectEqual(@as(u8, 12), form.fieldPosition(.wins, .add_button));
+    try std.testing.expectEqual(@as(u8, 13), form.fieldPosition(.ntp, .add_button));
+    try std.testing.expectEqual(@as(u8, 15), form.fieldPosition(.log, .add_button));
+    try std.testing.expectEqual(@as(u8, 16), form.fieldPosition(.tftp, .add_button));
+    try std.testing.expectEqual(@as(u8, 24), form.fieldPosition(.routes, .add_button));
+    try std.testing.expectEqual(@as(u8, 25), form.fieldPosition(.routes, .first_entry));
+    try std.testing.expectEqual(@as(u8, 27), form.fieldPosition(.options, .add_button));
+    try std.testing.expectEqual(@as(u8, 28), form.fieldPosition(.options, .first_entry));
 }
 
 test "buildRoutesFromForm: empty routes" {
@@ -7514,8 +7551,8 @@ test "handlePoolFormKey: delete inline route" {
     @memcpy(state.pool_form.routes[0].dest_buf[0..dest.len], dest);
     state.pool_form.routes[0].dest_len = dest.len;
 
-    // Navigate to first route entry (firstRouteField).
-    state.pool_form.active_field = state.pool_form.firstRouteField();
+    // Navigate to first route entry.
+    state.pool_form.active_field = state.pool_form.fieldPosition(.routes, .first_entry);
 
     // Press 'd' to delete.
     handlePoolFormKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
@@ -7550,7 +7587,7 @@ test "handlePoolFormKey: delete inline option" {
     state.pool_form.options[0].code_len = code.len;
 
     // Navigate to first option entry.
-    state.pool_form.active_field = state.pool_form.firstOptionField();
+    state.pool_form.active_field = state.pool_form.fieldPosition(.options, .first_entry);
 
     // Press 'd' to delete.
     handlePoolFormKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
@@ -7584,7 +7621,7 @@ test "handlePoolFormKey: delete inline domain search" {
     state.pool_form.domain_search[0].len = domain.len;
 
     // Navigate to first domain search entry.
-    state.pool_form.active_field = state.pool_form.firstDomainSearchField();
+    state.pool_form.active_field = state.pool_form.fieldPosition(.domain_search, .first_entry);
 
     // Press 'd' to delete.
     handlePoolFormKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
