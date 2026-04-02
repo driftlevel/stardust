@@ -2310,18 +2310,17 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
         const os = if (is_sel) active_style else opt_style;
         const code = o.code_buf[0..o.code_len];
         const val = o.value_buf[0..o.value_len];
-        const opt_text = std.fmt.allocPrint(fa, "    {s:>3}: {s}", .{
-            if (code.len > 0) code else "?",
-            if (val.len > 0) val else "?",
-        }) catch "";
-        // Pad to FIELD_W + LABEL_W.
-        const opt_w = LABEL_W + FIELD_W;
-        const opt_trunc = opt_text[0..@min(opt_text.len, opt_w)];
-        const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
-        const opt_padded = try fa.alloc(u8, opt_pad);
-        @memset(opt_padded, ' ');
-        _ = win.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = col + 1, .row_offset = or_row, .wrap = .none });
-        _ = win.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = col + 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = or_row, .wrap = .none });
+        // Label on left: "  Option NNN"
+        const opt_label = std.fmt.allocPrint(fa, "  Option {s:>3}", .{if (code.len > 0) code else "?"}) catch "  Option   ?";
+        _ = win.print(&.{.{ .text = opt_label, .style = label_style }}, .{ .col_offset = col + 1, .row_offset = or_row, .wrap = .none });
+        // Value on right, aligned with field boxes.
+        const val_text = if (val.len > 0) val else "";
+        const val_trunc = val_text[0..@min(val_text.len, FIELD_W)];
+        const val_pad = FIELD_W -| @as(u16, @intCast(val_trunc.len));
+        const val_padded = try fa.alloc(u8, val_pad);
+        @memset(val_padded, ' ');
+        _ = win.print(&.{.{ .text = val_trunc, .style = os }}, .{ .col_offset = col + 1 + LABEL_W, .row_offset = or_row, .wrap = .none });
+        _ = win.print(&.{.{ .text = val_padded, .style = os }}, .{ .col_offset = col + 1 + LABEL_W + @as(u16, @intCast(val_trunc.len)), .row_offset = or_row, .wrap = .none });
     }
 
     // Saved/error.
@@ -2679,7 +2678,7 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "MTU" }, // 5  (was 7)
     .{ .label = "Domain Name" }, // 6  (was 4)
     .{ .label = "Time Offset" }, // 7  (was 6)
-    .{ .label = "Boot Filename" }, // 8
+    .{ .label = "TFTP Boot File" }, // 8
     .{ .label = "HTTP Boot URL" }, // 9
     .{ .label = "Enable" }, // 10
     .{ .label = "Server" }, // 11
@@ -2715,14 +2714,14 @@ const pool_layout = [_]PoolLayoutItem{
     .{ .kind = .inline_section, .label = "DNS Servers", .inline_target = .dns },
     .{ .kind = .inline_section, .label = "WINS Servers", .inline_target = .wins },
     .{ .kind = .section, .label = "Time" },
-    .{ .kind = .inline_section, .label = "NTP Servers", .inline_target = .ntp },
     .{ .kind = .field, .field_idx = 7 }, // Time Offset
+    .{ .kind = .inline_section, .label = "NTP Servers", .inline_target = .ntp },
     .{ .kind = .section, .label = "Logs" },
     .{ .kind = .inline_section, .label = "Log Servers", .inline_target = .log },
     .{ .kind = .section, .label = "Boot" },
-    .{ .kind = .inline_section, .label = "TFTP Servers", .inline_target = .tftp },
-    .{ .kind = .field, .field_idx = 8 }, // Boot Filename
     .{ .kind = .field, .field_idx = 9 }, // HTTP Boot URL
+    .{ .kind = .field, .field_idx = 8 }, // TFTP Boot File
+    .{ .kind = .inline_section, .label = "TFTP Servers", .inline_target = .tftp },
     .{ .kind = .section, .label = "DNS Updates" },
     .{ .kind = .field, .field_idx = 10 }, // DNS Upd Enable
     .{ .kind = .field, .field_idx = 11 }, // DNS Upd Server
@@ -3785,13 +3784,13 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                                 }) catch "";
                             },
                             .options => blk: {
+                                // DHCP options render differently: label on left, value on right.
                                 const o = &form.options[ei];
                                 const code = o.code_buf[0..o.code_len];
+                                const opt_label = std.fmt.allocPrint(fa, "  Option {s:>3}", .{if (code.len > 0) code else "?"}) catch "  Option   ?";
+                                _ = box.print(&.{.{ .text = opt_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
                                 const val = o.value_buf[0..o.value_len];
-                                break :blk std.fmt.allocPrint(fa, "{s:>3}: {s}", .{
-                                    if (code.len > 0) code else "?",
-                                    if (val.len > 0) val else "?",
-                                }) catch "";
+                                break :blk if (val.len > 0) val else "";
                             },
                         };
                         const os = if (is_entry_active) active_style else opt_style;
@@ -7479,17 +7478,17 @@ test "PoolForm: fieldPosition helpers" {
     form.dns_servers_count = 2;
     form.route_count = 2;
     form.option_count = 1;
-    // Layout: 6 Network fields, Domain Name, [+]DS + 1 entry, [+]DNS + 2 entries,
-    // [+]WINS, [+]NTP, Time Offset, [+]Log, [+]TFTP, Boot Filename, HTTP Boot URL,
-    // 5 DNS Update fields, [+]Routes + 2 entries, [+]Options + 1 entry.
+    // Layout: 6 Network, Domain Name, [+]DS+1, [+]DNS+2, [+]WINS,
+    // Time Offset, [+]NTP, [+]Log, HTTP Boot URL, TFTP Boot File, [+]TFTP,
+    // 5 DNS Update, [+]Routes+2, [+]Options+1.
     try std.testing.expectEqual(@as(u8, 7), form.fieldPosition(.domain_search, .add_button));
     try std.testing.expectEqual(@as(u8, 8), form.fieldPosition(.domain_search, .first_entry));
     try std.testing.expectEqual(@as(u8, 9), form.fieldPosition(.dns, .add_button));
     try std.testing.expectEqual(@as(u8, 10), form.fieldPosition(.dns, .first_entry));
     try std.testing.expectEqual(@as(u8, 12), form.fieldPosition(.wins, .add_button));
-    try std.testing.expectEqual(@as(u8, 13), form.fieldPosition(.ntp, .add_button));
+    try std.testing.expectEqual(@as(u8, 14), form.fieldPosition(.ntp, .add_button));
     try std.testing.expectEqual(@as(u8, 15), form.fieldPosition(.log, .add_button));
-    try std.testing.expectEqual(@as(u8, 16), form.fieldPosition(.tftp, .add_button));
+    try std.testing.expectEqual(@as(u8, 18), form.fieldPosition(.tftp, .add_button));
     try std.testing.expectEqual(@as(u8, 24), form.fieldPosition(.routes, .add_button));
     try std.testing.expectEqual(@as(u8, 25), form.fieldPosition(.routes, .first_entry));
     try std.testing.expectEqual(@as(u8, 27), form.fieldPosition(.options, .add_button));
