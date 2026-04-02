@@ -996,6 +996,15 @@ pub fn computePoolHash(cfg: *const Config) [32]u8 {
     return digest;
 }
 
+/// Compute a SHA-256 hash for a single pool (plus global mac_classes).
+/// Used by the per-pool sync protocol to identify individual pool configs.
+pub fn computePerPoolHash(pool: *const PoolConfig, mac_classes: []const MacClass) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    hashPoolIntoSha256(&h, pool);
+    hashMacClasses(&h, mac_classes);
+    return h.finalResult();
+}
+
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Insertion-sort indices by comparing the strings they reference.
@@ -2194,6 +2203,57 @@ test "computePoolHash: tftp_servers order matters" {
 
     // TFTP order matters, so different order = different hash
     try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+// ---------------------------------------------------------------------------
+// computePerPoolHash tests
+// ---------------------------------------------------------------------------
+
+test "computePerPoolHash: same pool produces same hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    const h1 = computePerPoolHash(&c1.pools[0], c1.mac_classes);
+    const h2 = computePerPoolHash(&c2.pools[0], c2.mac_classes);
+    try std.testing.expectEqualSlices(u8, &h1, &h2);
+}
+
+test "computePerPoolHash: different pool produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c2.pools[0].subnet);
+    c2.pools[0].subnet = alloc.dupe(u8, "10.0.0.0") catch unreachable;
+
+    const h1 = computePerPoolHash(&c1.pools[0], c1.mac_classes);
+    const h2 = computePerPoolHash(&c2.pools[0], c2.mac_classes);
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "computePerPoolHash: different mac_classes produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    const classes = try alloc.alloc(MacClass, 1);
+    classes[0] = .{
+        .name = try alloc.dupe(u8, "printers"),
+        .match = try alloc.dupe(u8, "00:11:22"),
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+    };
+    c2.mac_classes = classes;
+
+    const h1 = computePerPoolHash(&c1.pools[0], c1.mac_classes);
+    const h2 = computePerPoolHash(&c2.pools[0], c2.mac_classes);
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }
 
 // ---------------------------------------------------------------------------
