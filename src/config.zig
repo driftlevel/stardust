@@ -974,8 +974,8 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
     return allocator.realloc(classes, idx) catch classes[0..idx];
 }
 
-/// Compute a SHA-256 pool hash over all pools' subnets, addresses, reservations,
-/// and static routes. Used by SyncManager to verify peer config compatibility.
+/// Compute a SHA-256 pool hash over all pool configuration fields and global
+/// MAC classes. Used by SyncManager to verify peer config compatibility.
 pub fn computePoolHash(cfg: *const Config) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
 
@@ -988,12 +988,114 @@ pub fn computePoolHash(cfg: *const Config) [32]u8 {
         hashPoolIntoSha256(&h, pool);
     }
 
+    // Hash global MAC classes (sorted by name for determinism).
+    hashMacClasses(&h, cfg.mac_classes);
+
     var digest: [32]u8 = undefined;
     h.final(&digest);
     return digest;
 }
 
-fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) void {
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// Insertion-sort indices by comparing the strings they reference.
+fn sortIndicesByString(indices: []usize, strings: []const []const u8) void {
+    if (indices.len <= 1) return;
+    for (1..indices.len) |i| {
+        const key = indices[i];
+        var j = i;
+        while (j > 0 and std.mem.lessThan(u8, strings[key], strings[indices[j - 1]])) {
+            indices[j] = indices[j - 1];
+            j -= 1;
+        }
+        indices[j] = key;
+    }
+}
+
+/// Hash a string slice in sorted (alphabetical) order. Uses a stack buffer for indices.
+fn hashSortedStringList(h: *Sha256, list: []const []const u8) void {
+    var idx_buf: [256]usize = undefined;
+    const count = @min(list.len, idx_buf.len);
+    for (0..count) |i| idx_buf[i] = i;
+    sortIndicesByString(idx_buf[0..count], list);
+    for (idx_buf[0..count]) |si| {
+        h.update(list[si]);
+    }
+}
+
+/// Hash a string list in config order (no sorting).
+fn hashStringListOrdered(h: *Sha256, list: []const []const u8) void {
+    for (list) |entry| {
+        h.update(entry);
+    }
+}
+
+/// Hash a StringHashMap([]const u8) with keys sorted alphabetically.
+fn hashSortedStringMap(h: *Sha256, map: std.StringHashMap([]const u8)) void {
+    var key_buf: [256][]const u8 = undefined;
+    var ki: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (ki < key_buf.len) {
+            key_buf[ki] = entry.key_ptr.*;
+            ki += 1;
+        }
+    }
+    // Insertion sort the keys.
+    if (ki > 1) for (1..ki) |i| {
+        const key = key_buf[i];
+        var j = i;
+        while (j > 0 and std.mem.lessThan(u8, key, key_buf[j - 1])) {
+            key_buf[j] = key_buf[j - 1];
+            j -= 1;
+        }
+        key_buf[j] = key;
+    };
+    for (key_buf[0..ki]) |k| {
+        h.update(k);
+        h.update(map.get(k).?);
+    }
+}
+
+/// Hash an optional nullable string with a marker byte (0x00 for null, 0x01 + bytes for set).
+fn hashOptionalString(h: *Sha256, val: ?[]const u8) void {
+    if (val) |v| {
+        h.update(&[1]u8{0x01});
+        h.update(v);
+    } else {
+        h.update(&[1]u8{0x00});
+    }
+}
+
+/// Hash global MAC classes sorted by name.
+fn hashMacClasses(h: *Sha256, classes: []const MacClass) void {
+    var mc_count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &mc_count, @intCast(classes.len), .big);
+    h.update(&mc_count);
+
+    var idx_buf: [256]usize = undefined;
+    const count = @min(classes.len, idx_buf.len);
+    for (0..count) |i| idx_buf[i] = i;
+    // Insertion sort by name.
+    if (count > 1) for (1..count) |i| {
+        const key = idx_buf[i];
+        var j = i;
+        while (j > 0 and std.mem.lessThan(u8, classes[key].name, classes[idx_buf[j - 1]].name)) {
+            idx_buf[j] = idx_buf[j - 1];
+            j -= 1;
+        }
+        idx_buf[j] = key;
+    };
+    for (idx_buf[0..count]) |ci| {
+        const mc = &classes[ci];
+        h.update(mc.name);
+        h.update(mc.match);
+        hashSortedStringMap(h, mc.dhcp_options);
+    }
+}
+
+fn hashPoolIntoSha256(h: *Sha256, pool: *const PoolConfig) void {
+    // -- Structural / addressing fields --
     const subnet_bytes = parseIpv4(pool.subnet) catch [4]u8{ 0, 0, 0, 0 };
     h.update(&subnet_bytes);
 
@@ -1030,6 +1132,56 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
     std.mem.writeInt(u32, &lt_bytes, pool.lease_time, .big);
     h.update(&lt_bytes);
 
+    // -- Scalar fields --
+    h.update(pool.domain_name);
+    h.update(pool.boot_filename);
+    h.update(pool.http_boot_url);
+
+    // time_offset: nullable i32, marker byte + big-endian value
+    if (pool.time_offset) |to| {
+        h.update(&[1]u8{0x01});
+        var to_bytes: [4]u8 = undefined;
+        std.mem.writeInt(i32, &to_bytes, to, .big);
+        h.update(&to_bytes);
+    } else {
+        h.update(&[1]u8{0x00});
+    }
+
+    // mtu: nullable u16, marker byte + big-endian value
+    if (pool.mtu) |mtu| {
+        h.update(&[1]u8{0x01});
+        var mtu_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &mtu_bytes, mtu, .big);
+        h.update(&mtu_bytes);
+    } else {
+        h.update(&[1]u8{0x00});
+    }
+
+    // -- String list fields (sorted alphabetically) --
+    hashSortedStringList(h, pool.dns_servers);
+    hashSortedStringList(h, pool.domain_search);
+    hashSortedStringList(h, pool.time_servers);
+    hashSortedStringList(h, pool.log_servers);
+    hashSortedStringList(h, pool.ntp_servers);
+    hashSortedStringList(h, pool.wins_servers);
+
+    // TFTP servers: order matters, do NOT sort.
+    hashStringListOrdered(h, pool.tftp_servers);
+
+    // -- DNS Update config --
+    h.update(&[1]u8{@intFromBool(pool.dns_update.enable)});
+    h.update(pool.dns_update.server);
+    h.update(pool.dns_update.zone);
+    h.update(pool.dns_update.key_name);
+    h.update(pool.dns_update.key_file);
+    var dns_lt_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &dns_lt_bytes, pool.dns_update.lease_time, .big);
+    h.update(&dns_lt_bytes);
+
+    // -- Pool-level DHCP options (sorted by key) --
+    hashSortedStringMap(h, pool.dhcp_options);
+
+    // -- Reservations (sorted by MAC) --
     var rc_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &rc_bytes, @intCast(pool.reservations.len), .big);
     h.update(&rc_bytes);
@@ -1053,16 +1205,27 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
         var bi: usize = 0;
         var pos: usize = 0;
         while (bi < 6 and pos + 1 < r.mac.len) : (bi += 1) {
-            const hi = std.fmt.charToDigit(r.mac[pos], 16) catch 0;
-            const lo = std.fmt.charToDigit(r.mac[pos + 1], 16) catch 0;
-            mac_bytes[bi] = (hi << 4) | lo;
+            const hi_nib = std.fmt.charToDigit(r.mac[pos], 16) catch 0;
+            const lo_nib = std.fmt.charToDigit(r.mac[pos + 1], 16) catch 0;
+            mac_bytes[bi] = (hi_nib << 4) | lo_nib;
             pos += 3;
         }
         h.update(&mac_bytes);
         const ip_bytes = parseIpv4(r.ip) catch [4]u8{ 0, 0, 0, 0 };
         h.update(&ip_bytes);
+        // Reservation hostname and client_id
+        hashOptionalString(h, r.hostname);
+        hashOptionalString(h, r.client_id);
+        // Reservation DHCP options (sorted by key)
+        if (r.dhcp_options) |opts| {
+            h.update(&[1]u8{0x01});
+            hashSortedStringMap(h, opts);
+        } else {
+            h.update(&[1]u8{0x00});
+        }
     }
 
+    // -- Static routes (sorted by destination) --
     var src_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &src_bytes, @intCast(pool.static_routes.len), .big);
     h.update(&src_bytes);
@@ -1886,6 +2049,150 @@ test "computePoolHash: different pool count produces different hash" {
     };
     c2.pools = extra;
 
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different domain_name produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c2.pools[0].domain_name);
+    c2.pools[0].domain_name = try alloc.dupe(u8, "example.com");
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different mtu produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    c2.pools[0].mtu = 1400;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different time_offset produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    c2.pools[0].time_offset = -18000;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: dns_servers order does not affect hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c1.pools[0].dns_servers);
+    const dns1 = try alloc.alloc([]const u8, 2);
+    dns1[0] = try alloc.dupe(u8, "8.8.8.8");
+    dns1[1] = try alloc.dupe(u8, "1.1.1.1");
+    c1.pools[0].dns_servers = dns1;
+
+    alloc.free(c2.pools[0].dns_servers);
+    const dns2 = try alloc.alloc([]const u8, 2);
+    dns2[0] = try alloc.dupe(u8, "1.1.1.1");
+    dns2[1] = try alloc.dupe(u8, "8.8.8.8");
+    c2.pools[0].dns_servers = dns2;
+
+    try std.testing.expectEqualSlices(u8, &computePoolHash(&c1), &computePoolHash(&c2));
+}
+
+test "computePoolHash: different dns_update config produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    c2.pools[0].dns_update.enable = true;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: different pool dhcp_options produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    try c2.pools[0].dhcp_options.put(try alloc.dupe(u8, "66"), try alloc.dupe(u8, "tftp.example.com"));
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: reservation hostname changes hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c1.pools[0].reservations);
+    const res1 = try alloc.alloc(Reservation, 1);
+    res1[0] = .{ .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .ip = try alloc.dupe(u8, "192.168.1.50"), .hostname = null, .client_id = null };
+    c1.pools[0].reservations = res1;
+
+    alloc.free(c2.pools[0].reservations);
+    const res2 = try alloc.alloc(Reservation, 1);
+    res2[0] = .{ .mac = try alloc.dupe(u8, "aa:bb:cc:dd:ee:ff"), .ip = try alloc.dupe(u8, "192.168.1.50"), .hostname = try alloc.dupe(u8, "myhost"), .client_id = null };
+    c2.pools[0].reservations = res2;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: mac_classes change produces different hash" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    const classes = try alloc.alloc(MacClass, 1);
+    classes[0] = .{
+        .name = try alloc.dupe(u8, "printers"),
+        .match = try alloc.dupe(u8, "aa:bb:cc"),
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+    };
+    c2.mac_classes = classes;
+
+    try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+test "computePoolHash: tftp_servers order matters" {
+    const alloc = std.testing.allocator;
+    var c1 = makeHashTestConfig(alloc);
+    defer c1.deinit();
+    var c2 = makeHashTestConfig(alloc);
+    defer c2.deinit();
+
+    alloc.free(c1.pools[0].tftp_servers);
+    const tftp1 = try alloc.alloc([]const u8, 2);
+    tftp1[0] = try alloc.dupe(u8, "10.0.0.1");
+    tftp1[1] = try alloc.dupe(u8, "10.0.0.2");
+    c1.pools[0].tftp_servers = tftp1;
+
+    alloc.free(c2.pools[0].tftp_servers);
+    const tftp2 = try alloc.alloc([]const u8, 2);
+    tftp2[0] = try alloc.dupe(u8, "10.0.0.2");
+    tftp2[1] = try alloc.dupe(u8, "10.0.0.1");
+    c2.pools[0].tftp_servers = tftp2;
+
+    // TFTP order matters, so different order = different hash
     try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
 }
 
