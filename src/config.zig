@@ -1195,12 +1195,10 @@ fn validatePoolFields(allocator: std.mem.Allocator, pool: *PoolConfig) bool {
             break :blk true;
         };
         if (!ps_valid) {
-            std.log.warn("config: pool {s}/{d}: pool_start '{s}' is invalid or outside subnet, clearing to auto-compute", .{
+            std.log.err("config: pool {s}/{d}: pool_start '{s}' is invalid or outside subnet, skipping pool", .{
                 pool.subnet, pool.prefix_len, pool.pool_start,
             });
-            allocator.free(pool.pool_start);
-            pool.pool_start = allocator.dupe(u8, "") catch return false;
-            ps_int_opt = null;
+            return false;
         }
     }
 
@@ -1215,25 +1213,20 @@ fn validatePoolFields(allocator: std.mem.Allocator, pool: *PoolConfig) bool {
             break :blk true;
         };
         if (!pe_valid) {
-            std.log.warn("config: pool {s}/{d}: pool_end '{s}' is invalid or outside subnet, clearing to auto-compute", .{
+            std.log.err("config: pool {s}/{d}: pool_end '{s}' is invalid or outside subnet, skipping pool", .{
                 pool.subnet, pool.prefix_len, pool.pool_end,
             });
-            allocator.free(pool.pool_end);
-            pool.pool_end = allocator.dupe(u8, "") catch return false;
-            pe_int_opt = null;
+            return false;
         }
     }
 
     // If both set, start must be <= end.
     if (ps_int_opt != null and pe_int_opt != null) {
         if (ps_int_opt.? > pe_int_opt.?) {
-            std.log.warn("config: pool {s}/{d}: pool_start {s} > pool_end {s}, clearing both to auto-compute", .{
+            std.log.err("config: pool {s}/{d}: pool_start {s} > pool_end {s}, skipping pool", .{
                 pool.subnet, pool.prefix_len, pool.pool_start, pool.pool_end,
             });
-            allocator.free(pool.pool_start);
-            pool.pool_start = allocator.dupe(u8, "") catch return false;
-            allocator.free(pool.pool_end);
-            pool.pool_end = allocator.dupe(u8, "") catch return false;
+            return false;
         }
     }
 
@@ -1989,42 +1982,10 @@ test "validatePoolFields: valid pool passes" {
 }
 
 // Note: strict-rejection tests (missing router, router outside subnet,
-// lease_time 0, lease_time > 2 weeks) are not included as unit tests because
-// they emit std.log.err which the Zig 0.15 test runner treats as failures.
+// lease_time 0, lease_time > 2 weeks, invalid pool_start, invalid pool_end,
+// pool_start > pool_end) are not included as unit tests because they emit
+// std.log.err which the Zig 0.15 test runner treats as failures.
 // Those paths are covered by integration / config-load testing.
-
-test "validatePoolFields: invalid pool_start cleared" {
-    const alloc = std.testing.allocator;
-    var pool = makeValidTestPool(alloc);
-    defer pool.deinit(alloc);
-    alloc.free(pool.pool_start);
-    pool.pool_start = alloc.dupe(u8, "not.an.ip") catch unreachable;
-    try std.testing.expect(validatePoolFields(alloc, &pool));
-    try std.testing.expectEqualStrings("", pool.pool_start);
-}
-
-test "validatePoolFields: pool_start outside subnet cleared" {
-    const alloc = std.testing.allocator;
-    var pool = makeValidTestPool(alloc);
-    defer pool.deinit(alloc);
-    alloc.free(pool.pool_start);
-    pool.pool_start = alloc.dupe(u8, "10.0.0.1") catch unreachable;
-    try std.testing.expect(validatePoolFields(alloc, &pool));
-    try std.testing.expectEqualStrings("", pool.pool_start);
-}
-
-test "validatePoolFields: pool_start > pool_end clears both" {
-    const alloc = std.testing.allocator;
-    var pool = makeValidTestPool(alloc);
-    defer pool.deinit(alloc);
-    alloc.free(pool.pool_start);
-    pool.pool_start = alloc.dupe(u8, "192.168.1.200") catch unreachable;
-    alloc.free(pool.pool_end);
-    pool.pool_end = alloc.dupe(u8, "192.168.1.100") catch unreachable;
-    try std.testing.expect(validatePoolFields(alloc, &pool));
-    try std.testing.expectEqualStrings("", pool.pool_start);
-    try std.testing.expectEqualStrings("", pool.pool_end);
-}
 
 test "validatePoolFields: MTU below 68 cleared" {
     const alloc = std.testing.allocator;
