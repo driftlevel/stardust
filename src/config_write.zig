@@ -78,23 +78,6 @@ pub fn renderConfig(w: anytype, cfg: *const config_mod.Config) !void {
         try w.writeAll("\n");
     }
 
-    // mac_classes section (only if any are defined)
-    if (cfg.mac_classes.len > 0) {
-        try w.writeAll("mac_classes:\n");
-        for (cfg.mac_classes) |mc| {
-            try w.print("  - name: {s}\n", .{mc.name});
-            try w.print("    match: \"{s}\"\n", .{mc.match});
-            if (mc.dhcp_options.count() > 0) {
-                try w.writeAll("    dhcp_options:\n");
-                var it = mc.dhcp_options.iterator();
-                while (it.next()) |entry| {
-                    try w.print("      {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-                }
-            }
-        }
-        try w.writeAll("\n");
-    }
-
     // pools section
     try w.writeAll("pools:\n");
     for (cfg.pools) |pool| {
@@ -227,6 +210,84 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
                     while (oit.next()) |entry| {
                         try w.print("          {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
                     }
+                }
+            }
+        }
+    }
+
+    // mac_classes (per-pool)
+    if (pool.mac_classes.len > 0) {
+        try w.writeAll("    mac_classes:\n");
+        for (pool.mac_classes) |mc| {
+            try w.print("      - name: {s}\n", .{mc.name});
+            try w.print("        match: \"{s}\"\n", .{mc.match});
+            if (mc.router) |r| {
+                try w.print("        router: {s}\n", .{r});
+            }
+            if (mc.domain_name) |d| {
+                try w.print("        domain_name: {s}\n", .{d});
+            }
+            if (mc.domain_search.len > 0) {
+                try w.writeAll("        domain_search:\n");
+                for (mc.domain_search) |s| {
+                    try w.print("          - {s}\n", .{s});
+                }
+            }
+            if (mc.dns_servers.len > 0) {
+                try w.writeAll("        dns_servers:\n");
+                for (mc.dns_servers) |s| {
+                    try w.print("          - {s}\n", .{s});
+                }
+            }
+            if (mc.ntp_servers.len > 0) {
+                try w.writeAll("        ntp_servers:\n");
+                for (mc.ntp_servers) |s| {
+                    try w.print("          - {s}\n", .{s});
+                }
+            }
+            if (mc.log_servers.len > 0) {
+                try w.writeAll("        log_servers:\n");
+                for (mc.log_servers) |s| {
+                    try w.print("          - {s}\n", .{s});
+                }
+            }
+            if (mc.wins_servers.len > 0) {
+                try w.writeAll("        wins_servers:\n");
+                for (mc.wins_servers) |s| {
+                    try w.print("          - {s}\n", .{s});
+                }
+            }
+            if (mc.time_offset) |off| {
+                try w.print("        time_offset: {d}\n", .{off});
+            }
+            if (mc.tftp_servers.len > 0) {
+                try w.writeAll("        tftp_servers:\n");
+                for (mc.tftp_servers) |s| {
+                    try w.print("          - {s}\n", .{s});
+                }
+            }
+            if (mc.boot_filename) |b| {
+                try w.print("        boot_filename: {s}\n", .{b});
+            }
+            if (mc.http_boot_url) |h| {
+                try w.print("        http_boot_url: {s}\n", .{h});
+            }
+            if (mc.static_routes.len > 0) {
+                try w.writeAll("        static_routes:\n");
+                for (mc.static_routes) |sr| {
+                    try w.print("          - destination: {d}.{d}.{d}.{d}/{d}\n", .{
+                        sr.destination[0], sr.destination[1], sr.destination[2], sr.destination[3], sr.prefix_len,
+                    });
+                    try w.print("            router: {d}.{d}.{d}.{d}\n", .{
+                        sr.router[0], sr.router[1], sr.router[2], sr.router[3],
+                    });
+                }
+            }
+            if (mc.dhcp_options.count() > 0) {
+                try w.writeAll("        dhcp_options:\n");
+                var it = mc.dhcp_options.iterator();
+                while (it.next()) |entry| {
+                    try w.print("          {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
                 }
             }
         }
@@ -495,7 +556,7 @@ test "renderConfig round-trips global fields" {
     try std.testing.expect(std.mem.indexOf(u8, out, "port: 2267") != null);
 }
 
-test "renderConfig includes mac_classes" {
+test "renderConfig includes per-pool mac_classes" {
     const allocator = std.testing.allocator;
 
     var mc_opts = std.StringHashMap([]const u8).init(allocator);
@@ -535,9 +596,10 @@ test "renderConfig includes mac_classes" {
         .dhcp_options = pool_opts,
         .reservations = &.{},
         .static_routes = &.{},
+        .mac_classes = mac_classes_slice,
     }};
 
-    var cfg = config_mod.Config{
+    const cfg = config_mod.Config{
         .allocator = allocator,
         .listen_address = "0.0.0.0",
         .state_dir = "/tmp",
@@ -545,13 +607,12 @@ test "renderConfig includes mac_classes" {
         .pool_allocation_random = false,
         .sync = null,
         .pools = &pools,
-        .mac_classes = mac_classes_slice,
         .admin_ssh = .{ .enable = false, .port = 2267, .bind = "0.0.0.0", .read_only = false, .host_key = "", .authorized_keys = "" },
         .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = "127.0.0.1" },
     };
     defer {
-        for (cfg.mac_classes) |*mc| mc.deinit(allocator);
-        allocator.free(cfg.mac_classes);
+        for (mac_classes_slice) |*mc| @constCast(mc).deinit(allocator);
+        allocator.free(mac_classes_slice);
         pool_opts.deinit();
     }
 
@@ -561,10 +622,10 @@ test "renderConfig includes mac_classes" {
     const out = buf.items;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "mac_classes:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "  - name: IP Phones") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    match: \"64:16:7f\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    dhcp_options:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "      66: tftp.phones.local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      - name: IP Phones") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        match: \"64:16:7f\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        dhcp_options:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "          66: tftp.phones.local") != null);
 }
 
 test "renderConfig includes reservation dhcp_options" {

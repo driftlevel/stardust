@@ -242,7 +242,7 @@ pub const SyncManager = struct {
             self.pool_states[i] = .{
                 .subnet_ip = subnet_ip,
                 .prefix_len = pool.prefix_len,
-                .local_hash = config_mod.computePerPoolHash(pool, self.full_cfg.mac_classes),
+                .local_hash = config_mod.computePerPoolHash(pool),
                 .enabled = std.atomic.Value(bool).init(true),
             };
         }
@@ -2061,6 +2061,6 @@ test "computeLocalPoolStates: produces correct per-pool hashes" {
     try std.testing.expect(mgr.pool_states[0].enabled.load(.acquire));
 
     // Hash should match what computePerPoolHash returns
-    const expected = config_mod.computePerPoolHash(&cfg.pools[0], cfg.mac_classes);
+    const expected = config_mod.computePerPoolHash(&cfg.pools[0]);
     try std.testing.expectEqualSlices(u8, &expected, &mgr.pool_states[0].local_hash);
 }

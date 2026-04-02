@@ -1437,7 +1437,7 @@ pub const DHCPServer = struct {
             pool,
             &mac_str_for_ov,
             reservation,
-            self.cfg.mac_classes,
+            pool.mac_classes,
         );
         defer overrides.deinit();
 
@@ -1792,7 +1792,7 @@ pub const DHCPServer = struct {
             pool,
             mac_str,
             config_res,
-            self.cfg.mac_classes,
+            pool.mac_classes,
         );
         defer overrides.deinit();
 
@@ -2278,7 +2278,7 @@ pub const DHCPServer = struct {
             mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch "";
         const config_res_inf = findConfigReservation(pool, mac_str_inf);
-        var overrides = collectOverrides(self.allocator, pool, mac_str_inf, config_res_inf, self.cfg.mac_classes);
+        var overrides = collectOverrides(self.allocator, pool, mac_str_inf, config_res_inf, pool.mac_classes);
         defer overrides.deinit();
 
         var opts_buf: [1024]u8 = undefined;

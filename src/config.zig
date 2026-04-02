@@ -45,16 +45,48 @@ pub const Reservation = struct {
     dhcp_options: ?std.StringHashMap([]const u8) = null,
 };
 
-/// MAC class rule: matches client MACs by prefix pattern and overrides DHCP options.
-/// Applied after pool defaults, before per-reservation overrides.
+/// MAC class rule: matches client MACs by prefix pattern and overrides DHCP options
+/// and/or first-class pool fields. Applied after pool defaults, before per-reservation
+/// overrides. First-class fields (router, dns_servers, etc.) allow structured overrides
+/// without needing raw option codes; dhcp_options provides escape-hatch for any code.
 pub const MacClass = struct {
     name: []const u8,
     match: []const u8, // MAC prefix, e.g. "64:16:7f" or "aa:bb:cc:dd:*"
+    // Optional first-class field overrides (null/empty = use pool default)
+    router: ?[]const u8 = null,
+    domain_name: ?[]const u8 = null,
+    domain_search: [][]const u8 = &.{},
+    dns_servers: [][]const u8 = &.{},
+    ntp_servers: [][]const u8 = &.{},
+    log_servers: [][]const u8 = &.{},
+    wins_servers: [][]const u8 = &.{},
+    time_offset: ?i32 = null,
+    tftp_servers: [][]const u8 = &.{},
+    boot_filename: ?[]const u8 = null,
+    http_boot_url: ?[]const u8 = null,
+    static_routes: []StaticRoute = &.{},
     dhcp_options: std.StringHashMap([]const u8),
 
     pub fn deinit(self: *MacClass, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.match);
+        if (self.router) |r| allocator.free(r);
+        if (self.domain_name) |d| allocator.free(d);
+        for (self.domain_search) |s| allocator.free(s);
+        if (self.domain_search.len > 0) allocator.free(self.domain_search);
+        for (self.dns_servers) |s| allocator.free(s);
+        if (self.dns_servers.len > 0) allocator.free(self.dns_servers);
+        for (self.ntp_servers) |s| allocator.free(s);
+        if (self.ntp_servers.len > 0) allocator.free(self.ntp_servers);
+        for (self.log_servers) |s| allocator.free(s);
+        if (self.log_servers.len > 0) allocator.free(self.log_servers);
+        for (self.wins_servers) |s| allocator.free(s);
+        if (self.wins_servers.len > 0) allocator.free(self.wins_servers);
+        for (self.tftp_servers) |s| allocator.free(s);
+        if (self.tftp_servers.len > 0) allocator.free(self.tftp_servers);
+        if (self.boot_filename) |b| allocator.free(b);
+        if (self.http_boot_url) |h| allocator.free(h);
+        if (self.static_routes.len > 0) allocator.free(self.static_routes);
         var it = self.dhcp_options.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -99,6 +131,7 @@ pub const PoolConfig = struct {
     dhcp_options: std.StringHashMap([]const u8),
     reservations: []Reservation,
     static_routes: []StaticRoute,
+    mac_classes: []MacClass = &.{},
 
     pub fn deinit(self: *PoolConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.subnet);
@@ -149,6 +182,8 @@ pub const PoolConfig = struct {
         }
         allocator.free(self.reservations);
         allocator.free(self.static_routes);
+        for (self.mac_classes) |*mc| @constCast(mc).deinit(allocator);
+        if (self.mac_classes.len > 0) allocator.free(self.mac_classes);
     }
 };
 
@@ -164,7 +199,6 @@ pub const Config = struct {
     log_level: LogLevel,
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
     sync: ?SyncConfig,
-    mac_classes: []MacClass = &.{},
     pools: []PoolConfig, // at least one required
     admin_ssh: AdminSSHConfig,
     metrics: MetricsConfig,
@@ -172,8 +206,6 @@ pub const Config = struct {
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.listen_address);
         self.allocator.free(self.state_dir);
-        for (self.mac_classes) |*mc| mc.deinit(self.allocator);
-        self.allocator.free(self.mac_classes);
         for (self.pools) |*pool| pool.deinit(self.allocator);
         self.allocator.free(self.pools);
         if (self.sync) |*s| {
@@ -235,7 +267,6 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .log_level = parseLogLevel(raw.log_level orelse "info"),
         .pool_allocation_random = false,
         .sync = null,
-        .mac_classes = try allocator.alloc(MacClass, 0),
         .pools = try allocator.alloc(PoolConfig, 0),
         .admin_ssh = .{
             .enable = false,
@@ -268,10 +299,8 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
                 }
             }
 
-            if (root_map.get("mac_classes")) |mc_val| {
-                if (mc_val.asList()) |mc_list| {
-                    cfg.mac_classes = try parseMacClasses(allocator, mc_list);
-                }
+            if (root_map.get("mac_classes")) |_| {
+                std.log.warn("config: global mac_classes is deprecated, move them into each pool", .{});
             }
 
             if (root_map.get("admin_ssh")) |ssh_val| {
@@ -661,6 +690,12 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         }
     }
 
+    if (pool_map.get("mac_classes")) |mc_val| {
+        if (mc_val.asList()) |mc_list| {
+            pool.mac_classes = try parseMacClasses(allocator, mc_list);
+        }
+    }
+
     if (!validatePoolFields(allocator, &pool)) return null;
 
     return pool;
@@ -938,6 +973,7 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
             continue;
         }
 
+        // --- dhcp_options map ---
         var opts = std.StringHashMap([]const u8).init(allocator);
         errdefer {
             var oit = opts.iterator();
@@ -960,13 +996,118 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
             }
         }
 
+        // --- name + match ---
         const name_duped = try allocator.dupe(u8, name_str);
         errdefer allocator.free(name_duped);
         const match_duped = try allocator.dupe(u8, match_str);
+        errdefer allocator.free(match_duped);
+
+        // --- Optional scalar fields ---
+        const mc_router: ?[]const u8 = if (m.get("router")) |v| blk: {
+            if (v.asScalar()) |s| {
+                if (s.len > 0) break :blk try allocator.dupe(u8, s);
+            }
+            break :blk null;
+        } else null;
+        errdefer if (mc_router) |r| allocator.free(r);
+
+        const mc_domain_name: ?[]const u8 = if (m.get("domain_name")) |v| blk: {
+            if (v.asScalar()) |s| {
+                if (s.len > 0) break :blk try allocator.dupe(u8, s);
+            }
+            break :blk null;
+        } else null;
+        errdefer if (mc_domain_name) |d| allocator.free(d);
+
+        const mc_boot_filename: ?[]const u8 = if (m.get("boot_filename")) |v| blk: {
+            if (v.asScalar()) |s| {
+                if (s.len > 0) break :blk try allocator.dupe(u8, s);
+            }
+            break :blk null;
+        } else null;
+        errdefer if (mc_boot_filename) |b| allocator.free(b);
+
+        const mc_http_boot_url: ?[]const u8 = if (m.get("http_boot_url")) |v| blk: {
+            if (v.asScalar()) |s| {
+                if (s.len > 0) break :blk try allocator.dupe(u8, s);
+            }
+            break :blk null;
+        } else null;
+        errdefer if (mc_http_boot_url) |h| allocator.free(h);
+
+        // --- Optional integer fields ---
+        const mc_time_offset: ?i32 = if (m.get("time_offset")) |v| blk: {
+            if (v.asScalar()) |s| break :blk std.fmt.parseInt(i32, s, 10) catch null;
+            break :blk null;
+        } else null;
+
+        // --- String list fields ---
+        const mc_domain_search = try parseMacClassStringList(allocator, m, "domain_search");
+        errdefer {
+            for (mc_domain_search) |s| allocator.free(s);
+            if (mc_domain_search.len > 0) allocator.free(mc_domain_search);
+        }
+        const mc_dns_servers = try parseMacClassStringList(allocator, m, "dns_servers");
+        errdefer {
+            for (mc_dns_servers) |s| allocator.free(s);
+            if (mc_dns_servers.len > 0) allocator.free(mc_dns_servers);
+        }
+        const mc_ntp_servers = try parseMacClassStringList(allocator, m, "ntp_servers");
+        errdefer {
+            for (mc_ntp_servers) |s| allocator.free(s);
+            if (mc_ntp_servers.len > 0) allocator.free(mc_ntp_servers);
+        }
+        const mc_log_servers = try parseMacClassStringList(allocator, m, "log_servers");
+        errdefer {
+            for (mc_log_servers) |s| allocator.free(s);
+            if (mc_log_servers.len > 0) allocator.free(mc_log_servers);
+        }
+        const mc_wins_servers = try parseMacClassStringList(allocator, m, "wins_servers");
+        errdefer {
+            for (mc_wins_servers) |s| allocator.free(s);
+            if (mc_wins_servers.len > 0) allocator.free(mc_wins_servers);
+        }
+        const mc_tftp_servers = try parseMacClassStringList(allocator, m, "tftp_servers");
+        errdefer {
+            for (mc_tftp_servers) |s| allocator.free(s);
+            if (mc_tftp_servers.len > 0) allocator.free(mc_tftp_servers);
+        }
+
+        // --- Static routes ---
+        var mc_static_routes: []StaticRoute = &.{};
+        errdefer if (mc_static_routes.len > 0) allocator.free(mc_static_routes);
+        if (m.get("static_routes")) |sr_val| {
+            if (sr_val.asList()) |sr_list| {
+                var routes = std.ArrayListUnmanaged(StaticRoute){};
+                errdefer routes.deinit(allocator);
+                for (sr_list) |sr_item| {
+                    const sr_map = sr_item.asMap() orelse continue;
+                    const dest_val = sr_map.get("destination") orelse continue;
+                    const rtr_val = sr_map.get("router") orelse continue;
+                    const dest_str = dest_val.asScalar() orelse continue;
+                    const rtr_str = rtr_val.asScalar() orelse continue;
+                    const route = parseOneStaticRoute(dest_str, rtr_str) orelse continue;
+                    try routes.append(allocator, route);
+                }
+                mc_static_routes = try routes.toOwnedSlice(allocator);
+            }
+        }
 
         classes[idx] = .{
             .name = name_duped,
             .match = match_duped,
+            .router = mc_router,
+            .domain_name = mc_domain_name,
+            .domain_search = mc_domain_search,
+            .dns_servers = mc_dns_servers,
+            .ntp_servers = mc_ntp_servers,
+            .log_servers = mc_log_servers,
+            .wins_servers = mc_wins_servers,
+            .time_offset = mc_time_offset,
+            .tftp_servers = mc_tftp_servers,
+            .boot_filename = mc_boot_filename,
+            .http_boot_url = mc_http_boot_url,
+            .static_routes = mc_static_routes,
             .dhcp_options = opts,
         };
         idx += 1;
@@ -974,8 +1115,33 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
     return allocator.realloc(classes, idx) catch classes[0..idx];
 }
 
-/// Compute a SHA-256 pool hash over all pool configuration fields and global
-/// MAC classes. Used by SyncManager to verify peer config compatibility.
+/// Parse a string list from a mac_class map entry. Returns &.{} if not present.
+fn parseMacClassStringList(allocator: std.mem.Allocator, m: anytype, key: []const u8) ![][]const u8 {
+    const val = m.get(key) orelse return &.{};
+    const list = val.asList() orelse return &.{};
+    if (list.len == 0) return &.{};
+    const result = try allocator.alloc([]const u8, list.len);
+    var count: usize = 0;
+    errdefer {
+        for (result[0..count]) |s| allocator.free(s);
+        allocator.free(result);
+    }
+    for (list) |item| {
+        const s = item.asScalar() orelse "";
+        if (s.len > 0) {
+            result[count] = try allocator.dupe(u8, s);
+            count += 1;
+        }
+    }
+    if (count == 0) {
+        allocator.free(result);
+        return &.{};
+    }
+    return allocator.realloc(result, count) catch result[0..count];
+}
+
+/// Compute a SHA-256 pool hash over all pool configuration fields and their
+/// per-pool MAC classes. Used by SyncManager to verify peer config compatibility.
 pub fn computePoolHash(cfg: *const Config) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
 
@@ -986,22 +1152,21 @@ pub fn computePoolHash(cfg: *const Config) [32]u8 {
 
     for (cfg.pools) |*pool| {
         hashPoolIntoSha256(&h, pool);
+        // Hash per-pool MAC classes (sorted by name for determinism).
+        hashMacClasses(&h, pool.mac_classes);
     }
-
-    // Hash global MAC classes (sorted by name for determinism).
-    hashMacClasses(&h, cfg.mac_classes);
 
     var digest: [32]u8 = undefined;
     h.final(&digest);
     return digest;
 }
 
-/// Compute a SHA-256 hash for a single pool (plus global mac_classes).
+/// Compute a SHA-256 hash for a single pool (including its per-pool mac_classes).
 /// Used by the per-pool sync protocol to identify individual pool configs.
-pub fn computePerPoolHash(pool: *const PoolConfig, mac_classes: []const MacClass) [32]u8 {
+pub fn computePerPoolHash(pool: *const PoolConfig) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     hashPoolIntoSha256(&h, pool);
-    hashMacClasses(&h, mac_classes);
+    hashMacClasses(&h, pool.mac_classes);
     return h.finalResult();
 }
 
@@ -1076,7 +1241,7 @@ fn hashOptionalString(h: *Sha256, val: ?[]const u8) void {
     }
 }
 
-/// Hash global MAC classes sorted by name.
+/// Hash per-pool MAC classes sorted by name.
 fn hashMacClasses(h: *Sha256, classes: []const MacClass) void {
     var mc_count: [4]u8 = undefined;
     std.mem.writeInt(u32, &mc_count, @intCast(classes.len), .big);
@@ -1099,7 +1264,63 @@ fn hashMacClasses(h: *Sha256, classes: []const MacClass) void {
         const mc = &classes[ci];
         h.update(mc.name);
         h.update(mc.match);
+        // First-class scalar fields
+        hashOptionalString(h, mc.router);
+        hashOptionalString(h, mc.domain_name);
+        hashOptionalString(h, mc.boot_filename);
+        hashOptionalString(h, mc.http_boot_url);
+        // time_offset: nullable i32, marker byte + big-endian value
+        if (mc.time_offset) |to| {
+            h.update(&[1]u8{0x01});
+            var to_bytes: [4]u8 = undefined;
+            std.mem.writeInt(i32, &to_bytes, to, .big);
+            h.update(&to_bytes);
+        } else {
+            h.update(&[1]u8{0x00});
+        }
+        // String list fields (sorted)
+        hashSortedStringList(h, mc.domain_search);
+        hashSortedStringList(h, mc.dns_servers);
+        hashSortedStringList(h, mc.ntp_servers);
+        hashSortedStringList(h, mc.log_servers);
+        hashSortedStringList(h, mc.wins_servers);
+        // TFTP servers: order matters, do NOT sort (same as pool level).
+        hashStringListOrdered(h, mc.tftp_servers);
+        // Static routes (sorted by destination)
+        hashStaticRoutes(h, mc.static_routes);
+        // dhcp_options map (sorted by key)
         hashSortedStringMap(h, mc.dhcp_options);
+    }
+}
+
+/// Hash a slice of StaticRoute sorted by destination address.
+fn hashStaticRoutes(h: *Sha256, routes: []const StaticRoute) void {
+    var src_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &src_bytes, @intCast(routes.len), .big);
+    h.update(&src_bytes);
+
+    var sr_indices: [256]usize = undefined;
+    const sr_count = @min(routes.len, sr_indices.len);
+    for (0..sr_count) |i| sr_indices[i] = i;
+    if (sr_count > 1) for (1..sr_count) |i| {
+        const key = sr_indices[i];
+        var j = i;
+        while (j > 0) {
+            const a = &routes[key];
+            const b2 = &routes[sr_indices[j - 1]];
+            const dest_a = std.mem.readInt(u32, &a.destination, .big);
+            const dest_b = std.mem.readInt(u32, &b2.destination, .big);
+            if (dest_a >= dest_b) break;
+            sr_indices[j] = sr_indices[j - 1];
+            j -= 1;
+        }
+        sr_indices[j] = key;
+    };
+    for (sr_indices[0..sr_count]) |sri| {
+        const r = &routes[sri];
+        h.update(&r.destination);
+        h.update(&[1]u8{r.prefix_len});
+        h.update(&r.router);
     }
 }
 
@@ -2177,7 +2398,7 @@ test "computePoolHash: mac_classes change produces different hash" {
         .match = try alloc.dupe(u8, "aa:bb:cc"),
         .dhcp_options = std.StringHashMap([]const u8).init(alloc),
     };
-    c2.mac_classes = classes;
+    c2.pools[0].mac_classes = classes;
 
     try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
 }
@@ -2216,8 +2437,8 @@ test "computePerPoolHash: same pool produces same hash" {
     var c2 = makeHashTestConfig(alloc);
     defer c2.deinit();
 
-    const h1 = computePerPoolHash(&c1.pools[0], c1.mac_classes);
-    const h2 = computePerPoolHash(&c2.pools[0], c2.mac_classes);
+    const h1 = computePerPoolHash(&c1.pools[0]);
+    const h2 = computePerPoolHash(&c2.pools[0]);
     try std.testing.expectEqualSlices(u8, &h1, &h2);
 }
 
@@ -2231,8 +2452,8 @@ test "computePerPoolHash: different pool produces different hash" {
     alloc.free(c2.pools[0].subnet);
     c2.pools[0].subnet = alloc.dupe(u8, "10.0.0.0") catch unreachable;
 
-    const h1 = computePerPoolHash(&c1.pools[0], c1.mac_classes);
-    const h2 = computePerPoolHash(&c2.pools[0], c2.mac_classes);
+    const h1 = computePerPoolHash(&c1.pools[0]);
+    const h2 = computePerPoolHash(&c2.pools[0]);
     try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }
 
@@ -2249,10 +2470,10 @@ test "computePerPoolHash: different mac_classes produces different hash" {
         .match = try alloc.dupe(u8, "00:11:22"),
         .dhcp_options = std.StringHashMap([]const u8).init(alloc),
     };
-    c2.mac_classes = classes;
+    c2.pools[0].mac_classes = classes;
 
-    const h1 = computePerPoolHash(&c1.pools[0], c1.mac_classes);
-    const h2 = computePerPoolHash(&c2.pools[0], c2.mac_classes);
+    const h1 = computePerPoolHash(&c1.pools[0]);
+    const h2 = computePerPoolHash(&c2.pools[0]);
     try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }
 

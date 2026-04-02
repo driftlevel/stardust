@@ -10,25 +10,6 @@ log_level: "info"   # err | warn | info | verbose | debug
 # pool_allocation_random: false
 
 # ---------------------------------------------------------------------------
-# MAC class rules — override DHCP options for clients matching a MAC prefix.
-# Applied after pool defaults, before per-reservation overrides.
-# Multiple rules may match the same client; they are applied in specificity
-# order (shortest prefix first), so the most specific match wins.
-# ---------------------------------------------------------------------------
-# mac_classes:
-#   - name: "IP Phones"
-#     match: "64:16:7f"           # Polycom OUI — matches any MAC starting with 64:16:7f:
-#     dhcp_options:
-#       66: "tftp.phones.local"  # TFTP server
-#       150: "10.0.0.5"          # Cisco TFTP alternative
-#
-#   - name: "PXE Boot Clients"
-#     match: "00:25:90:*"          # trailing :* is optional (same as prefix)
-#     dhcp_options:
-#       66: "10.0.0.10"
-#       67: "pxelinux.0"
-
-# ---------------------------------------------------------------------------
 # Pool definitions — each pool is one subnet served by this daemon.
 # Multiple pools may be defined for multi-subnet deployments.
 # ---------------------------------------------------------------------------
@@ -117,6 +98,27 @@ pools:
     # dhcp_options:
     #   150: "10.0.0.5,10.0.0.6"  # Cisco TFTP (IPs auto-encoded)
     #   252: "http://wpad.local/wpad.dat"  # WPAD URL (raw string)
+
+    # MAC class rules — override DHCP options and pool fields for clients
+    # matching a MAC prefix. Applied after pool defaults, before per-reservation
+    # overrides. Multiple rules may match the same client; they are applied in
+    # specificity order (shortest prefix first), so the most specific match wins.
+    # First-class fields (router, dns_servers, etc.) provide structured overrides;
+    # dhcp_options is the escape-hatch for any option code.
+    # mac_classes:
+    #   - name: "IP Phones"
+    #     match: "64:16:7f"           # Polycom OUI — matches any MAC starting with 64:16:7f:
+    #     tftp_servers:
+    #       - "tftp.phones.local"
+    #     boot_filename: "phone-config.cfg"
+    #     dhcp_options:
+    #       150: "10.0.0.5"          # Cisco TFTP alternative
+    #
+    #   - name: "PXE Boot Clients"
+    #     match: "00:25:90"           # trailing :* is optional (same as prefix)
+    #     tftp_servers:
+    #       - "10.0.0.10"
+    #     boot_filename: "pxelinux.0"
 
     # Per-pool DNS dynamic update configuration (RFC 2136)
     dns_update:
