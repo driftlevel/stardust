@@ -68,13 +68,10 @@ pools:
     # wins_servers:
     #   - "192.168.1.1"
 
-    # PXE / TFTP network boot (options 66 and 67)
-    # tftp_server_name: "192.168.1.1"
-    # boot_filename: "pxelinux.0"
-
-    # Cisco TFTP server addresses (option 150) — used by Cisco IP phones
-    # cisco_tftp_servers:
+    # TFTP server addresses (option 66 uses first entry, option 150 sends all)
+    # tftp_servers:
     #   - "192.168.1.1"
+    # boot_filename: "pxelinux.0"
 
     # UEFI HTTP boot — when a client sends option 60 = "HTTPClient",
     # the server echoes option 60 and provides this URL as option 67.

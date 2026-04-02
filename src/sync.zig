@@ -1144,9 +1144,8 @@ fn makeTestConfig(alloc: std.mem.Allocator) config_mod.Config {
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .mtu = null,
         .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
-        .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
+        .tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
-        .cisco_tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,

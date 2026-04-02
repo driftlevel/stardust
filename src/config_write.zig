@@ -156,17 +156,14 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
             try w.print("      - {s}\n", .{s});
         }
     }
-    if (pool.tftp_server_name.len > 0) {
-        try w.print("    tftp_server_name: {s}\n", .{pool.tftp_server_name});
+    if (pool.tftp_servers.len > 0) {
+        try w.writeAll("    tftp_servers:\n");
+        for (pool.tftp_servers) |s| {
+            try w.print("      - {s}\n", .{s});
+        }
     }
     if (pool.boot_filename.len > 0) {
         try w.print("    boot_filename: {s}\n", .{pool.boot_filename});
-    }
-    if (pool.cisco_tftp_servers.len > 0) {
-        try w.writeAll("    cisco_tftp_servers:\n");
-        for (pool.cisco_tftp_servers) |s| {
-            try w.print("      - {s}\n", .{s});
-        }
     }
     if (pool.http_boot_url.len > 0) {
         try w.print("    http_boot_url: {s}\n", .{pool.http_boot_url});
@@ -441,9 +438,8 @@ test "renderConfig round-trips global fields" {
             .ntp_servers = &.{},
             .mtu = null,
             .wins_servers = &.{},
-            .tftp_server_name = "",
+            .tftp_servers = &.{},
             .boot_filename = "",
-            .cisco_tftp_servers = &.{},
             .http_boot_url = "",
             .dns_update = .{
                 .enable = false,
@@ -532,9 +528,8 @@ test "renderConfig includes mac_classes" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -607,9 +602,8 @@ test "renderConfig includes reservation dhcp_options" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -680,9 +674,8 @@ test "upsertReservation adds new entry" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -744,9 +737,8 @@ test "upsertReservation updates existing entry" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -806,9 +798,8 @@ test "removeReservation removes by MAC" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -877,9 +868,8 @@ test "addPool appends to pools slice" {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .mtu = null,
         .wins_servers = try allocator.alloc([]const u8, 0),
-        .tftp_server_name = try allocator.dupe(u8, ""),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
         .boot_filename = try allocator.dupe(u8, ""),
-        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 7200 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -913,9 +903,8 @@ test "removePool removes by index and frees resources" {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .mtu = null,
         .wins_servers = try allocator.alloc([]const u8, 0),
-        .tftp_server_name = try allocator.dupe(u8, ""),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
         .boot_filename = try allocator.dupe(u8, ""),
-        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -940,9 +929,8 @@ test "removePool removes by index and frees resources" {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .mtu = null,
         .wins_servers = try allocator.alloc([]const u8, 0),
-        .tftp_server_name = try allocator.dupe(u8, ""),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
         .boot_filename = try allocator.dupe(u8, ""),
-        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 1800 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -1006,9 +994,8 @@ test "upsertReservation with dhcp_options" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -1100,9 +1087,8 @@ test "removeReservation frees dhcp_options" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -1120,11 +1106,11 @@ test "removeReservation frees dhcp_options" {
     try std.testing.expectEqual(@as(usize, 0), pool.reservations.len);
 }
 
-test "renderConfig includes mtu, wins_servers, and cisco_tftp_servers" {
+test "renderConfig includes mtu, wins_servers, and tftp_servers" {
     const allocator = std.testing.allocator;
 
     var wins = [_][]const u8{"10.0.0.5"};
-    var cisco = [_][]const u8{ "10.0.0.6", "10.0.0.7" };
+    var tftp = [_][]const u8{ "10.0.0.6", "10.0.0.7" };
     var pool_opts = std.StringHashMap([]const u8).init(allocator);
     var pools = [_]config_mod.PoolConfig{.{
         .subnet = "10.0.0.0",
@@ -1143,9 +1129,8 @@ test "renderConfig includes mtu, wins_servers, and cisco_tftp_servers" {
         .ntp_servers = &.{},
         .mtu = 9000,
         .wins_servers = &wins,
-        .tftp_server_name = "",
+        .tftp_servers = &tftp,
         .boot_filename = "",
-        .cisco_tftp_servers = &cisco,
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -1174,7 +1159,7 @@ test "renderConfig includes mtu, wins_servers, and cisco_tftp_servers" {
     try std.testing.expect(std.mem.indexOf(u8, out, "    mtu: 9000") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    wins_servers:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    cisco_tftp_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    tftp_servers:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.6") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.7") != null);
 }

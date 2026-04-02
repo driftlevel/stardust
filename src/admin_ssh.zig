@@ -573,12 +573,10 @@ const PoolForm = struct {
     wins_servers_len: usize = 0,
 
     // --- Boot ---
-    tftp_server_buf: [64]u8 = [_]u8{0} ** 64,
-    tftp_server_len: usize = 0,
+    tftp_servers_buf: [128]u8 = [_]u8{0} ** 128,
+    tftp_servers_len: usize = 0,
     boot_filename_buf: [128]u8 = [_]u8{0} ** 128,
     boot_filename_len: usize = 0,
-    cisco_tftp_buf: [128]u8 = [_]u8{0} ** 128,
-    cisco_tftp_len: usize = 0,
     http_boot_url_buf: [256]u8 = [_]u8{0} ** 256,
     http_boot_url_len: usize = 0,
 
@@ -2608,9 +2606,8 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "Log Servers", .section = "Servers" },
     .{ .label = "NTP Servers" },
     .{ .label = "WINS Servers" },
-    .{ .label = "TFTP Server", .section = "Boot" },
+    .{ .label = "TFTP Servers", .section = "Boot" },
     .{ .label = "Boot Filename" },
-    .{ .label = "Cisco TFTP" },
     .{ .label = "HTTP Boot URL" },
     .{ .label = "DNS Upd Enable", .section = "DNS Update" },
     .{ .label = "DNS Upd Server" },
@@ -2634,15 +2631,14 @@ fn poolFormFieldVal(form: *const PoolForm, idx: u8) []const u8 {
         9 => form.log_servers_buf[0..form.log_servers_len],
         10 => form.ntp_servers_buf[0..form.ntp_servers_len],
         11 => form.wins_servers_buf[0..form.wins_servers_len],
-        12 => form.tftp_server_buf[0..form.tftp_server_len],
+        12 => form.tftp_servers_buf[0..form.tftp_servers_len],
         13 => form.boot_filename_buf[0..form.boot_filename_len],
-        14 => form.cisco_tftp_buf[0..form.cisco_tftp_len],
-        15 => form.http_boot_url_buf[0..form.http_boot_url_len],
-        16 => if (form.dns_update_enable) "yes" else "no",
-        17 => form.dns_update_server_buf[0..form.dns_update_server_len],
-        18 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
-        19 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
-        20 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
+        14 => form.http_boot_url_buf[0..form.http_boot_url_len],
+        15 => if (form.dns_update_enable) "yes" else "no",
+        16 => form.dns_update_server_buf[0..form.dns_update_server_len],
+        17 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
+        18 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
+        19 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
         else => "",
     };
 }
@@ -2662,15 +2658,14 @@ fn poolFormFieldBuf(form: *PoolForm, idx: u8) ?struct { buf: []u8, len: *usize }
         9 => .{ .buf = &form.log_servers_buf, .len = &form.log_servers_len },
         10 => .{ .buf = &form.ntp_servers_buf, .len = &form.ntp_servers_len },
         11 => .{ .buf = &form.wins_servers_buf, .len = &form.wins_servers_len },
-        12 => .{ .buf = &form.tftp_server_buf, .len = &form.tftp_server_len },
+        12 => .{ .buf = &form.tftp_servers_buf, .len = &form.tftp_servers_len },
         13 => .{ .buf = &form.boot_filename_buf, .len = &form.boot_filename_len },
-        14 => .{ .buf = &form.cisco_tftp_buf, .len = &form.cisco_tftp_len },
-        15 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
-        // 16 = boolean toggle, not a text buffer
-        17 => .{ .buf = &form.dns_update_server_buf, .len = &form.dns_update_server_len },
-        18 => .{ .buf = &form.dns_update_zone_buf, .len = &form.dns_update_zone_len },
-        19 => .{ .buf = &form.dns_update_key_name_buf, .len = &form.dns_update_key_name_len },
-        20 => .{ .buf = &form.dns_update_key_file_buf, .len = &form.dns_update_key_file_len },
+        14 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
+        // 15 = boolean toggle, not a text buffer
+        16 => .{ .buf = &form.dns_update_server_buf, .len = &form.dns_update_server_len },
+        17 => .{ .buf = &form.dns_update_zone_buf, .len = &form.dns_update_zone_len },
+        18 => .{ .buf = &form.dns_update_key_name_buf, .len = &form.dns_update_key_name_len },
+        19 => .{ .buf = &form.dns_update_key_file_buf, .len = &form.dns_update_key_file_len },
         else => null,
     };
 }
@@ -2744,9 +2739,8 @@ fn populatePoolForm(form: *PoolForm, pool: *const config_mod.PoolConfig) void {
     form.ntp_servers_len = joinComma(128, &form.ntp_servers_buf, pool.ntp_servers);
     form.wins_servers_len = joinComma(128, &form.wins_servers_buf, pool.wins_servers);
 
-    copyField(&form.tftp_server_buf, &form.tftp_server_len, pool.tftp_server_name);
+    form.tftp_servers_len = joinComma(128, &form.tftp_servers_buf, pool.tftp_servers);
     copyField(&form.boot_filename_buf, &form.boot_filename_len, pool.boot_filename);
-    form.cisco_tftp_len = joinComma(128, &form.cisco_tftp_buf, pool.cisco_tftp_servers);
     copyField(&form.http_boot_url_buf, &form.http_boot_url_len, pool.http_boot_url);
 
     form.dns_update_enable = pool.dns_update.enable;
@@ -3133,15 +3127,14 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
             9 => if (pool.log_servers.len > 0) (std.mem.join(fa, ", ", pool.log_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
             10 => if (pool.ntp_servers.len > 0) (std.mem.join(fa, ", ", pool.ntp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
             11 => if (pool.wins_servers.len > 0) (std.mem.join(fa, ", ", pool.wins_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            12 => if (pool.tftp_server_name.len > 0) pool.tftp_server_name else "\xe2\x80\x94",
+            12 => if (pool.tftp_servers.len > 0) (std.mem.join(fa, ", ", pool.tftp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
             13 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
-            14 => if (pool.cisco_tftp_servers.len > 0) (std.mem.join(fa, ", ", pool.cisco_tftp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            15 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
-            16 => if (pool.dns_update.enable) "yes" else "no",
-            17 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
-            18 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
-            19 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
-            20 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
+            14 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
+            15 => if (pool.dns_update.enable) "yes" else "no",
+            16 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
+            17 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
+            18 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
+            19 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
             else => "\xe2\x80\x94",
         };
         const line = std.fmt.allocPrint(fa, "  {s:<18} {s}", .{ meta.label, val }) catch "";
@@ -3813,8 +3806,8 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     // Non-text fields: [+] buttons, route entries, option entries.
     if (form.active_field >= PoolForm.REGULAR_FIELD_COUNT) return;
 
-    // Field 16 = dns_update_enable: toggle on space or any printable
-    if (form.active_field == 16) {
+    // Field 15 = dns_update_enable: toggle on space or any printable
+    if (form.active_field == 15) {
         if (key.codepoint == ' ' or (key.codepoint >= 0x20 and key.codepoint <= 0x7E)) {
             form.dns_update_enable = !form.dns_update_enable;
         }
@@ -3964,8 +3957,8 @@ fn validatePoolForm(form: *PoolForm) ?[]const u8 {
     if (form.wins_servers_len > 0) {
         if (validateIpList(form.wins_servers_buf[0..form.wins_servers_len])) |e| return e;
     }
-    if (form.cisco_tftp_len > 0) {
-        if (validateIpList(form.cisco_tftp_buf[0..form.cisco_tftp_len])) |e| return e;
+    if (form.tftp_servers_len > 0) {
+        if (validateIpList(form.tftp_servers_buf[0..form.tftp_servers_len])) |e| return e;
     }
 
     // HTTP Boot URL: optional. Scheme + valid domain + optional path.
@@ -4348,15 +4341,13 @@ fn buildPoolFromFormInner(
         for (pool.wins_servers) |s| allocator.free(s);
         allocator.free(pool.wins_servers);
     }
-    pool.tftp_server_name = try allocator.dupe(u8, form.tftp_server_buf[0..form.tftp_server_len]);
-    errdefer allocator.free(pool.tftp_server_name);
+    pool.tftp_servers = try splitCommaDupe(allocator, form.tftp_servers_buf[0..form.tftp_servers_len]);
+    errdefer {
+        for (pool.tftp_servers) |s| allocator.free(s);
+        allocator.free(pool.tftp_servers);
+    }
     pool.boot_filename = try allocator.dupe(u8, form.boot_filename_buf[0..form.boot_filename_len]);
     errdefer allocator.free(pool.boot_filename);
-    pool.cisco_tftp_servers = try splitCommaDupe(allocator, form.cisco_tftp_buf[0..form.cisco_tftp_len]);
-    errdefer {
-        for (pool.cisco_tftp_servers) |s| allocator.free(s);
-        allocator.free(pool.cisco_tftp_servers);
-    }
     pool.http_boot_url = try allocator.dupe(u8, form.http_boot_url_buf[0..form.http_boot_url_len]);
     errdefer allocator.free(pool.http_boot_url);
     const dns_server = try allocator.dupe(u8, form.dns_update_server_buf[0..form.dns_update_server_len]);
@@ -4479,9 +4470,8 @@ fn applyFormToPool(allocator: std.mem.Allocator, pool: *config_mod.PoolConfig, f
     pool.mtu = if (form.mtu_len > 0) (std.fmt.parseInt(u16, form.mtu_buf[0..form.mtu_len], 10) catch null) else null;
     replaceStrSlice(allocator, &pool.wins_servers, form.wins_servers_buf[0..form.wins_servers_len]);
 
-    replaceStr(allocator, &pool.tftp_server_name, form.tftp_server_buf[0..form.tftp_server_len]);
+    replaceStrSlice(allocator, &pool.tftp_servers, form.tftp_servers_buf[0..form.tftp_servers_len]);
     replaceStr(allocator, &pool.boot_filename, form.boot_filename_buf[0..form.boot_filename_len]);
-    replaceStrSlice(allocator, &pool.cisco_tftp_servers, form.cisco_tftp_buf[0..form.cisco_tftp_len]);
     replaceStr(allocator, &pool.http_boot_url, form.http_boot_url_buf[0..form.http_boot_url_len]);
 
     pool.dns_update.enable = form.dns_update_enable;
@@ -6912,9 +6902,8 @@ test "fmtAbbrevRange: both endpoints explicit, same /24 subnet" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(fa),
@@ -6948,9 +6937,8 @@ test "fmtAbbrevRange: start only, end auto-computed" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(fa),
@@ -6986,9 +6974,8 @@ test "fmtAbbrevRange: both auto returns 'auto'" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(fa),
@@ -7038,13 +7025,13 @@ test "PoolForm: REGULAR_FIELD_COUNT matches pool_field_meta length" {
 
 test "PoolForm: totalFields accounts for inline domain search, routes and options" {
     var form = PoolForm{};
-    // No entries: 21 regular + [+]DS + [+]Route + [+]Option = 24
-    try std.testing.expectEqual(@as(u8, 24), form.totalFields());
+    // No entries: 20 regular + [+]DS + [+]Route + [+]Option = 23
+    try std.testing.expectEqual(@as(u8, 23), form.totalFields());
     form.domain_search_count = 1;
     form.route_count = 2;
     form.option_count = 3;
-    // 21 + 1 + 1 + 1 + 2 + 1 + 3 = 30
-    try std.testing.expectEqual(@as(u8, 30), form.totalFields());
+    // 20 + 1 + 1 + 1 + 2 + 1 + 3 = 29
+    try std.testing.expectEqual(@as(u8, 29), form.totalFields());
 }
 
 test "PoolForm: field index helpers" {
@@ -7052,12 +7039,12 @@ test "PoolForm: field index helpers" {
     form.domain_search_count = 1;
     form.route_count = 2;
     form.option_count = 1;
-    try std.testing.expectEqual(@as(u8, 21), form.addDomainSearchField());
-    try std.testing.expectEqual(@as(u8, 22), form.firstDomainSearchField());
-    try std.testing.expectEqual(@as(u8, 23), form.addRouteField());
-    try std.testing.expectEqual(@as(u8, 24), form.firstRouteField());
-    try std.testing.expectEqual(@as(u8, 26), form.addOptionField());
-    try std.testing.expectEqual(@as(u8, 27), form.firstOptionField());
+    try std.testing.expectEqual(@as(u8, 20), form.addDomainSearchField());
+    try std.testing.expectEqual(@as(u8, 21), form.firstDomainSearchField());
+    try std.testing.expectEqual(@as(u8, 22), form.addRouteField());
+    try std.testing.expectEqual(@as(u8, 23), form.firstRouteField());
+    try std.testing.expectEqual(@as(u8, 25), form.addOptionField());
+    try std.testing.expectEqual(@as(u8, 26), form.firstOptionField());
 }
 
 test "buildRoutesFromForm: empty routes" {

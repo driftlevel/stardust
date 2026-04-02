@@ -1453,13 +1453,13 @@ pub const DHCPServer = struct {
             appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
             appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
         } else {
-            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (pool.tftp_servers.len > 0) pool.tftp_servers[0] else "");
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
         }
 
         // Option 150: Cisco TFTP Server
         if (!isOverridden(&overrides, 150)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.cisco_tftp_servers);
+            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -1808,13 +1808,13 @@ pub const DHCPServer = struct {
             appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
             appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
         } else {
-            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (pool.tftp_servers.len > 0) pool.tftp_servers[0] else "");
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
         }
 
         // Option 150: Cisco TFTP Server
         if (!isOverridden(&overrides, 150)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.cisco_tftp_servers);
+            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -2279,13 +2279,13 @@ pub const DHCPServer = struct {
             appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
             appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
         } else {
-            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (pool.tftp_servers.len > 0) pool.tftp_servers[0] else "");
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
         }
 
         // Option 150: Cisco TFTP Server
         if (!isOverridden(&overrides, 150)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.cisco_tftp_servers);
+            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -2653,9 +2653,8 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .mtu = null,
         .wins_servers = try allocator.alloc([]const u8, 0),
-        .tftp_server_name = try allocator.dupe(u8, ""),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
         .boot_filename = try allocator.dupe(u8, ""),
-        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -2716,9 +2715,8 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .mtu = null,
         .wins_servers = try allocator.alloc([]const u8, 0),
-        .tftp_server_name = try allocator.dupe(u8, ""),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
         .boot_filename = try allocator.dupe(u8, ""),
-        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -2750,9 +2748,8 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .mtu = null,
         .wins_servers = try allocator.alloc([]const u8, 0),
-        .tftp_server_name = try allocator.dupe(u8, ""),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
         .boot_filename = try allocator.dupe(u8, ""),
-        .cisco_tftp_servers = try allocator.alloc([]const u8, 0),
         .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
@@ -4509,8 +4506,9 @@ test "UEFI HTTP boot: DISCOVER without HTTPClient gets normal TFTP options" {
     defer cfg.deinit();
     alloc.free(cfg.pools[0].http_boot_url);
     cfg.pools[0].http_boot_url = try alloc.dupe(u8, "http://boot.example.com/efi/bootx64.efi");
-    alloc.free(cfg.pools[0].tftp_server_name);
-    cfg.pools[0].tftp_server_name = try alloc.dupe(u8, "tftp.example.com");
+    alloc.free(cfg.pools[0].tftp_servers);
+    cfg.pools[0].tftp_servers = try alloc.alloc([]const u8, 1);
+    cfg.pools[0].tftp_servers[0] = try alloc.dupe(u8, "tftp.example.com");
     alloc.free(cfg.pools[0].boot_filename);
     cfg.pools[0].boot_filename = try alloc.dupe(u8, "pxelinux.0");
     cfg.pools[0].pool_start = blk: {
@@ -4547,8 +4545,9 @@ test "UEFI HTTP boot: http_boot_url empty => normal TFTP options even with HTTPC
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
     // http_boot_url is empty (default); tftp options set
-    alloc.free(cfg.pools[0].tftp_server_name);
-    cfg.pools[0].tftp_server_name = try alloc.dupe(u8, "tftp.example.com");
+    alloc.free(cfg.pools[0].tftp_servers);
+    cfg.pools[0].tftp_servers = try alloc.alloc([]const u8, 1);
+    cfg.pools[0].tftp_servers[0] = try alloc.dupe(u8, "tftp.example.com");
     alloc.free(cfg.pools[0].boot_filename);
     cfg.pools[0].boot_filename = try alloc.dupe(u8, "pxelinux.0");
     cfg.pools[0].pool_start = blk: {
@@ -4637,9 +4636,8 @@ test "collectOverrides: priority pool < mac_class < reservation" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -4703,9 +4701,8 @@ test "collectOverrides: most specific MAC class wins" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
@@ -4759,9 +4756,8 @@ test "collectOverrides: no matches returns pool options only" {
         .ntp_servers = &.{},
         .mtu = null,
         .wins_servers = &.{},
-        .tftp_server_name = "",
+        .tftp_servers = &.{},
         .boot_filename = "",
-        .cisco_tftp_servers = &.{},
         .http_boot_url = "",
         .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
         .dhcp_options = pool_opts,
@@ -4909,8 +4905,8 @@ test "OFFER includes WINS option 44 and Cisco TFTP option 150" {
     // Set up WINS and Cisco TFTP servers
     cfg.pools[0].wins_servers = try alloc.alloc([]const u8, 1);
     cfg.pools[0].wins_servers[0] = try alloc.dupe(u8, "10.0.0.5");
-    cfg.pools[0].cisco_tftp_servers = try alloc.alloc([]const u8, 1);
-    cfg.pools[0].cisco_tftp_servers[0] = try alloc.dupe(u8, "10.0.0.6");
+    cfg.pools[0].tftp_servers = try alloc.alloc([]const u8, 1);
+    cfg.pools[0].tftp_servers[0] = try alloc.dupe(u8, "10.0.0.6");
 
     const store = try makeTestStore(alloc);
     defer store.deinit();
