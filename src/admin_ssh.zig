@@ -446,7 +446,7 @@ const LeaseRow = struct {
 
 const Tab = enum(u8) { leases = 0, stats = 1, pools = 2, settings = 3 };
 
-const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, pool_ds_edit, pool_route_edit, pool_option_edit, help, res_option_edit, option_lookup, pool_option_lookup, settings_confirm };
+const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, pool_server_edit, pool_route_edit, pool_option_edit, help, res_option_edit, option_lookup, pool_option_lookup, settings_confirm };
 
 const ReservationForm = struct {
     /// MAC of the lease being edited; empty string means "new reservation".
@@ -502,10 +502,12 @@ const ReservationForm = struct {
     }
 };
 
-const DomainSearchEntry = struct {
+const InlineEntry = struct {
     buf: [64]u8 = [_]u8{0} ** 64,
     len: usize = 0,
 };
+
+const ServerEditTarget = enum { domain_search, dns, log, ntp, wins, tftp };
 
 const RouteEntry = struct {
     dest_buf: [18]u8 = [_]u8{0} ** 18, // "10.0.0.0/24"
@@ -541,16 +543,27 @@ const PoolForm = struct {
     domain_name_len: usize = 0,
 
     // --- Domain Search (inline entries with edit modal) ---
-    domain_search: [16]DomainSearchEntry = [_]DomainSearchEntry{.{}} ** 16,
+    domain_search: [16]InlineEntry = [_]InlineEntry{.{}} ** 16,
     domain_search_count: usize = 0,
-    ds_edit_buf: [64]u8 = [_]u8{0} ** 64,
-    ds_edit_len: usize = 0,
-    ds_edit_cursor: usize = 0,
-    ds_edit_index: ?usize = null, // null=adding, index=editing existing
 
-    // --- DNS ---
-    dns_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    dns_servers_len: usize = 0,
+    // --- Inline server entry arrays ---
+    dns_servers: [8]InlineEntry = [_]InlineEntry{.{}} ** 8,
+    dns_servers_count: usize = 0,
+    log_servers: [4]InlineEntry = [_]InlineEntry{.{}} ** 4,
+    log_servers_count: usize = 0,
+    ntp_servers: [4]InlineEntry = [_]InlineEntry{.{}} ** 4,
+    ntp_servers_count: usize = 0,
+    wins_servers: [2]InlineEntry = [_]InlineEntry{.{}} ** 2,
+    wins_servers_count: usize = 0,
+    tftp_servers: [4]InlineEntry = [_]InlineEntry{.{}} ** 4,
+    tftp_servers_count: usize = 0,
+
+    // --- Shared server edit modal state ---
+    server_edit_target: ServerEditTarget = .domain_search,
+    server_edit_buf: [64]u8 = [_]u8{0} ** 64,
+    server_edit_len: usize = 0,
+    server_edit_cursor: usize = 0,
+    server_edit_index: ?usize = null, // null=adding, index=editing existing
 
     // --- Timing ---
     lease_time_buf: [10]u8 = [_]u8{0} ** 10,
@@ -561,20 +574,12 @@ const PoolForm = struct {
     // --- Servers ---
     time_servers_buf: [128]u8 = [_]u8{0} ** 128,
     time_servers_len: usize = 0,
-    log_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    log_servers_len: usize = 0,
-    ntp_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    ntp_servers_len: usize = 0,
 
     // --- Network (cont.) ---
     mtu_buf: [6]u8 = [_]u8{0} ** 6,
     mtu_len: usize = 0,
-    wins_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    wins_servers_len: usize = 0,
 
     // --- Boot ---
-    tftp_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    tftp_servers_len: usize = 0,
     boot_filename_buf: [128]u8 = [_]u8{0} ** 128,
     boot_filename_len: usize = 0,
     http_boot_url_buf: [256]u8 = [_]u8{0} ** 256,
@@ -628,8 +633,10 @@ const PoolForm = struct {
     const REGULAR_FIELD_COUNT: u8 = pool_field_meta.len;
 
     fn totalFields(self: *const PoolForm) u8 {
-        // regular fields + [+]AddDomainSearch + ds entries + [+]AddRoute + route entries + [+]AddOption + option entries
-        return @intCast(pool_field_meta.len + 1 + self.domain_search_count + 1 + self.route_count + 1 + self.option_count);
+        // regular fields + [+]DS + ds entries + [+]DNS + dns entries + [+]Log + log entries
+        // + [+]NTP + ntp entries + [+]WINS + wins entries + [+]TFTP + tftp entries
+        // + [+]Route + route entries + [+]Option + option entries
+        return @intCast(pool_field_meta.len + 1 + self.domain_search_count + 1 + self.dns_servers_count + 1 + self.log_servers_count + 1 + self.ntp_servers_count + 1 + self.wins_servers_count + 1 + self.tftp_servers_count + 1 + self.route_count + 1 + self.option_count);
     }
 
     fn addDomainSearchField(self: *const PoolForm) u8 {
@@ -642,20 +649,60 @@ const PoolForm = struct {
         return REGULAR_FIELD_COUNT + 1;
     }
 
-    fn addRouteField(self: *const PoolForm) u8 {
+    fn addDnsField(self: *const PoolForm) u8 {
         return @intCast(REGULAR_FIELD_COUNT + 1 + self.domain_search_count);
     }
 
-    fn firstRouteField(self: *const PoolForm) u8 {
+    fn firstDnsField(self: *const PoolForm) u8 {
         return @intCast(REGULAR_FIELD_COUNT + 2 + self.domain_search_count);
     }
 
+    fn addLogField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 2 + self.domain_search_count + self.dns_servers_count);
+    }
+
+    fn firstLogField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 3 + self.domain_search_count + self.dns_servers_count);
+    }
+
+    fn addNtpField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 3 + self.domain_search_count + self.dns_servers_count + self.log_servers_count);
+    }
+
+    fn firstNtpField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 4 + self.domain_search_count + self.dns_servers_count + self.log_servers_count);
+    }
+
+    fn addWinsField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 4 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count);
+    }
+
+    fn firstWinsField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 5 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count);
+    }
+
+    fn addTftpField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 5 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count);
+    }
+
+    fn firstTftpField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 6 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count);
+    }
+
+    fn addRouteField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 6 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count);
+    }
+
+    fn firstRouteField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 7 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count);
+    }
+
     fn addOptionField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 2 + self.domain_search_count + self.route_count);
+        return @intCast(REGULAR_FIELD_COUNT + 7 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count + self.route_count);
     }
 
     fn firstOptionField(self: *const PoolForm) u8 {
-        return @intCast(REGULAR_FIELD_COUNT + 3 + self.domain_search_count + self.route_count);
+        return @intCast(REGULAR_FIELD_COUNT + 8 + self.domain_search_count + self.dns_servers_count + self.log_servers_count + self.ntp_servers_count + self.wins_servers_count + self.tftp_servers_count + self.route_count);
     }
 
     fn isNew(self: *const PoolForm) bool {
@@ -969,8 +1016,8 @@ fn runTui(
                         handlePoolDeleteConfirmKey(server, &state, key);
                         continue :parse_loop;
                     }
-                    if (state.mode == .pool_ds_edit) {
-                        handlePoolDsEditKey(&state, key);
+                    if (state.mode == .pool_server_edit) {
+                        handlePoolServerEditKey(&state, key);
                         continue :parse_loop;
                     }
                     if (state.mode == .pool_route_edit) {
@@ -1185,7 +1232,7 @@ fn runTui(
                                     state.mode = switch (state.mode) {
                                         .res_option_edit => .reservation_form,
                                         .option_lookup => .res_option_edit,
-                                        .pool_ds_edit, .pool_route_edit, .pool_option_edit => .pool_form,
+                                        .pool_server_edit, .pool_route_edit, .pool_option_edit => .pool_form,
                                         .pool_option_lookup => .pool_option_edit,
                                         else => .normal,
                                     };
@@ -1203,7 +1250,7 @@ fn runTui(
                                             handleFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
                                         } else if (state.mode == .pool_form) {
                                             const pf = &state.pool_form;
-                                            if (pf.active_field == pf.addDomainSearchField() or pf.active_field == pf.addRouteField() or pf.active_field == pf.addOptionField()) {
+                                            if (pf.active_field == pf.addDomainSearchField() or pf.active_field == pf.addDnsField() or pf.active_field == pf.addLogField() or pf.active_field == pf.addNtpField() or pf.active_field == pf.addWinsField() or pf.active_field == pf.addTftpField() or pf.active_field == pf.addRouteField() or pf.active_field == pf.addOptionField()) {
                                                 handlePoolFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
                                             }
                                         }
@@ -1337,7 +1384,7 @@ fn runTui(
                             },
                             // All other modals: swallow scroll.
                             .help => state.help_scroll -|= 1,
-                            .delete_confirm, .pool_delete_confirm, .pool_ds_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_server_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
@@ -1358,7 +1405,7 @@ fn runTui(
                                 if (state.form.active_field + 1 < state.form.totalFields()) state.form.active_field += 1;
                             },
                             .help => state.help_scroll +|= 1,
-                            .delete_confirm, .pool_delete_confirm, .pool_ds_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_server_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
                         },
                         else => {},
                     }
@@ -1457,7 +1504,7 @@ fn renderFrame(
         .pool_form => try renderPoolForm(state, win, fa),
         .pool_save_confirm => try renderPoolSaveConfirm(server, state, win, fa),
         .pool_delete_confirm => try renderPoolDeleteConfirm(server, state, win, fa),
-        .pool_ds_edit => try renderPoolDsEdit(state, win, fa),
+        .pool_server_edit => try renderPoolServerEdit(state, win, fa),
         .pool_route_edit => try renderPoolRouteEdit(state, win, fa),
         .pool_option_edit => try renderPoolOptionEdit(state, win, fa),
         .pool_option_lookup => try renderPoolOptionLookup(state, win, fa),
@@ -2594,26 +2641,21 @@ const PoolFieldMeta = struct {
 };
 
 const pool_field_meta = [_]PoolFieldMeta{
-    .{ .label = "Subnet", .section = "Network" },
-    .{ .label = "Router" },
-    .{ .label = "Pool Start" },
-    .{ .label = "Pool End" },
-    .{ .label = "Domain Name", .section = "Naming" },
-    .{ .label = "DNS Servers", .section = "DNS" },
-    .{ .label = "Lease Time", .section = "Timing" },
-    .{ .label = "Time Offset" },
-    .{ .label = "MTU" },
-    .{ .label = "Log Servers", .section = "Servers" },
-    .{ .label = "NTP Servers" },
-    .{ .label = "WINS Servers" },
-    .{ .label = "TFTP Servers", .section = "Boot" },
-    .{ .label = "Boot Filename" },
-    .{ .label = "HTTP Boot URL" },
-    .{ .label = "DNS Upd Enable", .section = "DNS Update" },
-    .{ .label = "DNS Upd Server" },
-    .{ .label = "DNS Upd Zone" },
-    .{ .label = "DNS Upd Key Name", .sensitive = true },
-    .{ .label = "DNS Upd Key File", .sensitive = true },
+    .{ .label = "Subnet", .section = "Network" }, // 0
+    .{ .label = "Router" }, // 1
+    .{ .label = "Pool Start" }, // 2
+    .{ .label = "Pool End" }, // 3
+    .{ .label = "Domain Name", .section = "Naming" }, // 4
+    .{ .label = "Lease Time", .section = "Timing" }, // 5
+    .{ .label = "Time Offset" }, // 6
+    .{ .label = "MTU" }, // 7
+    .{ .label = "Boot Filename", .section = "Boot" }, // 8
+    .{ .label = "HTTP Boot URL" }, // 9
+    .{ .label = "DNS Upd Enable", .section = "DNS Update" }, // 10
+    .{ .label = "DNS Upd Server" }, // 11
+    .{ .label = "DNS Upd Zone" }, // 12
+    .{ .label = "DNS Upd Key Name", .sensitive = true }, // 13
+    .{ .label = "DNS Upd Key File", .sensitive = true }, // 14
 };
 
 /// Return the string value of a pool form field by index.
@@ -2624,21 +2666,16 @@ fn poolFormFieldVal(form: *const PoolForm, idx: u8) []const u8 {
         2 => form.pool_start_buf[0..form.pool_start_len],
         3 => form.pool_end_buf[0..form.pool_end_len],
         4 => form.domain_name_buf[0..form.domain_name_len],
-        5 => form.dns_servers_buf[0..form.dns_servers_len],
-        6 => form.lease_time_buf[0..form.lease_time_len],
-        7 => form.time_offset_buf[0..form.time_offset_len],
-        8 => form.mtu_buf[0..form.mtu_len],
-        9 => form.log_servers_buf[0..form.log_servers_len],
-        10 => form.ntp_servers_buf[0..form.ntp_servers_len],
-        11 => form.wins_servers_buf[0..form.wins_servers_len],
-        12 => form.tftp_servers_buf[0..form.tftp_servers_len],
-        13 => form.boot_filename_buf[0..form.boot_filename_len],
-        14 => form.http_boot_url_buf[0..form.http_boot_url_len],
-        15 => if (form.dns_update_enable) "yes" else "no",
-        16 => form.dns_update_server_buf[0..form.dns_update_server_len],
-        17 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
-        18 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
-        19 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
+        5 => form.lease_time_buf[0..form.lease_time_len],
+        6 => form.time_offset_buf[0..form.time_offset_len],
+        7 => form.mtu_buf[0..form.mtu_len],
+        8 => form.boot_filename_buf[0..form.boot_filename_len],
+        9 => form.http_boot_url_buf[0..form.http_boot_url_len],
+        10 => if (form.dns_update_enable) "yes" else "no",
+        11 => form.dns_update_server_buf[0..form.dns_update_server_len],
+        12 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
+        13 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
+        14 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
         else => "",
     };
 }
@@ -2651,21 +2688,16 @@ fn poolFormFieldBuf(form: *PoolForm, idx: u8) ?struct { buf: []u8, len: *usize }
         2 => .{ .buf = &form.pool_start_buf, .len = &form.pool_start_len },
         3 => .{ .buf = &form.pool_end_buf, .len = &form.pool_end_len },
         4 => .{ .buf = &form.domain_name_buf, .len = &form.domain_name_len },
-        5 => .{ .buf = &form.dns_servers_buf, .len = &form.dns_servers_len },
-        6 => .{ .buf = &form.lease_time_buf, .len = &form.lease_time_len },
-        7 => .{ .buf = &form.time_offset_buf, .len = &form.time_offset_len },
-        8 => .{ .buf = &form.mtu_buf, .len = &form.mtu_len },
-        9 => .{ .buf = &form.log_servers_buf, .len = &form.log_servers_len },
-        10 => .{ .buf = &form.ntp_servers_buf, .len = &form.ntp_servers_len },
-        11 => .{ .buf = &form.wins_servers_buf, .len = &form.wins_servers_len },
-        12 => .{ .buf = &form.tftp_servers_buf, .len = &form.tftp_servers_len },
-        13 => .{ .buf = &form.boot_filename_buf, .len = &form.boot_filename_len },
-        14 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
-        // 15 = boolean toggle, not a text buffer
-        16 => .{ .buf = &form.dns_update_server_buf, .len = &form.dns_update_server_len },
-        17 => .{ .buf = &form.dns_update_zone_buf, .len = &form.dns_update_zone_len },
-        18 => .{ .buf = &form.dns_update_key_name_buf, .len = &form.dns_update_key_name_len },
-        19 => .{ .buf = &form.dns_update_key_file_buf, .len = &form.dns_update_key_file_len },
+        5 => .{ .buf = &form.lease_time_buf, .len = &form.lease_time_len },
+        6 => .{ .buf = &form.time_offset_buf, .len = &form.time_offset_len },
+        7 => .{ .buf = &form.mtu_buf, .len = &form.mtu_len },
+        8 => .{ .buf = &form.boot_filename_buf, .len = &form.boot_filename_len },
+        9 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
+        // 10 = boolean toggle, not a text buffer
+        11 => .{ .buf = &form.dns_update_server_buf, .len = &form.dns_update_server_len },
+        12 => .{ .buf = &form.dns_update_zone_buf, .len = &form.dns_update_zone_len },
+        13 => .{ .buf = &form.dns_update_key_name_buf, .len = &form.dns_update_key_name_len },
+        14 => .{ .buf = &form.dns_update_key_file_buf, .len = &form.dns_update_key_file_len },
         else => null,
     };
 }
@@ -2718,7 +2750,14 @@ fn populatePoolForm(form: *PoolForm, pool: *const config_mod.PoolConfig) void {
         form.domain_search[i].len = n;
     }
 
-    form.dns_servers_len = joinComma(128, &form.dns_servers_buf, pool.dns_servers);
+    // Copy DNS server entries.
+    form.dns_servers_count = @min(pool.dns_servers.len, form.dns_servers.len);
+    for (0..form.dns_servers_count) |i| {
+        const src = pool.dns_servers[i];
+        const n = @min(src.len, form.dns_servers[i].buf.len);
+        @memcpy(form.dns_servers[i].buf[0..n], src[0..n]);
+        form.dns_servers[i].len = n;
+    }
 
     // lease_time as decimal string
     const lt_str = std.fmt.bufPrint(&form.lease_time_buf, "{d}", .{pool.lease_time}) catch "";
@@ -2735,11 +2774,43 @@ fn populatePoolForm(form: *PoolForm, pool: *const config_mod.PoolConfig) void {
     }
 
     form.time_servers_len = joinComma(128, &form.time_servers_buf, pool.time_servers);
-    form.log_servers_len = joinComma(128, &form.log_servers_buf, pool.log_servers);
-    form.ntp_servers_len = joinComma(128, &form.ntp_servers_buf, pool.ntp_servers);
-    form.wins_servers_len = joinComma(128, &form.wins_servers_buf, pool.wins_servers);
 
-    form.tftp_servers_len = joinComma(128, &form.tftp_servers_buf, pool.tftp_servers);
+    // Copy log server entries.
+    form.log_servers_count = @min(pool.log_servers.len, form.log_servers.len);
+    for (0..form.log_servers_count) |i| {
+        const src = pool.log_servers[i];
+        const n = @min(src.len, form.log_servers[i].buf.len);
+        @memcpy(form.log_servers[i].buf[0..n], src[0..n]);
+        form.log_servers[i].len = n;
+    }
+
+    // Copy NTP server entries.
+    form.ntp_servers_count = @min(pool.ntp_servers.len, form.ntp_servers.len);
+    for (0..form.ntp_servers_count) |i| {
+        const src = pool.ntp_servers[i];
+        const n = @min(src.len, form.ntp_servers[i].buf.len);
+        @memcpy(form.ntp_servers[i].buf[0..n], src[0..n]);
+        form.ntp_servers[i].len = n;
+    }
+
+    // Copy WINS server entries.
+    form.wins_servers_count = @min(pool.wins_servers.len, form.wins_servers.len);
+    for (0..form.wins_servers_count) |i| {
+        const src = pool.wins_servers[i];
+        const n = @min(src.len, form.wins_servers[i].buf.len);
+        @memcpy(form.wins_servers[i].buf[0..n], src[0..n]);
+        form.wins_servers[i].len = n;
+    }
+
+    // Copy TFTP server entries.
+    form.tftp_servers_count = @min(pool.tftp_servers.len, form.tftp_servers.len);
+    for (0..form.tftp_servers_count) |i| {
+        const src = pool.tftp_servers[i];
+        const n = @min(src.len, form.tftp_servers[i].buf.len);
+        @memcpy(form.tftp_servers[i].buf[0..n], src[0..n]);
+        form.tftp_servers[i].len = n;
+    }
+
     copyField(&form.boot_filename_buf, &form.boot_filename_len, pool.boot_filename);
     copyField(&form.http_boot_url_buf, &form.http_boot_url_len, pool.http_boot_url);
 
@@ -3099,7 +3170,7 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
 
     // Build lines.
     // Each field = 1 line, each section = 2 lines (blank + header), plus domain search entries, plus summary.
-    const MAX_LINES = pool_field_meta.len * 3 + 20;
+    const MAX_LINES = pool_field_meta.len * 3 + 60;
     var lines: [MAX_LINES]struct { text: []const u8, style: vaxis.Style } = undefined;
     var lcount: usize = 0;
 
@@ -3118,40 +3189,44 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
             2 => if (pool.pool_start.len > 0) pool.pool_start else "\xe2\x80\x94",
             3 => if (pool.pool_end.len > 0) pool.pool_end else "\xe2\x80\x94",
             4 => if (pool.domain_name.len > 0) pool.domain_name else "\xe2\x80\x94",
-            5 => if (pool.dns_servers.len > 0) blk: {
-                break :blk std.mem.join(fa, ", ", pool.dns_servers) catch "\xe2\x80\x94";
-            } else "\xe2\x80\x94",
-            6 => std.fmt.allocPrint(fa, "{d}", .{pool.lease_time}) catch "?",
-            7 => if (pool.time_offset) |off| std.fmt.allocPrint(fa, "{d}", .{off}) catch "?" else "\xe2\x80\x94",
-            8 => if (pool.mtu) |mtu| std.fmt.allocPrint(fa, "{d}", .{mtu}) catch "?" else "\xe2\x80\x94",
-            9 => if (pool.log_servers.len > 0) (std.mem.join(fa, ", ", pool.log_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            10 => if (pool.ntp_servers.len > 0) (std.mem.join(fa, ", ", pool.ntp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            11 => if (pool.wins_servers.len > 0) (std.mem.join(fa, ", ", pool.wins_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            12 => if (pool.tftp_servers.len > 0) (std.mem.join(fa, ", ", pool.tftp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            13 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
-            14 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
-            15 => if (pool.dns_update.enable) "yes" else "no",
-            16 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
-            17 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
-            18 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
-            19 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
+            5 => std.fmt.allocPrint(fa, "{d}", .{pool.lease_time}) catch "?",
+            6 => if (pool.time_offset) |off| std.fmt.allocPrint(fa, "{d}", .{off}) catch "?" else "\xe2\x80\x94",
+            7 => if (pool.mtu) |mtu| std.fmt.allocPrint(fa, "{d}", .{mtu}) catch "?" else "\xe2\x80\x94",
+            8 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
+            9 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
+            10 => if (pool.dns_update.enable) "yes" else "no",
+            11 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
+            12 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
+            13 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
+            14 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
             else => "\xe2\x80\x94",
         };
         const line = std.fmt.allocPrint(fa, "  {s:<18} {s}", .{ meta.label, val }) catch "";
         lines[lcount] = .{ .text = line, .style = if (meta.section != null) val_style else val_style };
         lcount += 1;
     }
-    // Domain search entries (shown after regular fields).
-    if (pool.domain_search.len > 0) {
-        lines[lcount] = .{ .text = "", .style = val_style };
-        lcount += 1;
-        lines[lcount] = .{ .text = "  -- Domain Search --", .style = section_style };
-        lcount += 1;
-        for (pool.domain_search) |ds| {
-            if (lcount >= MAX_LINES) break;
-            const ds_line = std.fmt.allocPrint(fa, "    {s}", .{ds}) catch "";
-            lines[lcount] = .{ .text = ds_line, .style = val_style };
+    // Inline server sections (shown after regular fields).
+    const inline_sections = [_]struct { label: []const u8, items: []const []const u8 }{
+        .{ .label = "Domain Search", .items = pool.domain_search },
+        .{ .label = "DNS Servers", .items = pool.dns_servers },
+        .{ .label = "Log Servers", .items = pool.log_servers },
+        .{ .label = "NTP Servers", .items = pool.ntp_servers },
+        .{ .label = "WINS Servers", .items = pool.wins_servers },
+        .{ .label = "TFTP Servers", .items = pool.tftp_servers },
+    };
+    for (inline_sections) |sec| {
+        if (sec.items.len > 0) {
+            lines[lcount] = .{ .text = "", .style = val_style };
             lcount += 1;
+            const sec_hdr = std.fmt.allocPrint(fa, "  -- {s} --", .{sec.label}) catch "";
+            lines[lcount] = .{ .text = sec_hdr, .style = section_style };
+            lcount += 1;
+            for (sec.items) |item| {
+                if (lcount >= MAX_LINES) break;
+                const item_line = std.fmt.allocPrint(fa, "    {s}", .{item}) catch "";
+                lines[lcount] = .{ .text = item_line, .style = val_style };
+                lcount += 1;
+            }
         }
     }
     // Summary lines.
@@ -3215,12 +3290,8 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
                     if (pool_field_meta[fi].section != null) {
                         abs += 2; // blank line + section header
                     }
-                } else if (fi == form.addDomainSearchField()) {
-                    abs += 2; // blank line + "Domain Search" section header
-                } else if (fi == form.addRouteField()) {
-                    abs += 2; // blank line + "Routes" section header
-                } else if (fi == form.addOptionField()) {
-                    abs += 2; // blank line + "Options" section header
+                } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
+                    abs += 2; // blank line + section header
                 }
                 if (abs == clicked_abs) {
                     form.active_field = fi;
@@ -3230,11 +3301,11 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
                 abs += 1;
             }
         },
-        .pool_ds_edit => {
+        .pool_server_edit => {
             // Single field at row 3.
             const rel = click_row -| modal_y;
             if (rel == 3) {
-                state.pool_form.ds_edit_cursor = state.pool_form.ds_edit_len;
+                state.pool_form.server_edit_cursor = state.pool_form.server_edit_len;
             }
         },
         .res_option_edit => {
@@ -3313,7 +3384,7 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
             const h: u16 = 16;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
-        .pool_ds_edit => {
+        .pool_server_edit => {
             const w: u16 = 48;
             const h: u16 = if (state.pool_form.err_len > 0) 8 else 7;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
@@ -3417,7 +3488,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     const total_field_count = form.totalFields();
     // Max possible rows: each regular field can have a 2-row section header, plus
     // domain search/route/option sections each have a 2-row header, plus all entries.
-    const MAX_FIELD_ROWS = pool_field_meta.len * 3 + 8 + 16 + 32 + 32;
+    const MAX_FIELD_ROWS = pool_field_meta.len * 3 + 16 + 8 + 4 + 4 + 2 + 4 + 32 + 32 + 40;
     var field_rows: [MAX_FIELD_ROWS]u16 = undefined;
     var total_rows: u16 = 0;
     {
@@ -3429,15 +3500,9 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                     r += 1; // blank line before section
                     r += 1; // section header
                 }
-            } else if (fi == form.addDomainSearchField()) {
+            } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
                 r += 1; // blank line
-                r += 1; // "Domain Search" section header
-            } else if (fi == form.addRouteField()) {
-                r += 1; // blank line
-                r += 1; // "Routes" section header
-            } else if (fi == form.addOptionField()) {
-                r += 1; // blank line
-                r += 1; // "Options" section header
+                r += 1; // section header
             }
             field_rows[fi] = r;
             r += 1;
@@ -3475,32 +3540,14 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                 abs_row += 1;
                 if (draw_row >= BOX_H - 2) break;
             }
-        } else if (fi == form.addDomainSearchField()) {
-            // "Domain Search" section header.
+        } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
+            // Inline section header.
+            const sec_name: []const u8 = if (fi == form.addDomainSearchField()) "Domain Search" else if (fi == form.addDnsField()) "DNS Servers" else if (fi == form.addLogField()) "Log Servers" else if (fi == form.addNtpField()) "NTP Servers" else if (fi == form.addWinsField()) "WINS Servers" else if (fi == form.addTftpField()) "TFTP Servers" else if (fi == form.addRouteField()) "Routes" else "DHCP Options";
             if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
             abs_row += 1;
             if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                _ = box.print(&.{.{ .text = "  -- Domain Search --", .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-                draw_row += 1;
-            }
-            abs_row += 1;
-            if (draw_row >= BOX_H - 2) break;
-        } else if (fi == form.addRouteField()) {
-            // "Routes" section header.
-            if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
-            abs_row += 1;
-            if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                _ = box.print(&.{.{ .text = "  -- Routes --", .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-                draw_row += 1;
-            }
-            abs_row += 1;
-            if (draw_row >= BOX_H - 2) break;
-        } else if (fi == form.addOptionField()) {
-            // "Options" section header.
-            if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
-            abs_row += 1;
-            if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                _ = box.print(&.{.{ .text = "  -- DHCP Options --", .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec_name}) catch "";
+                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
                 draw_row += 1;
             }
             abs_row += 1;
@@ -3527,7 +3574,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             const fw = @as(usize, FIELD_W);
             var vis_start: usize = 0;
             var cursor_vis: usize = 0;
-            if (is_active and fi != 16) {
+            if (is_active and fi != 10) {
                 const cur = @min(form.cursor, val.len);
                 if (cur >= fw) {
                     vis_start = cur - fw + 1;
@@ -3541,7 +3588,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
 
             // Cursor block: show character under cursor with inverted colors.
-            if (is_active and fi != 16) {
+            if (is_active and fi != 10) {
                 const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
                 const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
                 if (cursor_col < BOX_W -| 1) {
@@ -3550,22 +3597,102 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                     _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
                 }
             }
-        } else if (fi == form.addDomainSearchField() or fi == form.addRouteField() or fi == form.addOptionField()) {
+        } else if (fi == form.addDomainSearchField() or fi == form.addDnsField() or fi == form.addLogField() or fi == form.addNtpField() or fi == form.addWinsField() or fi == form.addTftpField() or fi == form.addRouteField() or fi == form.addOptionField()) {
             // [+] Add button.
-            const add_label = if (fi == form.addDomainSearchField()) "  Domain Search  " else if (fi == form.addRouteField()) "  Routes         " else "  DHCP Options   ";
+            const add_label: []const u8 = if (fi == form.addDomainSearchField()) "  Domain Search  " else if (fi == form.addDnsField()) "  DNS Servers    " else if (fi == form.addLogField()) "  Log Servers    " else if (fi == form.addNtpField()) "  NTP Servers    " else if (fi == form.addWinsField()) "  WINS Servers   " else if (fi == form.addTftpField()) "  TFTP Servers   " else if (fi == form.addRouteField()) "  Routes         " else "  DHCP Options   ";
             _ = box.print(&.{.{ .text = add_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
-            const add_fs = if (is_active) active_style else field_style;
-            _ = box.print(&.{.{ .text = "[+] Add", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
-        } else if (fi >= form.firstDomainSearchField() and fi < form.addRouteField()) {
+            // Check if at max capacity.
+            const at_max = if (fi == form.addDomainSearchField()) form.domain_search_count >= form.domain_search.len else if (fi == form.addDnsField()) form.dns_servers_count >= form.dns_servers.len else if (fi == form.addLogField()) form.log_servers_count >= form.log_servers.len else if (fi == form.addNtpField()) form.ntp_servers_count >= form.ntp_servers.len else if (fi == form.addWinsField()) form.wins_servers_count >= form.wins_servers.len else if (fi == form.addTftpField()) form.tftp_servers_count >= form.tftp_servers.len else if (fi == form.addRouteField()) form.route_count >= form.routes.len else form.option_count >= form.options.len;
+            if (at_max) {
+                const max_n: usize = if (fi == form.addDomainSearchField()) form.domain_search.len else if (fi == form.addDnsField()) form.dns_servers.len else if (fi == form.addLogField()) form.log_servers.len else if (fi == form.addNtpField()) form.ntp_servers.len else if (fi == form.addWinsField()) form.wins_servers.len else if (fi == form.addTftpField()) form.tftp_servers.len else if (fi == form.addRouteField()) form.routes.len else form.options.len;
+                const max_text = std.fmt.allocPrint(fa, "(max {d})", .{max_n}) catch "(max)";
+                const grey_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+                _ = box.print(&.{.{ .text = max_text, .style = grey_style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+            } else {
+                const add_fs = if (is_active) active_style else field_style;
+                _ = box.print(&.{.{ .text = "[+] Add", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+            }
+        } else if (fi >= form.firstDomainSearchField() and fi < form.addDnsField()) {
             // Existing domain search entry.
             const di = fi - form.firstDomainSearchField();
             if (di < form.domain_search_count) {
                 const d = &form.domain_search[di];
                 const ds_text = d.buf[0..d.len];
-                const line = std.fmt.allocPrint(fa, "  {s}", .{if (ds_text.len > 0) ds_text else "..."}) catch "";
+                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (ds_text.len > 0) ds_text else "..."}) catch "";
                 const os = if (is_active) active_style else opt_style;
                 const opt_w = LABEL_W + FIELD_W;
-                const opt_trunc = line[0..@min(line.len, opt_w)];
+                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
+                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                const opt_padded = try fa.alloc(u8, opt_pad);
+                @memset(opt_padded, ' ');
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+            }
+        } else if (fi >= form.firstDnsField() and fi < form.addLogField()) {
+            // Existing DNS server entry.
+            const di = fi - form.firstDnsField();
+            if (di < form.dns_servers_count) {
+                const d = &form.dns_servers[di];
+                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                const os = if (is_active) active_style else opt_style;
+                const opt_w = LABEL_W + FIELD_W;
+                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
+                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                const opt_padded = try fa.alloc(u8, opt_pad);
+                @memset(opt_padded, ' ');
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+            }
+        } else if (fi >= form.firstLogField() and fi < form.addNtpField()) {
+            const di = fi - form.firstLogField();
+            if (di < form.log_servers_count) {
+                const d = &form.log_servers[di];
+                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                const os = if (is_active) active_style else opt_style;
+                const opt_w = LABEL_W + FIELD_W;
+                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
+                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                const opt_padded = try fa.alloc(u8, opt_pad);
+                @memset(opt_padded, ' ');
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+            }
+        } else if (fi >= form.firstNtpField() and fi < form.addWinsField()) {
+            const di = fi - form.firstNtpField();
+            if (di < form.ntp_servers_count) {
+                const d = &form.ntp_servers[di];
+                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                const os = if (is_active) active_style else opt_style;
+                const opt_w = LABEL_W + FIELD_W;
+                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
+                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                const opt_padded = try fa.alloc(u8, opt_pad);
+                @memset(opt_padded, ' ');
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+            }
+        } else if (fi >= form.firstWinsField() and fi < form.addTftpField()) {
+            const di = fi - form.firstWinsField();
+            if (di < form.wins_servers_count) {
+                const d = &form.wins_servers[di];
+                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                const os = if (is_active) active_style else opt_style;
+                const opt_w = LABEL_W + FIELD_W;
+                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
+                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                const opt_padded = try fa.alloc(u8, opt_pad);
+                @memset(opt_padded, ' ');
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+            }
+        } else if (fi >= form.firstTftpField() and fi < form.addRouteField()) {
+            const di = fi - form.firstTftpField();
+            if (di < form.tftp_servers_count) {
+                const d = &form.tftp_servers[di];
+                const line_text = std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                const os = if (is_active) active_style else opt_style;
+                const opt_w = LABEL_W + FIELD_W;
+                const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
                 const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
                 const opt_padded = try fa.alloc(u8, opt_pad);
                 @memset(opt_padded, ' ');
@@ -3616,9 +3743,13 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     }
 
     // Hint + error (inside border).
-    const is_add_btn = form.active_field == form.addDomainSearchField() or form.active_field == form.addRouteField() or form.active_field == form.addOptionField();
+    const is_add_btn = form.active_field == form.addDomainSearchField() or form.active_field == form.addDnsField() or form.active_field == form.addLogField() or form.active_field == form.addNtpField() or form.active_field == form.addWinsField() or form.active_field == form.addTftpField() or form.active_field == form.addRouteField() or form.active_field == form.addOptionField();
     const is_inline = form.active_field >= PoolForm.REGULAR_FIELD_COUNT and !is_add_btn;
-    const hint_text = if (is_inline)
+    // Check if active entry is in a reorderable section (DNS or TFTP).
+    const is_reorderable = is_inline and ((form.active_field >= form.firstDnsField() and form.active_field < form.addLogField() and form.dns_servers_count > 1) or (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField() and form.tftp_servers_count > 1));
+    const hint_text: []const u8 = if (is_reorderable)
+        "  Enter:edit  d:delete  +/-:reorder  Esc:cancel"
+    else if (is_inline)
         "  Enter:edit  d:delete  Tab:next  Esc:cancel"
     else if (is_add_btn)
         "  Enter:add  Tab:next  Shift-Tab:prev  Esc:cancel"
@@ -3637,6 +3768,41 @@ fn spaces(fa: std.mem.Allocator, n: u16) ![]const u8 {
     return buf;
 }
 
+/// Delete an entry from an inline entry array by shifting subsequent entries down.
+fn deleteInlineEntry(comptime T: type, arr: []T, count: *usize, di: usize) void {
+    if (di >= count.*) return;
+    var i: usize = di;
+    while (i + 1 < count.*) : (i += 1) {
+        arr[i] = arr[i + 1];
+    }
+    count.* -= 1;
+}
+
+/// Open the shared server edit modal, optionally populating from an existing entry.
+fn openServerEdit(form: *PoolForm, state: *TuiState, target: ServerEditTarget, edit_index: ?usize) void {
+    form.err_len = 0;
+    form.server_edit_target = target;
+    form.server_edit_index = edit_index;
+    if (edit_index) |idx| {
+        // Copy existing entry into edit buffer.
+        const entry: *const InlineEntry = switch (target) {
+            .domain_search => &form.domain_search[idx],
+            .dns => &form.dns_servers[idx],
+            .log => &form.log_servers[idx],
+            .ntp => &form.ntp_servers[idx],
+            .wins => &form.wins_servers[idx],
+            .tftp => &form.tftp_servers[idx],
+        };
+        @memcpy(form.server_edit_buf[0..entry.len], entry.buf[0..entry.len]);
+        form.server_edit_len = entry.len;
+        form.server_edit_cursor = entry.len;
+    } else {
+        form.server_edit_len = 0;
+        form.server_edit_cursor = 0;
+    }
+    state.mode = .pool_server_edit;
+}
+
 fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
     var form = &state.pool_form;
     form.err_len = 0;
@@ -3646,21 +3812,36 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
 
-    // 'd' deletes selected inline domain search, route, or option entry.
+    // 'd' deletes selected inline entry (domain search, server, route, or option).
     if (key.matches('d', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
-        if (form.active_field >= form.firstDomainSearchField() and form.active_field < form.addRouteField()) {
-            // Delete a domain search entry.
-            const di = form.active_field - form.firstDomainSearchField();
-            if (di < form.domain_search_count) {
-                var i: usize = di;
-                while (i + 1 < form.domain_search_count) : (i += 1) {
-                    form.domain_search[i] = form.domain_search[i + 1];
-                }
-                form.domain_search_count -= 1;
-                if (form.active_field >= form.totalFields()) {
-                    form.active_field -|= 1;
-                }
-            }
+        if (form.active_field >= form.firstDomainSearchField() and form.active_field < form.addDnsField()) {
+            deleteInlineEntry(InlineEntry, &form.domain_search, &form.domain_search_count, form.active_field - form.firstDomainSearchField());
+            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+            return;
+        }
+        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
+            deleteInlineEntry(InlineEntry, &form.dns_servers, &form.dns_servers_count, form.active_field - form.firstDnsField());
+            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+            return;
+        }
+        if (form.active_field >= form.firstLogField() and form.active_field < form.addNtpField()) {
+            deleteInlineEntry(InlineEntry, &form.log_servers, &form.log_servers_count, form.active_field - form.firstLogField());
+            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+            return;
+        }
+        if (form.active_field >= form.firstNtpField() and form.active_field < form.addWinsField()) {
+            deleteInlineEntry(InlineEntry, &form.ntp_servers, &form.ntp_servers_count, form.active_field - form.firstNtpField());
+            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+            return;
+        }
+        if (form.active_field >= form.firstWinsField() and form.active_field < form.addTftpField()) {
+            deleteInlineEntry(InlineEntry, &form.wins_servers, &form.wins_servers_count, form.active_field - form.firstWinsField());
+            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+            return;
+        }
+        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
+            deleteInlineEntry(InlineEntry, &form.tftp_servers, &form.tftp_servers_count, form.active_field - form.firstTftpField());
+            if (form.active_field >= form.totalFields()) form.active_field -|= 1;
             return;
         }
         if (form.active_field >= form.firstRouteField() and form.active_field < form.addOptionField()) {
@@ -3672,9 +3853,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                     form.routes[i] = form.routes[i + 1];
                 }
                 form.route_count -= 1;
-                if (form.active_field >= form.totalFields()) {
-                    form.active_field -|= 1;
-                }
+                if (form.active_field >= form.totalFields()) form.active_field -|= 1;
             }
             return;
         }
@@ -3687,36 +3866,123 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                     form.options[i] = form.options[i + 1];
                 }
                 form.option_count -= 1;
-                if (form.active_field >= form.totalFields()) {
-                    form.active_field -|= 1;
-                }
+                if (form.active_field >= form.totalFields()) form.active_field -|= 1;
+            }
+            return;
+        }
+    }
+
+    // '+' moves an entry down (DNS and TFTP only).
+    if (key.matches('+', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
+        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
+            const di = form.active_field - form.firstDnsField();
+            if (di + 1 < form.dns_servers_count) {
+                const tmp = form.dns_servers[di];
+                form.dns_servers[di] = form.dns_servers[di + 1];
+                form.dns_servers[di + 1] = tmp;
+                form.active_field += 1;
+            }
+            return;
+        }
+        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
+            const di = form.active_field - form.firstTftpField();
+            if (di + 1 < form.tftp_servers_count) {
+                const tmp = form.tftp_servers[di];
+                form.tftp_servers[di] = form.tftp_servers[di + 1];
+                form.tftp_servers[di + 1] = tmp;
+                form.active_field += 1;
+            }
+            return;
+        }
+    }
+
+    // '-' moves an entry up (DNS and TFTP only).
+    if (key.matches('-', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
+        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
+            const di = form.active_field - form.firstDnsField();
+            if (di > 0) {
+                const tmp = form.dns_servers[di];
+                form.dns_servers[di] = form.dns_servers[di - 1];
+                form.dns_servers[di - 1] = tmp;
+                form.active_field -= 1;
+            }
+            return;
+        }
+        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
+            const di = form.active_field - form.firstTftpField();
+            if (di > 0) {
+                const tmp = form.tftp_servers[di];
+                form.tftp_servers[di] = form.tftp_servers[di - 1];
+                form.tftp_servers[di - 1] = tmp;
+                form.active_field -= 1;
             }
             return;
         }
     }
 
     if (key.matches(vaxis.Key.enter, .{})) {
-        // [+] Add Domain Search button.
+        // [+] Add buttons for inline server sections.
         if (form.active_field == form.addDomainSearchField()) {
-            form.err_len = 0;
-            form.ds_edit_len = 0;
-            form.ds_edit_cursor = 0;
-            form.ds_edit_index = null;
-            state.mode = .pool_ds_edit;
+            if (form.domain_search_count >= form.domain_search.len) return;
+            openServerEdit(form, state, .domain_search, null);
             return;
         }
-        // Existing domain search entry -> edit.
-        if (form.active_field >= form.firstDomainSearchField() and form.active_field < form.addRouteField()) {
+        if (form.active_field == form.addDnsField()) {
+            if (form.dns_servers_count >= form.dns_servers.len) return;
+            openServerEdit(form, state, .dns, null);
+            return;
+        }
+        if (form.active_field == form.addLogField()) {
+            if (form.log_servers_count >= form.log_servers.len) return;
+            openServerEdit(form, state, .log, null);
+            return;
+        }
+        if (form.active_field == form.addNtpField()) {
+            if (form.ntp_servers_count >= form.ntp_servers.len) return;
+            openServerEdit(form, state, .ntp, null);
+            return;
+        }
+        if (form.active_field == form.addWinsField()) {
+            if (form.wins_servers_count >= form.wins_servers.len) return;
+            openServerEdit(form, state, .wins, null);
+            return;
+        }
+        if (form.active_field == form.addTftpField()) {
+            if (form.tftp_servers_count >= form.tftp_servers.len) return;
+            openServerEdit(form, state, .tftp, null);
+            return;
+        }
+        // Existing inline server entries -> edit.
+        if (form.active_field >= form.firstDomainSearchField() and form.active_field < form.addDnsField()) {
             const di = form.active_field - form.firstDomainSearchField();
             if (di < form.domain_search_count) {
-                form.err_len = 0;
-                const d = &form.domain_search[di];
-                @memcpy(form.ds_edit_buf[0..d.len], d.buf[0..d.len]);
-                form.ds_edit_len = d.len;
-                form.ds_edit_cursor = d.len;
-                form.ds_edit_index = di;
-                state.mode = .pool_ds_edit;
+                openServerEdit(form, state, .domain_search, di);
             }
+            return;
+        }
+        if (form.active_field >= form.firstDnsField() and form.active_field < form.addLogField()) {
+            const di = form.active_field - form.firstDnsField();
+            if (di < form.dns_servers_count) openServerEdit(form, state, .dns, di);
+            return;
+        }
+        if (form.active_field >= form.firstLogField() and form.active_field < form.addNtpField()) {
+            const di = form.active_field - form.firstLogField();
+            if (di < form.log_servers_count) openServerEdit(form, state, .log, di);
+            return;
+        }
+        if (form.active_field >= form.firstNtpField() and form.active_field < form.addWinsField()) {
+            const di = form.active_field - form.firstNtpField();
+            if (di < form.ntp_servers_count) openServerEdit(form, state, .ntp, di);
+            return;
+        }
+        if (form.active_field >= form.firstWinsField() and form.active_field < form.addTftpField()) {
+            const di = form.active_field - form.firstWinsField();
+            if (di < form.wins_servers_count) openServerEdit(form, state, .wins, di);
+            return;
+        }
+        if (form.active_field >= form.firstTftpField() and form.active_field < form.addRouteField()) {
+            const di = form.active_field - form.firstTftpField();
+            if (di < form.tftp_servers_count) openServerEdit(form, state, .tftp, di);
             return;
         }
         // [+] Add Route button.
@@ -3806,8 +4072,8 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     // Non-text fields: [+] buttons, route entries, option entries.
     if (form.active_field >= PoolForm.REGULAR_FIELD_COUNT) return;
 
-    // Field 15 = dns_update_enable: toggle on space or any printable
-    if (form.active_field == 15) {
+    // Field 10 = dns_update_enable: toggle on space or any printable
+    if (form.active_field == 10) {
         if (key.codepoint == ' ' or (key.codepoint >= 0x20 and key.codepoint <= 0x7E)) {
             form.dns_update_enable = !form.dns_update_enable;
         }
@@ -3921,11 +4187,6 @@ fn validatePoolForm(form: *PoolForm) ?[]const u8 {
         }
     }
 
-    // DNS servers: comma-separated IPs.
-    if (form.dns_servers_len > 0) {
-        if (validateIpList(form.dns_servers_buf[0..form.dns_servers_len])) |e| return e;
-    }
-
     // Lease time: positive integer, max 2 weeks (1209600 seconds).
     const lt = form.lease_time_buf[0..form.lease_time_len];
     if (lt.len == 0) return "Lease time is required";
@@ -3944,21 +4205,9 @@ fn validatePoolForm(form: *PoolForm) ?[]const u8 {
         if (mtu_val < 68) return "MTU minimum is 68";
     }
 
-    // IP lists: validate each entry.
+    // Time servers (still comma-separated, hidden field).
     if (form.time_servers_len > 0) {
         if (validateIpList(form.time_servers_buf[0..form.time_servers_len])) |e| return e;
-    }
-    if (form.log_servers_len > 0) {
-        if (validateIpList(form.log_servers_buf[0..form.log_servers_len])) |e| return e;
-    }
-    if (form.ntp_servers_len > 0) {
-        if (validateIpList(form.ntp_servers_buf[0..form.ntp_servers_len])) |e| return e;
-    }
-    if (form.wins_servers_len > 0) {
-        if (validateIpList(form.wins_servers_buf[0..form.wins_servers_len])) |e| return e;
-    }
-    if (form.tftp_servers_len > 0) {
-        if (validateIpList(form.tftp_servers_buf[0..form.tftp_servers_len])) |e| return e;
     }
 
     // HTTP Boot URL: optional. Scheme + valid domain + optional path.
@@ -4046,6 +4295,21 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
             confirm.changes[confirm.change_count] = .{ .label = "Domain Search", .old_val = "", .new_val = n, .kind = .drift };
             confirm.change_count += 1;
         }
+        const new_srv_counts = [_]struct { label: []const u8, count: usize }{
+            .{ .label = "DNS Servers", .count = form.dns_servers_count },
+            .{ .label = "Log Servers", .count = form.log_servers_count },
+            .{ .label = "NTP Servers", .count = form.ntp_servers_count },
+            .{ .label = "WINS Servers", .count = form.wins_servers_count },
+            .{ .label = "TFTP Servers", .count = form.tftp_servers_count },
+        };
+        for (new_srv_counts) |sc| {
+            if (sc.count > 0 and confirm.change_count < confirm.changes.len) {
+                var sbuf: [32]u8 = undefined;
+                const sn = std.fmt.bufPrint(&sbuf, "{d} server(s)", .{sc.count}) catch "servers";
+                confirm.changes[confirm.change_count] = .{ .label = sc.label, .old_val = "", .new_val = sn, .kind = .drift };
+                confirm.change_count += 1;
+            }
+        }
         if (form.route_count > 0 and confirm.change_count < confirm.changes.len) {
             var buf: [32]u8 = undefined;
             const n = std.fmt.bufPrint(&buf, "{d} route(s)", .{form.route_count}) catch "routes";
@@ -4066,8 +4330,8 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
     var tmp_form: PoolForm = .{};
     populatePoolForm(&tmp_form, pool);
 
-    // Sync-breaking field indices: subnet(0), pool_start(2), pool_end(3), lease_time(6)
-    const sync_fields = [_]u8{ 0, 2, 3, 6 };
+    // Sync-breaking field indices: subnet(0), pool_start(2), pool_end(3), lease_time(5)
+    const sync_fields = [_]u8{ 0, 2, 3, 5 };
 
     var fi: u8 = 0;
     while (fi < PoolForm.REGULAR_FIELD_COUNT) : (fi += 1) {
@@ -4116,6 +4380,35 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
         if (ds_differ and confirm.change_count < confirm.changes.len) {
             confirm.changes[confirm.change_count] = .{ .label = "Domain Search", .old_val = "(modified)", .new_val = "(modified)", .kind = .drift };
             confirm.change_count += 1;
+        }
+    }
+
+    // Compare inline server entry arrays.
+    const server_diffs = [_]struct { label: []const u8, count: usize, tmp_count: usize, entries: []const InlineEntry, tmp_entries: []const InlineEntry }{
+        .{ .label = "DNS Servers", .count = form.dns_servers_count, .tmp_count = tmp_form.dns_servers_count, .entries = &form.dns_servers, .tmp_entries = &tmp_form.dns_servers },
+        .{ .label = "Log Servers", .count = form.log_servers_count, .tmp_count = tmp_form.log_servers_count, .entries = &form.log_servers, .tmp_entries = &tmp_form.log_servers },
+        .{ .label = "NTP Servers", .count = form.ntp_servers_count, .tmp_count = tmp_form.ntp_servers_count, .entries = &form.ntp_servers, .tmp_entries = &tmp_form.ntp_servers },
+        .{ .label = "WINS Servers", .count = form.wins_servers_count, .tmp_count = tmp_form.wins_servers_count, .entries = &form.wins_servers, .tmp_entries = &tmp_form.wins_servers },
+        .{ .label = "TFTP Servers", .count = form.tftp_servers_count, .tmp_count = tmp_form.tftp_servers_count, .entries = &form.tftp_servers, .tmp_entries = &tmp_form.tftp_servers },
+    };
+    for (server_diffs) |sd| {
+        if (sd.count != sd.tmp_count) {
+            if (confirm.change_count < confirm.changes.len) {
+                confirm.changes[confirm.change_count] = .{ .label = sd.label, .old_val = "(changed)", .new_val = "(changed)", .kind = .drift };
+                confirm.change_count += 1;
+            }
+        } else {
+            var differ = false;
+            for (0..sd.count) |ei| {
+                if (!std.mem.eql(u8, sd.entries[ei].buf[0..sd.entries[ei].len], sd.tmp_entries[ei].buf[0..sd.tmp_entries[ei].len])) {
+                    differ = true;
+                    break;
+                }
+            }
+            if (differ and confirm.change_count < confirm.changes.len) {
+                confirm.changes[confirm.change_count] = .{ .label = sd.label, .old_val = "(modified)", .new_val = "(modified)", .kind = .drift };
+                confirm.change_count += 1;
+            }
         }
     }
 
@@ -4302,7 +4595,7 @@ fn buildPoolFromFormInner(
     errdefer allocator.free(pool.pool_start);
     pool.pool_end = try allocator.dupe(u8, form.pool_end_buf[0..form.pool_end_len]);
     errdefer allocator.free(pool.pool_end);
-    pool.dns_servers = try splitCommaDupe(allocator, form.dns_servers_buf[0..form.dns_servers_len]);
+    pool.dns_servers = try dupeInlineEntries(allocator, &form.dns_servers, form.dns_servers_count);
     errdefer {
         for (pool.dns_servers) |s| allocator.free(s);
         allocator.free(pool.dns_servers);
@@ -4325,23 +4618,23 @@ fn buildPoolFromFormInner(
         for (pool.time_servers) |s| allocator.free(s);
         allocator.free(pool.time_servers);
     }
-    pool.log_servers = try splitCommaDupe(allocator, form.log_servers_buf[0..form.log_servers_len]);
+    pool.log_servers = try dupeInlineEntries(allocator, &form.log_servers, form.log_servers_count);
     errdefer {
         for (pool.log_servers) |s| allocator.free(s);
         allocator.free(pool.log_servers);
     }
-    pool.ntp_servers = try splitCommaDupe(allocator, form.ntp_servers_buf[0..form.ntp_servers_len]);
+    pool.ntp_servers = try dupeInlineEntries(allocator, &form.ntp_servers, form.ntp_servers_count);
     errdefer {
         for (pool.ntp_servers) |s| allocator.free(s);
         allocator.free(pool.ntp_servers);
     }
     pool.mtu = if (form.mtu_len > 0) (std.fmt.parseInt(u16, form.mtu_buf[0..form.mtu_len], 10) catch null) else null;
-    pool.wins_servers = try splitCommaDupe(allocator, form.wins_servers_buf[0..form.wins_servers_len]);
+    pool.wins_servers = try dupeInlineEntries(allocator, &form.wins_servers, form.wins_servers_count);
     errdefer {
         for (pool.wins_servers) |s| allocator.free(s);
         allocator.free(pool.wins_servers);
     }
-    pool.tftp_servers = try splitCommaDupe(allocator, form.tftp_servers_buf[0..form.tftp_servers_len]);
+    pool.tftp_servers = try dupeInlineEntries(allocator, &form.tftp_servers, form.tftp_servers_count);
     errdefer {
         for (pool.tftp_servers) |s| allocator.free(s);
         allocator.free(pool.tftp_servers);
@@ -4404,6 +4697,21 @@ fn buildRoutesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ![]c
     return routes;
 }
 
+/// Allocate a string slice from inline entries.
+fn dupeInlineEntries(allocator: std.mem.Allocator, entries: anytype, count: usize) ![][]const u8 {
+    if (count == 0) return try allocator.alloc([]const u8, 0);
+    const result = try allocator.alloc([]const u8, count);
+    for (result) |*s| s.* = "";
+    errdefer {
+        for (result) |s| allocator.free(s);
+        allocator.free(result);
+    }
+    for (0..count) |i| {
+        result[i] = try allocator.dupe(u8, entries[i].buf[0..entries[i].len]);
+    }
+    return result;
+}
+
 fn subnetIpStr(form: *const PoolForm) []const u8 {
     const subnet = form.subnet_buf[0..form.subnet_len];
     const slash = std.mem.indexOfScalar(u8, subnet, '/') orelse return subnet;
@@ -4458,19 +4766,19 @@ fn applyFormToPool(allocator: std.mem.Allocator, pool: *config_mod.PoolConfig, f
         pool.domain_search[i] = allocator.dupe(u8, form.domain_search[i].buf[0..form.domain_search[i].len]) catch "";
     }
 
-    replaceStrSlice(allocator, &pool.dns_servers, form.dns_servers_buf[0..form.dns_servers_len]);
+    replaceInlineEntries(allocator, &pool.dns_servers, &form.dns_servers, form.dns_servers_count);
 
     pool.lease_time = lease_time;
     pool.time_offset = if (form.time_offset_len > 0) (std.fmt.parseInt(i32, form.time_offset_buf[0..form.time_offset_len], 10) catch null) else null;
 
     replaceStrSlice(allocator, &pool.time_servers, form.time_servers_buf[0..form.time_servers_len]);
-    replaceStrSlice(allocator, &pool.log_servers, form.log_servers_buf[0..form.log_servers_len]);
-    replaceStrSlice(allocator, &pool.ntp_servers, form.ntp_servers_buf[0..form.ntp_servers_len]);
+    replaceInlineEntries(allocator, &pool.log_servers, &form.log_servers, form.log_servers_count);
+    replaceInlineEntries(allocator, &pool.ntp_servers, &form.ntp_servers, form.ntp_servers_count);
 
     pool.mtu = if (form.mtu_len > 0) (std.fmt.parseInt(u16, form.mtu_buf[0..form.mtu_len], 10) catch null) else null;
-    replaceStrSlice(allocator, &pool.wins_servers, form.wins_servers_buf[0..form.wins_servers_len]);
+    replaceInlineEntries(allocator, &pool.wins_servers, &form.wins_servers, form.wins_servers_count);
 
-    replaceStrSlice(allocator, &pool.tftp_servers, form.tftp_servers_buf[0..form.tftp_servers_len]);
+    replaceInlineEntries(allocator, &pool.tftp_servers, &form.tftp_servers, form.tftp_servers_count);
     replaceStr(allocator, &pool.boot_filename, form.boot_filename_buf[0..form.boot_filename_len]);
     replaceStr(allocator, &pool.http_boot_url, form.http_boot_url_buf[0..form.http_boot_url_len]);
 
@@ -4514,6 +4822,15 @@ fn replaceStr(allocator: std.mem.Allocator, field: *[]const u8, new_val: []const
     // field.* must always be allocator-owned (safe to free later).
     // Fall back to zero-length allocated slice on OOM (can't use a string literal).
     field.* = allocator.dupe(u8, new_val) catch (allocator.alloc(u8, 0) catch unreachable);
+}
+
+fn replaceInlineEntries(allocator: std.mem.Allocator, field: *[][]const u8, entries: anytype, count: usize) void {
+    for (field.*) |s| allocator.free(s);
+    allocator.free(field.*);
+    field.* = allocator.alloc([]const u8, count) catch (allocator.alloc([]const u8, 0) catch unreachable);
+    for (0..count) |i| {
+        field.*[i] = allocator.dupe(u8, entries[i].buf[0..entries[i].len]) catch "";
+    }
 }
 
 fn replaceStrSlice(allocator: std.mem.Allocator, field: *[][]const u8, csv: []const u8) void {
@@ -5376,7 +5693,7 @@ fn renderHelp(state: *TuiState, win: vaxis.Window) void {
 // Pool domain search edit modal
 // ---------------------------------------------------------------------------
 
-fn renderPoolDsEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+fn renderPoolServerEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const form = &state.pool_form;
     const BOX_W: u16 = 48;
     const has_err = form.err_len > 0;
@@ -5395,13 +5712,26 @@ fn renderPoolDsEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) 
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
 
-    const title = if (form.ds_edit_index == null) "  Add Domain" else "  Edit Domain";
+    // Title depends on target and add vs edit.
+    const is_add = form.server_edit_index == null;
+    const title: []const u8 = switch (form.server_edit_target) {
+        .domain_search => if (is_add) "  Add Domain" else "  Edit Domain",
+        .dns => if (is_add) "  Add DNS Server" else "  Edit DNS Server",
+        .log => if (is_add) "  Add Log Server" else "  Edit Log Server",
+        .ntp => if (is_add) "  Add NTP Server" else "  Edit NTP Server",
+        .wins => if (is_add) "  Add WINS Server" else "  Edit WINS Server",
+        .tftp => if (is_add) "  Add TFTP Server" else "  Edit TFTP Server",
+    };
     _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
-    // Domain field (single field).
-    _ = box.print(&.{.{ .text = "  Domain    ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 3, .wrap = .none });
-    const val = form.ds_edit_buf[0..form.ds_edit_len];
+    // Field label depends on target.
+    const label: []const u8 = switch (form.server_edit_target) {
+        .domain_search => "  Domain    ",
+        .dns, .log, .ntp, .wins, .tftp => "  Server    ",
+    };
+    _ = box.print(&.{.{ .text = label, .style = label_style }}, .{ .col_offset = 1, .row_offset = 3, .wrap = .none });
+    const val = form.server_edit_buf[0..form.server_edit_len];
     const field_fw: u16 = BOX_W -| 16;
     const val_trunc = val[0..@min(val.len, field_fw)];
     const val_pad = try fa.alloc(u8, field_fw -| @as(u16, @intCast(val_trunc.len)));
@@ -5409,7 +5739,7 @@ fn renderPoolDsEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) 
     _ = box.print(&.{.{ .text = val_trunc, .style = active_style }}, .{ .col_offset = 13, .row_offset = 3, .wrap = .none });
     _ = box.print(&.{.{ .text = val_pad, .style = active_style }}, .{ .col_offset = 13 + @as(u16, @intCast(val_trunc.len)), .row_offset = 3, .wrap = .none });
     {
-        const cur = @min(form.ds_edit_cursor, val.len);
+        const cur = @min(form.server_edit_cursor, val.len);
         const ch: []const u8 = if (cur < val.len) val[cur..][0..1] else " ";
         _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 3, .wrap = .none });
     }
@@ -5421,7 +5751,7 @@ fn renderPoolDsEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) 
     _ = box.print(&.{.{ .text = "  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
-fn handlePoolDsEditKey(state: *TuiState, key: vaxis.Key) void {
+fn handlePoolServerEditKey(state: *TuiState, key: vaxis.Key) void {
     var form = &state.pool_form;
 
     if (key.matches(vaxis.Key.escape, .{})) {
@@ -5431,48 +5761,67 @@ fn handlePoolDsEditKey(state: *TuiState, key: vaxis.Key) void {
     }
     if (key.matches(vaxis.Key.enter, .{})) {
         form.err_len = 0;
-        // Validate: non-empty, valid domain chars, starts with alpha, auto-lowercase.
-        if (form.ds_edit_len == 0) {
-            const msg = "  Domain is required";
+        if (form.server_edit_len == 0) {
+            const msg = "  Value is required";
             form.err_len = msg.len;
             @memcpy(form.err_buf[0..msg.len], msg);
             return;
         }
-        for (form.ds_edit_buf[0..form.ds_edit_len]) |*ch| {
+        // Auto-lowercase.
+        for (form.server_edit_buf[0..form.server_edit_len]) |*ch| {
             if (ch.* >= 'A' and ch.* <= 'Z') ch.* = ch.* - 'A' + 'a';
         }
-        const dn = form.ds_edit_buf[0..form.ds_edit_len];
-        if (dn[0] < 'a' or dn[0] > 'z') {
-            const msg = "  Must start with a letter";
-            form.err_len = msg.len;
-            @memcpy(form.err_buf[0..msg.len], msg);
-            return;
-        }
-        for (dn) |ch| {
-            if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_')) {
-                const msg = "  Only a-z, 0-9, dots, dashes, _";
+        const val = form.server_edit_buf[0..form.server_edit_len];
+
+        if (form.server_edit_target == .domain_search) {
+            // Domain search: must be a valid domain name.
+            if (!isValidDomainName(val)) {
+                const msg = "  Invalid domain (a-z 0-9 . - _)";
+                form.err_len = msg.len;
+                @memcpy(form.err_buf[0..msg.len], msg);
+                return;
+            }
+        } else {
+            // Server types: accept IPv4 or valid domain name.
+            const is_ip = if (config_mod.parseIpv4(val)) |_| true else |_| false;
+            if (!is_ip and !isValidDomainName(val)) {
+                const msg = "  Invalid IP or domain name";
                 form.err_len = msg.len;
                 @memcpy(form.err_buf[0..msg.len], msg);
                 return;
             }
         }
-        // Save the entry.
-        if (form.ds_edit_index) |idx| {
+
+        // Save the entry to the appropriate array.
+        const entry_arr = serverEditEntryArr(form);
+        const count = serverEditCount(form);
+        if (form.server_edit_index) |idx| {
             // Editing existing.
-            if (idx < form.domain_search_count) {
-                @memcpy(form.domain_search[idx].buf[0..form.ds_edit_len], form.ds_edit_buf[0..form.ds_edit_len]);
-                form.domain_search[idx].len = form.ds_edit_len;
+            if (idx < count.*) {
+                @memcpy(entry_arr[idx].buf[0..form.server_edit_len], form.server_edit_buf[0..form.server_edit_len]);
+                entry_arr[idx].len = form.server_edit_len;
             }
         } else {
             // Adding new.
-            if (form.domain_search_count < form.domain_search.len) {
-                var new_entry = &form.domain_search[form.domain_search_count];
+            const max = serverEditMax(form);
+            if (count.* < max) {
+                var new_entry = &entry_arr[count.*];
                 new_entry.* = .{};
-                @memcpy(new_entry.buf[0..form.ds_edit_len], form.ds_edit_buf[0..form.ds_edit_len]);
-                new_entry.len = form.ds_edit_len;
-                form.domain_search_count += 1;
+                @memcpy(new_entry.buf[0..form.server_edit_len], form.server_edit_buf[0..form.server_edit_len]);
+                new_entry.len = form.server_edit_len;
+                count.* += 1;
             }
         }
+
+        // DNS Update Server auto-populate: when saving DNS server at index 0.
+        if (form.server_edit_target == .dns) {
+            const save_idx = form.server_edit_index orelse (form.dns_servers_count - 1);
+            if (save_idx == 0 and form.dns_update_server_len == 0) {
+                @memcpy(form.dns_update_server_buf[0..form.server_edit_len], form.server_edit_buf[0..form.server_edit_len]);
+                form.dns_update_server_len = form.server_edit_len;
+            }
+        }
+
         state.mode = .pool_form;
         return;
     }
@@ -5480,34 +5829,81 @@ fn handlePoolDsEditKey(state: *TuiState, key: vaxis.Key) void {
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) return;
 
     // Text editing.
-    const buf: []u8 = &form.ds_edit_buf;
-    const len: *usize = &form.ds_edit_len;
+    const buf: []u8 = &form.server_edit_buf;
+    const len: *usize = &form.server_edit_len;
     const max_len = buf.len;
 
     if (key.matches(vaxis.Key.backspace, .{})) {
-        if (form.ds_edit_cursor > 0 and len.* > 0) {
-            const pos = form.ds_edit_cursor;
+        if (form.server_edit_cursor > 0 and len.* > 0) {
+            const pos = form.server_edit_cursor;
             if (pos < len.*) std.mem.copyForwards(u8, buf[pos - 1 ..], buf[pos..len.*]);
             len.* -= 1;
-            form.ds_edit_cursor -= 1;
+            form.server_edit_cursor -= 1;
         }
     } else if (key.matches(vaxis.Key.left, .{})) {
-        if (form.ds_edit_cursor > 0) form.ds_edit_cursor -= 1;
+        if (form.server_edit_cursor > 0) form.server_edit_cursor -= 1;
     } else if (key.matches(vaxis.Key.right, .{})) {
-        if (form.ds_edit_cursor < len.*) form.ds_edit_cursor += 1;
+        if (form.server_edit_cursor < len.*) form.server_edit_cursor += 1;
     } else if (key.matches(vaxis.Key.home, .{})) {
-        form.ds_edit_cursor = 0;
+        form.server_edit_cursor = 0;
     } else if (key.matches(vaxis.Key.end, .{})) {
-        form.ds_edit_cursor = len.*;
+        form.server_edit_cursor = len.*;
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
         if (len.* < max_len) {
-            const pos = form.ds_edit_cursor;
+            const pos = form.server_edit_cursor;
             if (pos < len.*) std.mem.copyBackwards(u8, buf[pos + 1 ..], buf[pos..len.*]);
             buf[pos] = @intCast(key.codepoint);
             len.* += 1;
-            form.ds_edit_cursor += 1;
+            form.server_edit_cursor += 1;
         }
     }
+}
+
+/// Validate a domain name: starts with alnum, contains only a-z 0-9 . - _
+fn isValidDomainName(val: []const u8) bool {
+    if (val.len == 0) return false;
+    const first = val[0];
+    if (!((first >= 'a' and first <= 'z') or (first >= '0' and first <= '9'))) return false;
+    for (val) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_')) return false;
+    }
+    return true;
+}
+
+/// Get a mutable pointer to the entry array for the current server_edit_target.
+fn serverEditEntryArr(form: *PoolForm) []InlineEntry {
+    return switch (form.server_edit_target) {
+        .domain_search => &form.domain_search,
+        .dns => &form.dns_servers,
+        .log => &form.log_servers,
+        .ntp => &form.ntp_servers,
+        .wins => &form.wins_servers,
+        .tftp => &form.tftp_servers,
+    };
+}
+
+/// Get a mutable pointer to the count for the current server_edit_target.
+fn serverEditCount(form: *PoolForm) *usize {
+    return switch (form.server_edit_target) {
+        .domain_search => &form.domain_search_count,
+        .dns => &form.dns_servers_count,
+        .log => &form.log_servers_count,
+        .ntp => &form.ntp_servers_count,
+        .wins => &form.wins_servers_count,
+        .tftp => &form.tftp_servers_count,
+    };
+}
+
+/// Get the max capacity for the current server_edit_target.
+fn serverEditMax(form: *const PoolForm) usize {
+    return switch (form.server_edit_target) {
+        .domain_search => form.domain_search.len,
+        .dns => form.dns_servers.len,
+        .log => form.log_servers.len,
+        .ntp => form.ntp_servers.len,
+        .wins => form.wins_servers.len,
+        .tftp => form.tftp_servers.len,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -7002,8 +7398,8 @@ test "calcPoolColWidths: narrow terminal reduces columns" {
 // Route/Option entry tests
 // ---------------------------------------------------------------------------
 
-test "DomainSearchEntry: default is empty" {
-    const de = DomainSearchEntry{};
+test "InlineEntry: default is empty" {
+    const de = InlineEntry{};
     try std.testing.expectEqual(@as(usize, 0), de.len);
 }
 
@@ -7023,28 +7419,38 @@ test "PoolForm: REGULAR_FIELD_COUNT matches pool_field_meta length" {
     try std.testing.expectEqual(@as(usize, PoolForm.REGULAR_FIELD_COUNT), pool_field_meta.len);
 }
 
-test "PoolForm: totalFields accounts for inline domain search, routes and options" {
+test "PoolForm: totalFields accounts for all inline sections" {
     var form = PoolForm{};
-    // No entries: 20 regular + [+]DS + [+]Route + [+]Option = 23
+    // No entries: 15 regular + 8 [+] buttons (DS,DNS,Log,NTP,WINS,TFTP,Route,Option) = 23
     try std.testing.expectEqual(@as(u8, 23), form.totalFields());
     form.domain_search_count = 1;
+    form.dns_servers_count = 2;
     form.route_count = 2;
     form.option_count = 3;
-    // 20 + 1 + 1 + 1 + 2 + 1 + 3 = 29
-    try std.testing.expectEqual(@as(u8, 29), form.totalFields());
+    // 15 + 8 + 1 + 2 + 2 + 3 = 31
+    try std.testing.expectEqual(@as(u8, 31), form.totalFields());
 }
 
 test "PoolForm: field index helpers" {
     var form = PoolForm{};
     form.domain_search_count = 1;
+    form.dns_servers_count = 2;
     form.route_count = 2;
     form.option_count = 1;
-    try std.testing.expectEqual(@as(u8, 20), form.addDomainSearchField());
-    try std.testing.expectEqual(@as(u8, 21), form.firstDomainSearchField());
-    try std.testing.expectEqual(@as(u8, 22), form.addRouteField());
-    try std.testing.expectEqual(@as(u8, 23), form.firstRouteField());
-    try std.testing.expectEqual(@as(u8, 25), form.addOptionField());
-    try std.testing.expectEqual(@as(u8, 26), form.firstOptionField());
+    // 15 regular fields
+    try std.testing.expectEqual(@as(u8, 15), form.addDomainSearchField());
+    try std.testing.expectEqual(@as(u8, 16), form.firstDomainSearchField());
+    // After DS: 15 + 1 + 1 = 17
+    try std.testing.expectEqual(@as(u8, 17), form.addDnsField());
+    try std.testing.expectEqual(@as(u8, 18), form.firstDnsField());
+    // After DNS: 17 + 1 + 2 = 20
+    try std.testing.expectEqual(@as(u8, 20), form.addLogField());
+    // After Log/NTP/WINS/TFTP (all 0): 20+1 + 0 + 1 + 0 + 1 + 0 + 1 + 0 = 24
+    try std.testing.expectEqual(@as(u8, 24), form.addRouteField());
+    try std.testing.expectEqual(@as(u8, 25), form.firstRouteField());
+    // After routes: 24 + 1 + 2 = 27
+    try std.testing.expectEqual(@as(u8, 27), form.addOptionField());
+    try std.testing.expectEqual(@as(u8, 28), form.firstOptionField());
 }
 
 test "buildRoutesFromForm: empty routes" {
@@ -7144,18 +7550,19 @@ test "handlePoolFormKey: delete inline option" {
     try std.testing.expectEqual(@as(usize, 0), state.pool_form.option_count);
 }
 
-test "handlePoolDsEditKey: save new domain search entry" {
+test "handlePoolServerEditKey: save new domain search entry" {
     var state = TuiState{};
-    state.mode = .pool_ds_edit;
+    state.mode = .pool_server_edit;
     state.pool_form.domain_search_count = 0;
-    state.pool_form.ds_edit_index = null; // adding new
+    state.pool_form.server_edit_target = .domain_search;
+    state.pool_form.server_edit_index = null; // adding new
 
     const domain = "example.local";
-    @memcpy(state.pool_form.ds_edit_buf[0..domain.len], domain);
-    state.pool_form.ds_edit_len = domain.len;
+    @memcpy(state.pool_form.server_edit_buf[0..domain.len], domain);
+    state.pool_form.server_edit_len = domain.len;
 
     // Press Enter to save.
-    handlePoolDsEditKey(&state, vaxis.Key{ .codepoint = vaxis.Key.enter, .mods = .{} });
+    handlePoolServerEditKey(&state, vaxis.Key{ .codepoint = vaxis.Key.enter, .mods = .{} });
     try std.testing.expectEqual(@as(usize, 1), state.pool_form.domain_search_count);
     try std.testing.expect(state.mode == .pool_form);
     try std.testing.expectEqualStrings("example.local", state.pool_form.domain_search[0].buf[0..state.pool_form.domain_search[0].len]);
