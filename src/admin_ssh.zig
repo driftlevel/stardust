@@ -2681,11 +2681,11 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "Time Offset" }, // 7  (was 6)
     .{ .label = "Boot Filename" }, // 8
     .{ .label = "HTTP Boot URL" }, // 9
-    .{ .label = "DNS Upd Enable" }, // 10
-    .{ .label = "DNS Upd Server" }, // 11
-    .{ .label = "DNS Upd Zone" }, // 12
-    .{ .label = "DNS Upd Key Name", .sensitive = true }, // 13
-    .{ .label = "DNS Upd Key File", .sensitive = true }, // 14
+    .{ .label = "Enable" }, // 10
+    .{ .label = "Server" }, // 11
+    .{ .label = "Zone" }, // 12
+    .{ .label = "Key Name", .sensitive = true }, // 13
+    .{ .label = "Key File", .sensitive = true }, // 14
 };
 
 /// A single item in the unified pool form layout.  The layout array drives
