@@ -2561,6 +2561,15 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
             fb.len.* -= 1;
         }
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        // Filter allowed characters based on reservation field type.
+        const ch: u8 = @intCast(key.codepoint);
+        const allowed = switch (form.active_field) {
+            0 => (ch >= '0' and ch <= '9') or ch == '.', // IP
+            1 => (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F') or ch == ':' or ch == '-', // MAC
+            2 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '-', // Hostname
+            else => true,
+        };
+        if (!allowed) return;
         if (fb.len.* < fb.buf.len - 1) {
             const pos = form.cursor;
             if (pos < fb.len.*) std.mem.copyBackwards(u8, fb.buf[pos + 1 ..], fb.buf[pos..fb.len.*]);
@@ -3526,7 +3535,7 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
         },
         .pool_option_edit => {
             const w: u16 = 48;
-            const h: u16 = 8;
+            const h: u16 = if (state.pool_form.err_len > 0) 9 else 8;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .pool_option_lookup => {
@@ -3541,7 +3550,7 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
         },
         .res_option_edit => {
             const w: u16 = 48;
-            const h: u16 = 8;
+            const h: u16 = if (state.form.err_len > 0) 9 else 8;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .option_lookup => {
@@ -4149,6 +4158,24 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             }
         }
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        // Filter allowed characters based on field type.
+        const field_idx = af_info.field_idx;
+        const ch: u8 = @intCast(key.codepoint);
+        const allowed = switch (field_idx) {
+            0 => (ch >= '0' and ch <= '9') or ch == '.' or ch == '/', // Subnet (CIDR)
+            1, 2, 3 => (ch >= '0' and ch <= '9') or ch == '.', // Router, Pool Start, Pool End (IP)
+            4, 5 => ch >= '0' and ch <= '9', // Lease Time, MTU (integer)
+            6 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_', // Domain Name
+            7 => (ch >= '0' and ch <= '9') or ch == '-', // Time Offset (signed int)
+            8 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-' or ch == '/', // Boot filename (file path)
+            9 => ch >= 0x20 and ch <= 0x7E, // HTTP Boot URL (all printable)
+            11 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == ':', // DNS Update Server (IP or domain)
+            12 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_', // DNS Update Zone (domain)
+            13 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-', // Key Name
+            14 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-' or ch == '/' or ch == '+' or ch == '=', // Key File (file path)
+            else => true,
+        };
+        if (!allowed) return;
         if (poolFormFieldBuf(form, fi)) |fb| {
             if (fb.len.* < fb.buf.len) {
                 // Shift bytes after cursor right by one, insert character.
@@ -4278,6 +4305,56 @@ fn validatePoolForm(form: *PoolForm) ?[]const u8 {
                 if (ch < 0x20 or ch > 0x7E) return "URL path has non-printable characters";
             }
         }
+    }
+
+    // TFTP Boot File (field 8): optional, validate as file path.
+    if (form.boot_filename_len > 0) {
+        for (form.boot_filename_buf[0..form.boot_filename_len]) |ch| {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
+                ch == '.' or ch == '_' or ch == '-' or ch == '/'))
+                return "Boot file: only alphanumeric, . _ - / allowed";
+        }
+    }
+
+    // DNS Update Server (field 11): optional, validate as IP or domain name.
+    if (form.dns_update_server_len > 0) {
+        const val = form.dns_update_server_buf[0..form.dns_update_server_len];
+        const is_ip = if (config_mod.parseIpv4(val)) |_| true else |_| false;
+        if (!is_ip and !isValidDomainName(val)) return "DNS update server: invalid IP or domain";
+    }
+
+    // DNS Update Zone (field 12): optional, validate as domain name.
+    if (form.dns_update_zone_len > 0) {
+        if (!isValidDomainName(form.dns_update_zone_buf[0..form.dns_update_zone_len]))
+            return "DNS update zone: invalid domain name";
+    }
+
+    // DNS Update Key Name (field 13): optional, validate as key name.
+    if (form.dns_update_key_name_len > 0) {
+        const kn = form.dns_update_key_name_buf[0..form.dns_update_key_name_len];
+        const first = kn[0];
+        if (!((first >= 'a' and first <= 'z') or (first >= 'A' and first <= 'Z') or (first >= '0' and first <= '9')))
+            return "Key name must start with alphanumeric";
+        for (kn) |ch| {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-'))
+                return "Key name: only alphanumeric, _ - allowed";
+        }
+    }
+
+    // DNS Update Key File (field 14): optional, validate as file path.
+    if (form.dns_update_key_file_len > 0) {
+        for (form.dns_update_key_file_buf[0..form.dns_update_key_file_len]) |ch| {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
+                ch == '.' or ch == '_' or ch == '-' or ch == '/' or ch == '+' or ch == '='))
+                return "Key file: only alphanumeric, . _ - / + = allowed";
+        }
+    }
+
+    // Validate DHCP option codes (1-255).
+    for (form.options[0..form.option_count]) |opt| {
+        if (opt.code_len == 0) return "DHCP option code is required";
+        const code = std.fmt.parseInt(u16, opt.code_buf[0..opt.code_len], 10) catch return "DHCP option code must be 1-255";
+        if (code == 0 or code > 255) return "DHCP option code must be 1-255";
     }
 
     return null;
@@ -5208,11 +5285,18 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             if (state.settings_cursor < settingsTextLen(state)) state.settings_cursor += 1;
             return;
         }
-        // Printable ASCII: insert at cursor.
+        // Printable ASCII: insert at cursor with character filtering.
         if (key.codepoint >= 0x20 and key.codepoint <= 0x7E and
             !key.matches(vaxis.Key.enter, .{}) and !key.matches(' ', .{}))
         {
-            settingsTextInsert(state, @intCast(key.codepoint));
+            const ch: u8 = @intCast(key.codepoint);
+            const allowed = switch (state.settings_row) {
+                4 => ch >= '0' and ch <= '9', // Port (integer)
+                5 => (ch >= '0' and ch <= '9') or ch == '.', // Bind address (IP)
+                else => true,
+            };
+            if (!allowed) return;
+            settingsTextInsert(state, ch);
             settingsMarkTextDirty(state, cfg);
             return;
         }
@@ -5890,6 +5974,13 @@ fn handlePoolServerEditKey(state: *TuiState, key: vaxis.Key) void {
     } else if (key.matches(vaxis.Key.end, .{})) {
         form.server_edit_cursor = len.*;
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        // Filter allowed characters based on server edit target type.
+        const ch: u8 = @intCast(key.codepoint);
+        const allowed = switch (form.server_edit_target) {
+            .domain_search => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_', // Domain name
+            .dns, .ntp, .log, .wins, .tftp => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == ':', // IP or domain
+        };
+        if (!allowed) return;
         if (len.* < max_len) {
             const pos = form.server_edit_cursor;
             if (pos < len.*) std.mem.copyBackwards(u8, buf[pos + 1 ..], buf[pos..len.*]);
@@ -6115,6 +6206,13 @@ fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
     } else if (key.matches(vaxis.Key.end, .{})) {
         form.route_edit_cursor = len.*;
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        // Filter allowed characters based on route field type.
+        const ch: u8 = @intCast(key.codepoint);
+        const allowed = if (form.route_edit_field == 0)
+            (ch >= '0' and ch <= '9') or ch == '.' or ch == '/' // Network (CIDR)
+        else
+            (ch >= '0' and ch <= '9') or ch == '.'; // Gateway (IP)
+        if (!allowed) return;
         if (len.* < max_len) {
             const pos = form.route_edit_cursor;
             if (pos < len.*) std.mem.copyBackwards(u8, buf[pos + 1 ..], buf[pos..len.*]);
@@ -6132,7 +6230,8 @@ fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
 fn renderPoolOptionEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const form = &state.pool_form;
     const BOX_W: u16 = 48;
-    const BOX_H: u16 = 8;
+    const has_err = form.err_len > 0;
+    const BOX_H: u16 = if (has_err) 9 else 8;
     if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
@@ -6188,6 +6287,10 @@ fn renderPoolOptionEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocat
         _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 4, .wrap = .none });
     }
 
+    if (has_err) {
+        const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+        _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
+    }
     _ = box.print(&.{.{ .text = "  Tab: switch  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
@@ -6199,8 +6302,27 @@ fn handlePoolOptionEditKey(state: *TuiState, key: vaxis.Key) void {
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
+        form.err_len = 0;
         // Save the option.
-        if (form.opt_edit_code_len == 0) return; // need at least a code
+        if (form.opt_edit_code_len == 0) {
+            const msg = "  Option code is required";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        }
+        // Validate code is 1-255.
+        const code_val = std.fmt.parseInt(u16, form.opt_edit_code[0..form.opt_edit_code_len], 10) catch {
+            const msg = "  Option code must be a number 1-255";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        };
+        if (code_val == 0 or code_val > 255) {
+            const msg = "  Option code must be 1-255";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        }
         if (form.opt_edit_index) |idx| {
             // Editing existing.
             if (idx < form.option_count) {
@@ -6239,6 +6361,7 @@ fn handlePoolOptionEditKey(state: *TuiState, key: vaxis.Key) void {
     }
 
     // Text editing.
+    form.err_len = 0;
     const buf: []u8 = if (form.opt_edit_field == 0) &form.opt_edit_code else &form.opt_edit_value;
     const len: *usize = if (form.opt_edit_field == 0) &form.opt_edit_code_len else &form.opt_edit_value_len;
     const max_len = buf.len;
@@ -6378,7 +6501,8 @@ fn handlePoolOptionLookupKey(state: *TuiState, key: vaxis.Key) void {
 fn renderResOptionEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const form = &state.form;
     const BOX_W: u16 = 48;
-    const BOX_H: u16 = 8;
+    const has_err = form.err_len > 0;
+    const BOX_H: u16 = if (has_err) 9 else 8;
     if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
@@ -6434,6 +6558,10 @@ fn renderResOptionEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocato
         _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 4, .wrap = .none });
     }
 
+    if (has_err) {
+        const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+        _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
+    }
     _ = box.print(&.{.{ .text = "  Tab: switch  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
@@ -6441,12 +6569,32 @@ fn handleResOptionEditKey(state: *TuiState, key: vaxis.Key) void {
     var form = &state.form;
 
     if (key.matches(vaxis.Key.escape, .{})) {
+        form.err_len = 0;
         state.mode = .reservation_form;
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
+        form.err_len = 0;
         // Save the option.
-        if (form.opt_edit_code_len == 0) return; // need at least a code
+        if (form.opt_edit_code_len == 0) {
+            const msg = "  Option code is required";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        }
+        // Validate code is 1-255.
+        const code_val = std.fmt.parseInt(u16, form.opt_edit_code[0..form.opt_edit_code_len], 10) catch {
+            const msg = "  Option code must be a number 1-255";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        };
+        if (code_val == 0 or code_val > 255) {
+            const msg = "  Option code must be 1-255";
+            form.err_len = msg.len;
+            @memcpy(form.err_buf[0..msg.len], msg);
+            return;
+        }
         if (form.opt_edit_index) |idx| {
             // Editing existing.
             if (idx < form.option_count) {
@@ -6485,6 +6633,7 @@ fn handleResOptionEditKey(state: *TuiState, key: vaxis.Key) void {
     }
 
     // Text editing.
+    form.err_len = 0;
     const buf: []u8 = if (form.opt_edit_field == 0) &form.opt_edit_code else &form.opt_edit_value;
     const len: *usize = if (form.opt_edit_field == 0) &form.opt_edit_code_len else &form.opt_edit_value_len;
     const max_len = buf.len;
@@ -7634,8 +7783,12 @@ test "validatePoolForm: valid with DHCP options and routes" {
     form.router_len = 11;
     @memcpy(form.lease_time_buf[0..4], "3600");
     form.lease_time_len = 4;
-    // Add a route and option — these don't affect validation.
+    // Add a route and option with valid data.
     form.route_count = 1;
     form.option_count = 1;
+    @memcpy(form.options[0].code_buf[0..2], "66");
+    form.options[0].code_len = 2;
+    @memcpy(form.options[0].value_buf[0..9], "10.0.0.99");
+    form.options[0].value_len = 9;
     try std.testing.expect(validatePoolForm(&form) == null);
 }
