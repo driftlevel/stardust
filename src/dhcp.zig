@@ -209,25 +209,52 @@ fn toLowerAscii(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
+/// Result of merging DHCP option overrides from all layers (pool, mac_classes,
+/// reservation). The `dhcp_options` map contains raw option-code→value strings
+/// that go through `encodeOptionValue`. The first-class field overrides carry
+/// typed data from the winning MAC class and are applied directly by the packet
+/// builder using the correct encoding for each option type.
+/// All slice/pointer values reference config-owned memory — no duplication.
+const OverrideResult = struct {
+    dhcp_options: std.StringHashMap([]const u8),
+    // First-class field overrides from the winning MAC class layer.
+    // null / empty = use pool default.
+    router: ?[]const u8 = null,
+    dns_servers: ?[]const []const u8 = null,
+    domain_name: ?[]const u8 = null,
+    domain_search: ?[]const []const u8 = null,
+    ntp_servers: ?[]const []const u8 = null,
+    log_servers: ?[]const []const u8 = null,
+    wins_servers: ?[]const []const u8 = null,
+    time_offset: ?i32 = null,
+    tftp_servers: ?[]const []const u8 = null,
+    boot_filename: ?[]const u8 = null,
+    http_boot_url: ?[]const u8 = null,
+    static_routes: ?[]const config_mod.StaticRoute = null,
+};
+
 /// Collect merged DHCP option overrides from all layers:
 ///   1. pool.dhcp_options (lowest priority)
 ///   2. Matching mac_classes (least-specific match first, then more specific)
+///      — both dhcp_options and first-class structured fields
 ///   3. Per-reservation dhcp_options (highest priority)
-/// Returns a map allocated on `allocator` (caller frees). Values point into
-/// config-owned strings (no duplication needed).
+/// Returns an OverrideResult; caller must deinit `.dhcp_options`.
+/// Values point into config-owned strings (no duplication needed).
 fn collectOverrides(
     allocator: std.mem.Allocator,
     pool: *const config_mod.PoolConfig,
     mac: []const u8,
     reservation: ?*const config_mod.Reservation,
     mac_classes: []const config_mod.MacClass,
-) std.StringHashMap([]const u8) {
-    var overrides = std.StringHashMap([]const u8).init(allocator);
+) OverrideResult {
+    var result = OverrideResult{
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+    };
 
     // Layer 1: pool custom options.
     var pool_it = pool.dhcp_options.iterator();
     while (pool_it.next()) |entry| {
-        overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+        result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
     }
 
     // Layer 2: MAC class matches, sorted by specificity (shortest match first).
@@ -260,9 +287,26 @@ fn collectOverrides(
         }
     }
     for (matches[0..match_count]) |m| {
-        var mc_it = mac_classes[m.idx].dhcp_options.iterator();
+        const mc = &mac_classes[m.idx];
+
+        // Apply first-class structured field overrides (last match wins).
+        if (mc.router != null) result.router = mc.router;
+        if (mc.dns_servers.len > 0) result.dns_servers = mc.dns_servers;
+        if (mc.domain_name != null) result.domain_name = mc.domain_name;
+        if (mc.domain_search.len > 0) result.domain_search = mc.domain_search;
+        if (mc.ntp_servers.len > 0) result.ntp_servers = mc.ntp_servers;
+        if (mc.log_servers.len > 0) result.log_servers = mc.log_servers;
+        if (mc.wins_servers.len > 0) result.wins_servers = mc.wins_servers;
+        if (mc.time_offset != null) result.time_offset = mc.time_offset;
+        if (mc.tftp_servers.len > 0) result.tftp_servers = mc.tftp_servers;
+        if (mc.boot_filename != null) result.boot_filename = mc.boot_filename;
+        if (mc.http_boot_url != null) result.http_boot_url = mc.http_boot_url;
+        if (mc.static_routes.len > 0) result.static_routes = mc.static_routes;
+
+        // Apply dhcp_options (overwrites pool layer).
+        var mc_it = mc.dhcp_options.iterator();
         while (mc_it.next()) |entry| {
-            overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
         }
     }
 
@@ -271,12 +315,12 @@ fn collectOverrides(
         if (res.dhcp_options) |res_opts| {
             var res_it = res_opts.iterator();
             while (res_it.next()) |entry| {
-                overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+                result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
             }
         }
     }
 
-    return overrides;
+    return result;
 }
 
 /// Check if an option code (as integer) is present in the override map.
@@ -1439,14 +1483,28 @@ pub const DHCPServer = struct {
             reservation,
             pool.mac_classes,
         );
-        defer overrides.deinit();
+        defer overrides.dhcp_options.deinit();
 
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
-        const router_ip = try config_mod.parseIpv4(pool.router);
+        const eff_router = overrides.router orelse pool.router;
+        const router_ip = try config_mod.parseIpv4(eff_router);
         const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time));
         const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time / 2));
         const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time * 7 / 8));
+
+        // Effective values: MAC class overrides fall back to pool defaults.
+        const eff_dns_servers = overrides.dns_servers orelse pool.dns_servers;
+        const eff_domain_name = overrides.domain_name orelse pool.domain_name;
+        const eff_domain_search = overrides.domain_search orelse pool.domain_search;
+        const eff_ntp_servers = overrides.ntp_servers orelse pool.ntp_servers;
+        const eff_log_servers = overrides.log_servers orelse pool.log_servers;
+        const eff_wins_servers = overrides.wins_servers orelse pool.wins_servers;
+        const eff_tftp_servers = overrides.tftp_servers orelse pool.tftp_servers;
+        const eff_boot_filename = overrides.boot_filename orelse pool.boot_filename;
+        const eff_http_boot_url = overrides.http_boot_url orelse pool.http_boot_url;
+        const eff_static_routes = overrides.static_routes orelse pool.static_routes;
+        const eff_time_offset: ?i32 = overrides.time_offset orelse pool.time_offset;
 
         // Build options into a temporary buffer
         var opts_buf: [1024]u8 = undefined;
@@ -1503,21 +1561,21 @@ pub const DHCPServer = struct {
         }
 
         // Option 6: DNS Servers (ordered, with hostname resolution)
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, pool.dns_servers, &self.resolve_cache, null);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, eff_dns_servers, &self.resolve_cache, null);
 
         // Option 15: Domain Name
-        if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
-            const dn_len = @min(pool.domain_name.len, 255);
+        if (isRequested(prl, .DomainName) and eff_domain_name.len > 0) {
+            const dn_len = @min(eff_domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], pool.domain_name[0..dn_len]);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], eff_domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
         }
 
         // Option 119: Domain Search List (RFC 3397)
-        if (isRequested(prl, .DomainSearch) and pool.domain_search.len > 0) {
+        if (isRequested(prl, .DomainSearch) and eff_domain_search.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], pool.domain_search);
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], eff_domain_search);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1528,7 +1586,7 @@ pub const DHCPServer = struct {
 
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
-            if (pool.time_offset) |offset| {
+            if (eff_time_offset) |offset| {
                 opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
                 opts_buf[opts_len + 1] = 4;
                 const be = std.mem.nativeToBig(i32, offset);
@@ -1542,16 +1600,16 @@ pub const DHCPServer = struct {
 
         // Option 4: Time Servers (RFC 868) — shuffled for load distribution.
         // Use explicit time_servers if configured, otherwise mirror ntp_servers.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else eff_ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 7: Log Servers — shuffled for load distribution.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, eff_log_servers, &self.resolve_cache, xid_seed);
 
         // Option 42: NTP Servers — shuffled for load distribution.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, eff_ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 26: Interface MTU
-        if (!isOverridden(&overrides, 26)) {
+        if (!isOverridden(&overrides.dhcp_options, 26)) {
             if (pool.mtu) |mtu| {
                 if (isRequestedCode(prl, 26) and opts_len + 4 <= opts_buf.len) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.InterfaceMTU);
@@ -1564,7 +1622,7 @@ pub const DHCPServer = struct {
         }
 
         // Option 28: Broadcast Address (auto-derived from subnet)
-        if (!isOverridden(&overrides, 28)) {
+        if (!isOverridden(&overrides.dhcp_options, 28)) {
             if (isRequestedCode(prl, 28) and opts_len + 6 <= opts_buf.len) {
                 const bcast_sip = config_mod.parseIpv4(pool.subnet) catch null;
                 if (bcast_sip) |sip| {
@@ -1580,30 +1638,30 @@ pub const DHCPServer = struct {
         }
 
         // Option 44: NetBIOS/WINS Name Servers — shuffled for load distribution.
-        if (!isOverridden(&overrides, 44)) {
-            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers, &self.resolve_cache, xid_seed);
+        if (!isOverridden(&overrides.dhcp_options, 44)) {
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, eff_wins_servers, &self.resolve_cache, xid_seed);
         }
 
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
-        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+        if (isHttpClient(request) and eff_http_boot_url.len > 0) {
             // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
             // Both sent unconditionally per UEFI Spec §24.4.
             appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
-            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, eff_http_boot_url);
         } else {
-            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (pool.tftp_servers.len > 0) pool.tftp_servers[0] else "");
-            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (eff_tftp_servers.len > 0) eff_tftp_servers[0] else "");
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, eff_boot_filename);
         }
 
         // Option 150: Cisco TFTP Server (ordered, with hostname resolution)
-        if (!isOverridden(&overrides, 150)) {
-            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers, &self.resolve_cache, null);
+        if (!isOverridden(&overrides.dhcp_options, 150)) {
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, eff_tftp_servers, &self.resolve_cache, null);
         }
 
         // Option 33: Static Routes (RFC 2132)
-        if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
+        if (isRequested(prl, .StaticRoutes) and eff_static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], eff_static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1613,9 +1671,9 @@ pub const DHCPServer = struct {
         }
 
         // Option 121: Classless Static Routes (RFC 3442)
-        if (isRequested(prl, .ClasslessStaticRoutes) and pool.static_routes.len > 0) {
+        if (isRequested(prl, .ClasslessStaticRoutes) and eff_static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], eff_static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1625,7 +1683,7 @@ pub const DHCPServer = struct {
         }
 
         // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
-        var opts_it = overrides.iterator();
+        var opts_it = overrides.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1727,7 +1785,6 @@ pub const DHCPServer = struct {
 
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
-        const router_ip = try config_mod.parseIpv4(pool.router);
         const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time));
         const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time / 2));
         const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time * 7 / 8));
@@ -1794,7 +1851,22 @@ pub const DHCPServer = struct {
             config_res,
             pool.mac_classes,
         );
-        defer overrides.deinit();
+        defer overrides.dhcp_options.deinit();
+
+        // Effective values: MAC class overrides fall back to pool defaults.
+        const eff_router = overrides.router orelse pool.router;
+        const router_ip = try config_mod.parseIpv4(eff_router);
+        const eff_dns_servers = overrides.dns_servers orelse pool.dns_servers;
+        const eff_domain_name = overrides.domain_name orelse pool.domain_name;
+        const eff_domain_search = overrides.domain_search orelse pool.domain_search;
+        const eff_ntp_servers = overrides.ntp_servers orelse pool.ntp_servers;
+        const eff_log_servers = overrides.log_servers orelse pool.log_servers;
+        const eff_wins_servers = overrides.wins_servers orelse pool.wins_servers;
+        const eff_tftp_servers = overrides.tftp_servers orelse pool.tftp_servers;
+        const eff_boot_filename = overrides.boot_filename orelse pool.boot_filename;
+        const eff_http_boot_url = overrides.http_boot_url orelse pool.http_boot_url;
+        const eff_static_routes = overrides.static_routes orelse pool.static_routes;
+        const eff_time_offset: ?i32 = overrides.time_offset orelse pool.time_offset;
 
         // Build options
         var opts_buf: [1024]u8 = undefined;
@@ -1851,21 +1923,21 @@ pub const DHCPServer = struct {
         }
 
         // Option 6: DNS Servers (ordered, with hostname resolution)
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, pool.dns_servers, &self.resolve_cache, null);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, eff_dns_servers, &self.resolve_cache, null);
 
         // Option 15: Domain Name
-        if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
-            const dn_len = @min(pool.domain_name.len, 255);
+        if (isRequested(prl, .DomainName) and eff_domain_name.len > 0) {
+            const dn_len = @min(eff_domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], pool.domain_name[0..dn_len]);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], eff_domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
         }
 
         // Option 119: Domain Search List (RFC 3397)
-        if (isRequested(prl, .DomainSearch) and pool.domain_search.len > 0) {
+        if (isRequested(prl, .DomainSearch) and eff_domain_search.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], pool.domain_search);
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], eff_domain_search);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1876,7 +1948,7 @@ pub const DHCPServer = struct {
 
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
-            if (pool.time_offset) |offset| {
+            if (eff_time_offset) |offset| {
                 opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
                 opts_buf[opts_len + 1] = 4;
                 const be = std.mem.nativeToBig(i32, offset);
@@ -1890,16 +1962,16 @@ pub const DHCPServer = struct {
 
         // Option 4: Time Servers (RFC 868) — shuffled for load distribution.
         // Use explicit time_servers if configured, otherwise mirror ntp_servers.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else eff_ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 7: Log Servers — shuffled for load distribution.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, eff_log_servers, &self.resolve_cache, xid_seed);
 
         // Option 42: NTP Servers — shuffled for load distribution.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, eff_ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 26: Interface MTU
-        if (!isOverridden(&overrides, 26)) {
+        if (!isOverridden(&overrides.dhcp_options, 26)) {
             if (pool.mtu) |mtu| {
                 if (isRequestedCode(prl, 26) and opts_len + 4 <= opts_buf.len) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.InterfaceMTU);
@@ -1912,7 +1984,7 @@ pub const DHCPServer = struct {
         }
 
         // Option 28: Broadcast Address (auto-derived from subnet)
-        if (!isOverridden(&overrides, 28)) {
+        if (!isOverridden(&overrides.dhcp_options, 28)) {
             if (isRequestedCode(prl, 28) and opts_len + 6 <= opts_buf.len) {
                 const bcast_sip = config_mod.parseIpv4(pool.subnet) catch null;
                 if (bcast_sip) |sip| {
@@ -1928,30 +2000,30 @@ pub const DHCPServer = struct {
         }
 
         // Option 44: NetBIOS/WINS Name Servers — shuffled for load distribution.
-        if (!isOverridden(&overrides, 44)) {
-            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers, &self.resolve_cache, xid_seed);
+        if (!isOverridden(&overrides.dhcp_options, 44)) {
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, eff_wins_servers, &self.resolve_cache, xid_seed);
         }
 
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
-        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+        if (isHttpClient(request) and eff_http_boot_url.len > 0) {
             // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
             // Both sent unconditionally per UEFI Spec §24.4.
             appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
-            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, eff_http_boot_url);
         } else {
-            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (pool.tftp_servers.len > 0) pool.tftp_servers[0] else "");
-            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (eff_tftp_servers.len > 0) eff_tftp_servers[0] else "");
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, eff_boot_filename);
         }
 
         // Option 150: Cisco TFTP Server (ordered, with hostname resolution)
-        if (!isOverridden(&overrides, 150)) {
-            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers, &self.resolve_cache, null);
+        if (!isOverridden(&overrides.dhcp_options, 150)) {
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, eff_tftp_servers, &self.resolve_cache, null);
         }
 
         // Option 33: Static Routes (RFC 2132)
-        if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
+        if (isRequested(prl, .StaticRoutes) and eff_static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], eff_static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1961,9 +2033,9 @@ pub const DHCPServer = struct {
         }
 
         // Option 121: Classless Static Routes (RFC 3442)
-        if (isRequested(prl, .ClasslessStaticRoutes) and pool.static_routes.len > 0) {
+        if (isRequested(prl, .ClasslessStaticRoutes) and eff_static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], eff_static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1984,7 +2056,7 @@ pub const DHCPServer = struct {
         }
 
         // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
-        var opts_it = overrides.iterator();
+        var opts_it = overrides.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -2279,7 +2351,21 @@ pub const DHCPServer = struct {
         }) catch "";
         const config_res_inf = findConfigReservation(pool, mac_str_inf);
         var overrides = collectOverrides(self.allocator, pool, mac_str_inf, config_res_inf, pool.mac_classes);
-        defer overrides.deinit();
+        defer overrides.dhcp_options.deinit();
+
+        // Effective values: MAC class overrides fall back to pool defaults.
+        const eff_router = overrides.router orelse pool.router;
+        const eff_dns_servers = overrides.dns_servers orelse pool.dns_servers;
+        const eff_domain_name = overrides.domain_name orelse pool.domain_name;
+        const eff_domain_search = overrides.domain_search orelse pool.domain_search;
+        const eff_ntp_servers = overrides.ntp_servers orelse pool.ntp_servers;
+        const eff_log_servers = overrides.log_servers orelse pool.log_servers;
+        const eff_wins_servers = overrides.wins_servers orelse pool.wins_servers;
+        const eff_tftp_servers = overrides.tftp_servers orelse pool.tftp_servers;
+        const eff_boot_filename = overrides.boot_filename orelse pool.boot_filename;
+        const eff_http_boot_url = overrides.http_boot_url orelse pool.http_boot_url;
+        const eff_static_routes = overrides.static_routes orelse pool.static_routes;
+        const eff_time_offset: ?i32 = overrides.time_offset orelse pool.time_offset;
 
         var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
@@ -2307,7 +2393,7 @@ pub const DHCPServer = struct {
 
         // Option 3: Router
         if (isRequested(prl, .Router)) {
-            const router_ip = try config_mod.parseIpv4(pool.router);
+            const router_ip = try config_mod.parseIpv4(eff_router);
             opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
             opts_buf[opts_len + 1] = 4;
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
@@ -2315,21 +2401,21 @@ pub const DHCPServer = struct {
         }
 
         // Option 6: DNS Servers (ordered, with hostname resolution)
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, pool.dns_servers, &self.resolve_cache, null);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, eff_dns_servers, &self.resolve_cache, null);
 
         // Option 15: Domain Name
-        if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
-            const dn_len = @min(pool.domain_name.len, 255);
+        if (isRequested(prl, .DomainName) and eff_domain_name.len > 0) {
+            const dn_len = @min(eff_domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], pool.domain_name[0..dn_len]);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], eff_domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
         }
 
         // Option 119: Domain Search List (RFC 3397)
-        if (isRequested(prl, .DomainSearch) and pool.domain_search.len > 0) {
+        if (isRequested(prl, .DomainSearch) and eff_domain_search.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], pool.domain_search);
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], eff_domain_search);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -2340,7 +2426,7 @@ pub const DHCPServer = struct {
 
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
-            if (pool.time_offset) |offset| {
+            if (eff_time_offset) |offset| {
                 opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
                 opts_buf[opts_len + 1] = 4;
                 const be = std.mem.nativeToBig(i32, offset);
@@ -2354,16 +2440,16 @@ pub const DHCPServer = struct {
 
         // Option 4: Time Servers (RFC 868) — shuffled for load distribution.
         // Use explicit time_servers if configured, otherwise mirror ntp_servers.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else eff_ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 7: Log Servers — shuffled for load distribution.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, eff_log_servers, &self.resolve_cache, xid_seed);
 
         // Option 42: NTP Servers — shuffled for load distribution.
-        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers, &self.resolve_cache, xid_seed);
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, eff_ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 26: Interface MTU
-        if (!isOverridden(&overrides, 26)) {
+        if (!isOverridden(&overrides.dhcp_options, 26)) {
             if (pool.mtu) |mtu| {
                 if (isRequestedCode(prl, 26) and opts_len + 4 <= opts_buf.len) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.InterfaceMTU);
@@ -2376,7 +2462,7 @@ pub const DHCPServer = struct {
         }
 
         // Option 28: Broadcast Address (auto-derived from subnet)
-        if (!isOverridden(&overrides, 28)) {
+        if (!isOverridden(&overrides.dhcp_options, 28)) {
             if (isRequestedCode(prl, 28) and opts_len + 6 <= opts_buf.len) {
                 const bcast_sip = config_mod.parseIpv4(pool.subnet) catch null;
                 if (bcast_sip) |sip| {
@@ -2392,30 +2478,30 @@ pub const DHCPServer = struct {
         }
 
         // Option 44: NetBIOS/WINS Name Servers — shuffled for load distribution.
-        if (!isOverridden(&overrides, 44)) {
-            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers, &self.resolve_cache, xid_seed);
+        if (!isOverridden(&overrides.dhcp_options, 44)) {
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, eff_wins_servers, &self.resolve_cache, xid_seed);
         }
 
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
-        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+        if (isHttpClient(request) and eff_http_boot_url.len > 0) {
             // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
             // Both sent unconditionally per UEFI Spec §24.4.
             appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
-            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, eff_http_boot_url);
         } else {
-            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (pool.tftp_servers.len > 0) pool.tftp_servers[0] else "");
-            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, if (eff_tftp_servers.len > 0) eff_tftp_servers[0] else "");
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, eff_boot_filename);
         }
 
         // Option 150: Cisco TFTP Server (ordered, with hostname resolution)
-        if (!isOverridden(&overrides, 150)) {
-            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers, &self.resolve_cache, null);
+        if (!isOverridden(&overrides.dhcp_options, 150)) {
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, eff_tftp_servers, &self.resolve_cache, null);
         }
 
         // Option 33: Static Routes (RFC 2132)
-        if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
+        if (isRequested(prl, .StaticRoutes) and eff_static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], eff_static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -2425,9 +2511,9 @@ pub const DHCPServer = struct {
         }
 
         // Option 121: Classless Static Routes (RFC 3442)
-        if (isRequested(prl, .ClasslessStaticRoutes) and pool.static_routes.len > 0) {
+        if (isRequested(prl, .ClasslessStaticRoutes) and eff_static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], eff_static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -2437,7 +2523,7 @@ pub const DHCPServer = struct {
         }
 
         // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
-        var opts_it = overrides.iterator();
+        var opts_it = overrides.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -4795,14 +4881,14 @@ test "collectOverrides: priority pool < mac_class < reservation" {
     };
 
     var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", &reservation, &mac_classes);
-    defer overrides.deinit();
+    defer overrides.dhcp_options.deinit();
 
     // "66" should be reservation value (highest priority)
-    try std.testing.expectEqualStrings("res-tftp", overrides.get("66").?);
+    try std.testing.expectEqualStrings("res-tftp", overrides.dhcp_options.get("66").?);
     // "67" should be MAC class value (pool didn't set it)
-    try std.testing.expectEqualStrings("class-boot.img", overrides.get("67").?);
+    try std.testing.expectEqualStrings("class-boot.img", overrides.dhcp_options.get("67").?);
     // "15" should be pool value (no override from class or reservation)
-    try std.testing.expectEqualStrings("pool.lan", overrides.get("15").?);
+    try std.testing.expectEqualStrings("pool.lan", overrides.dhcp_options.get("15").?);
 }
 
 test "collectOverrides: most specific MAC class wins" {
@@ -4850,10 +4936,10 @@ test "collectOverrides: most specific MAC class wins" {
     };
 
     var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
-    defer overrides.deinit();
+    defer overrides.dhcp_options.deinit();
 
     // More specific (exact MAC) should win over OUI prefix
-    try std.testing.expectEqualStrings("exact-tftp", overrides.get("66").?);
+    try std.testing.expectEqualStrings("exact-tftp", overrides.dhcp_options.get("66").?);
 }
 
 test "collectOverrides: no matches returns pool options only" {
@@ -4901,11 +4987,11 @@ test "collectOverrides: no matches returns pool options only" {
     }};
 
     var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
-    defer overrides.deinit();
+    defer overrides.dhcp_options.deinit();
 
     // Only pool option should be present
-    try std.testing.expectEqualStrings("pool-tftp", overrides.get("66").?);
-    try std.testing.expectEqual(@as(usize, 1), overrides.count());
+    try std.testing.expectEqualStrings("pool-tftp", overrides.dhcp_options.get("66").?);
+    try std.testing.expectEqual(@as(usize, 1), overrides.dhcp_options.count());
 }
 
 test "OFFER includes MTU option 26 as big-endian u16" {
