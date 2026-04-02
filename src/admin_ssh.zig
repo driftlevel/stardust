@@ -446,7 +446,7 @@ const LeaseRow = struct {
 
 const Tab = enum(u8) { leases = 0, stats = 1, pools = 2, settings = 3 };
 
-const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, pool_ds_edit, pool_route_edit, pool_option_edit, help, res_option_edit, option_lookup, pool_option_lookup };
+const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, pool_ds_edit, pool_route_edit, pool_option_edit, help, res_option_edit, option_lookup, pool_option_lookup, settings_confirm };
 
 const ReservationForm = struct {
     /// MAC of the lease being edited; empty string means "new reservation".
@@ -743,10 +743,7 @@ const TuiState = struct {
     // Settings tab.
     settings_row: u8 = 0,
     settings_scroll: u16 = 0,
-    settings_editing: bool = false, // true when editing a text field on settings tab
-    settings_buf: [64]u8 = [_]u8{0} ** 64,
-    settings_buf_len: usize = 0,
-    settings_cursor: usize = 0,
+    settings_cursor: usize = 0, // cursor position in the currently selected text field
     // Pending (dirty) values — applied on Enter, not immediately.
     settings_dirty: [SETTINGS_EDITABLE_COUNT]bool = [_]bool{false} ** SETTINGS_EDITABLE_COUNT,
     settings_pending_log_level: config_mod.LogLevel = .info,
@@ -758,6 +755,14 @@ const TuiState = struct {
     settings_pending_bind_len: usize = 0,
     settings_pending_random_alloc: bool = false,
     settings_needs_scroll: bool = false, // set by key handler, cleared after auto-scroll
+    // Validation error display.
+    settings_err_buf: [80]u8 = [_]u8{0} ** 80,
+    settings_err_len: usize = 0,
+    // Confirmation diff lines (populated before entering settings_confirm mode).
+    settings_confirm_buf: [512]u8 = [_]u8{0} ** 512,
+    settings_confirm_len: usize = 0,
+    settings_confirm_count: u8 = 0, // number of change lines
+    settings_confirm_port_warn: bool = false, // port < 1024 warning
     help_scroll: u16 = 0,
 };
 
@@ -990,6 +995,10 @@ fn runTui(
                         } else {
                             state.mode = .normal;
                         }
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .settings_confirm) {
+                        handleSettingsConfirmKey(server, &state, key);
                         continue :parse_loop;
                     }
                     if (state.mode == .res_option_edit) {
@@ -1293,7 +1302,7 @@ fn runTui(
                                 }
                             } else if (state.tab == .settings) {
                                 // Click on settings fields — map row to editable field.
-                                handleSettingsClick(&state, term_row, state.settings_scroll);
+                                handleSettingsClick(&state, server.cfg, term_row, state.settings_scroll);
                             }
                         },
                         .wheel_right => if (state.mode == .normal) {
@@ -1330,7 +1339,7 @@ fn runTui(
                             },
                             // All other modals: swallow scroll.
                             .help => state.help_scroll -|= 1,
-                            .delete_confirm, .pool_delete_confirm, .pool_ds_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_ds_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
@@ -1351,7 +1360,7 @@ fn runTui(
                                 if (state.form.active_field + 1 < state.form.totalFields()) state.form.active_field += 1;
                             },
                             .help => state.help_scroll +|= 1,
-                            .delete_confirm, .pool_delete_confirm, .pool_ds_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_ds_edit, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
                         },
                         else => {},
                     }
@@ -1457,6 +1466,7 @@ fn renderFrame(
         .help => renderHelp(state, win),
         .res_option_edit => try renderResOptionEdit(state, win, fa),
         .option_lookup => try renderOptionLookup(state, win, fa),
+        .settings_confirm => try renderSettingsConfirm(state, win, fa),
     }
 }
 
@@ -1503,7 +1513,7 @@ fn renderHeader(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
         .leases => "  /:filter  n:new  e:edit  d:delete",
         .stats => "",
         .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view" else "  /:filter  v:view  e:edit  n:new  d:del",
-        .settings => if (state.settings_editing) "  Esc:cancel  Enter:apply" else "  j/k:move  Space:toggle  Enter:apply & reload",
+        .settings => "  j/k:move  Space:toggle  Enter:review & save",
     };
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
@@ -3345,6 +3355,12 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
             const h: u16 = @min(win_h -| 2, 22);
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
+        .settings_confirm => {
+            const w: u16 = 56;
+            const warn_lines: u16 = if (state.settings_confirm_port_warn) 1 else 0;
+            const h: u16 = 6 + state.settings_confirm_count + warn_lines;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
         .normal => return .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     }
 }
@@ -4641,13 +4657,14 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     const dirty_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 60 } }, .bg = bg, .bold = true };
 
     // Edit indices (visual order): 0=log_level, 1=random_alloc, 2=collect, 3=http_enable, 4=http_port, 5=http_bind
+    // For text fields (4, 5), always show the pending buffer when dirty; otherwise show the live config value.
     const edit_vals = [SETTINGS_EDITABLE_COUNT][]const u8{
         if (state.settings_dirty[0]) @tagName(state.settings_pending_log_level) else @tagName(cfg.log_level),
         if (state.settings_dirty[1]) (if (state.settings_pending_random_alloc) "true" else "false") else (if (cfg.pool_allocation_random) "true" else "false"),
         if (state.settings_dirty[2]) (if (state.settings_pending_collect) "true" else "false") else (if (cfg.metrics.collect) "true" else "false"),
         if (state.settings_dirty[3]) (if (state.settings_pending_http_enable) "true" else "false") else (if (cfg.metrics.http_enable) "true" else "false"),
-        if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[4]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
-        if (state.settings_editing and state.settings_row == 5) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[5]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
+        if (state.settings_pending_port_len > 0 or state.settings_dirty[4]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
+        if (state.settings_pending_bind_len > 0 or state.settings_dirty[5]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
     };
 
     const LABEL_W: u16 = 24;
@@ -4751,7 +4768,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
 
         const is_editable = line.edit_idx != null and !read_only;
         const is_selected = is_editable and line.edit_idx.? == state.settings_row;
-        const is_editing_this = is_selected and state.settings_editing;
+        const is_text_field = is_selected and (line.edit_idx.? == 4 or line.edit_idx.? == 5);
 
         // Label with dirty indicator.
         const is_dirty = is_editable and state.settings_dirty[line.edit_idx.?];
@@ -4762,7 +4779,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
 
         // Value field.
         const field_w: u16 = if (win.width > LABEL_W + 4) win.width - LABEL_W - 4 else 10;
-        const style = if (is_editing_this) sel_style else if (is_selected) sel_style else if (is_editable) val_style else ro_style;
+        const style = if (is_selected) sel_style else if (is_editable) val_style else ro_style;
         const val = line.value;
         const val_trunc = val[0..@min(val.len, field_w)];
         const pad_n = field_w -| @as(u16, @intCast(val_trunc.len));
@@ -4771,8 +4788,8 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         _ = win.print(&.{.{ .text = val_trunc, .style = style }}, .{ .col_offset = LABEL_W + 2, .row_offset = dr, .wrap = .none });
         _ = win.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(val_trunc.len)), .row_offset = dr, .wrap = .none });
 
-        // Cursor for text editing.
-        if (is_editing_this and (state.settings_row == 3 or state.settings_row == 4)) {
+        // Cursor for text fields — always visible when selected (no editing mode needed).
+        if (is_text_field) {
             const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
             const cur = @min(state.settings_cursor, val.len);
             const ch: []const u8 = if (cur < val.len) val[cur..][0..1] else " ";
@@ -4780,15 +4797,21 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         }
 
         // Hint for selected editable field.
-        if (is_selected and !is_editing_this) {
+        if (is_selected and !is_text_field) {
             const hint = switch (line.edit_idx.?) {
                 0 => "  \xe2\x86\x90/\xe2\x86\x92 or Space: cycle",
-                1, 2, 5 => "  Space: toggle",
-                3, 4 => "  Enter: edit",
+                1, 2, 3 => "  Space: toggle",
                 else => "",
             };
             _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(val_trunc.len)) + pad_n, .row_offset = dr, .wrap = .none });
         }
+    }
+
+    // Validation error display.
+    if (state.settings_err_len > 0) {
+        const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = bg, .bold = true };
+        const err_row: u16 = if (win.height > 1) win.height - 1 else 0;
+        _ = win.print(&.{.{ .text = state.settings_err_buf[0..state.settings_err_len], .style = err_style }}, .{ .col_offset = 2, .row_offset = err_row, .wrap = .none });
     }
 }
 
@@ -4796,71 +4819,7 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     const cfg = server.cfg;
     const read_only = cfg.admin_ssh.read_only;
 
-    if (state.settings_editing) {
-        // Text editing mode (fields 4=port, 5=bind).
-        if (key.matches(vaxis.Key.escape, .{})) {
-            state.settings_editing = false;
-            return;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            // Store the edited value as pending (don't apply yet).
-            if (state.settings_row == 4) {
-                const n = @min(state.settings_buf_len, state.settings_pending_port_buf.len);
-                @memcpy(state.settings_pending_port_buf[0..n], state.settings_buf[0..n]);
-                state.settings_pending_port_len = n;
-                // Validate port.
-                const port_val = std.fmt.parseInt(u16, state.settings_buf[0..n], 10) catch {
-                    // Don't save invalid port — stay in editing mode.
-                    return;
-                };
-                if (port_val == 0) return;
-                // Compare against live config.
-                var live_buf: [6]u8 = undefined;
-                const live = std.fmt.bufPrint(&live_buf, "{d}", .{cfg.metrics.http_port}) catch "";
-                state.settings_dirty[4] = !std.mem.eql(u8, state.settings_pending_port_buf[0..n], live);
-            } else if (state.settings_row == 5) {
-                const n = @min(state.settings_buf_len, state.settings_pending_bind_buf.len);
-                @memcpy(state.settings_pending_bind_buf[0..n], state.settings_buf[0..n]);
-                state.settings_pending_bind_len = n;
-                // Validate bind address.
-                _ = config_mod.parseIpv4(state.settings_buf[0..n]) catch return; // stay in editing
-                state.settings_dirty[5] = !std.mem.eql(u8, state.settings_pending_bind_buf[0..n], cfg.metrics.http_bind);
-            }
-            state.settings_editing = false;
-            return;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (state.settings_cursor > 0 and state.settings_buf_len > 0) {
-                const pos = state.settings_cursor;
-                if (pos < state.settings_buf_len) {
-                    std.mem.copyForwards(u8, state.settings_buf[pos - 1 ..], state.settings_buf[pos..state.settings_buf_len]);
-                }
-                state.settings_buf_len -= 1;
-                state.settings_cursor -= 1;
-            }
-        } else if (key.matches(vaxis.Key.left, .{})) {
-            if (state.settings_cursor > 0) state.settings_cursor -= 1;
-        } else if (key.matches(vaxis.Key.right, .{})) {
-            if (state.settings_cursor < state.settings_buf_len) state.settings_cursor += 1;
-        } else if (key.matches(vaxis.Key.home, .{})) {
-            state.settings_cursor = 0;
-        } else if (key.matches(vaxis.Key.end, .{})) {
-            state.settings_cursor = state.settings_buf_len;
-        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
-            if (state.settings_buf_len < state.settings_buf.len) {
-                const pos = state.settings_cursor;
-                if (pos < state.settings_buf_len) {
-                    std.mem.copyBackwards(u8, state.settings_buf[pos + 1 ..], state.settings_buf[pos..state.settings_buf_len]);
-                }
-                state.settings_buf[pos] = @intCast(key.codepoint);
-                state.settings_buf_len += 1;
-                state.settings_cursor += 1;
-            }
-        }
-        return;
-    }
-
-    // Navigation mode.
+    // Read-only: only scroll.
     if (read_only) {
         if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) state.settings_scroll +|= 1;
         if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) state.settings_scroll -|= 1;
@@ -4869,32 +4828,61 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
 
     // Any key interaction should ensure the selected field is visible.
     state.settings_needs_scroll = true;
+    // Clear validation error on any key.
+    state.settings_err_len = 0;
 
+    const is_text_field = (state.settings_row == 4 or state.settings_row == 5);
+
+    // Text field: handle typing, backspace, cursor movement directly.
+    if (is_text_field) {
+        // Ensure the pending buffer is initialized from live config if not yet touched.
+        settingsInitPendingBuf(state, cfg);
+
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            settingsTextBackspace(state);
+            settingsMarkTextDirty(state, cfg);
+            return;
+        }
+        if (key.matches(vaxis.Key.home, .{})) {
+            state.settings_cursor = 0;
+            return;
+        }
+        if (key.matches(vaxis.Key.end, .{})) {
+            state.settings_cursor = settingsTextLen(state);
+            return;
+        }
+        // Left/right on text fields: move cursor (not toggle/cycle).
+        if (key.matches(vaxis.Key.left, .{})) {
+            if (state.settings_cursor > 0) state.settings_cursor -= 1;
+            return;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            if (state.settings_cursor < settingsTextLen(state)) state.settings_cursor += 1;
+            return;
+        }
+        // Printable ASCII: insert at cursor.
+        if (key.codepoint >= 0x20 and key.codepoint <= 0x7E and
+            !key.matches(vaxis.Key.enter, .{}) and !key.matches(' ', .{}))
+        {
+            settingsTextInsert(state, @intCast(key.codepoint));
+            settingsMarkTextDirty(state, cfg);
+            return;
+        }
+    }
+
+    // Navigation and toggle/cycle keys (shared between all field types).
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
+        const old_row = state.settings_row;
         if (state.settings_row + 1 < SETTINGS_EDITABLE_COUNT) state.settings_row += 1;
+        if (state.settings_row != old_row) settingsOnRowChange(state, cfg);
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        const old_row = state.settings_row;
         state.settings_row -|= 1;
-    } else if (key.matches(' ', .{}) or key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.right, .{})) {
-        // Toggle/cycle: update pending value, mark dirty.
+        if (state.settings_row != old_row) settingsOnRowChange(state, cfg);
+    } else if (key.matches(' ', .{})) {
+        // Space: toggle boolean fields, cycle log level.
         switch (state.settings_row) {
-            0 => {
-                const levels = [_]config_mod.LogLevel{ .err, .warn, .info, .verbose, .debug };
-                const cur = if (state.settings_dirty[0]) state.settings_pending_log_level else cfg.log_level;
-                var idx: usize = 0;
-                for (levels, 0..) |l, i| {
-                    if (l == cur) {
-                        idx = i;
-                        break;
-                    }
-                }
-                if (key.matches(vaxis.Key.left, .{})) {
-                    idx = if (idx == 0) levels.len - 1 else idx - 1;
-                } else {
-                    idx = (idx + 1) % levels.len;
-                }
-                state.settings_pending_log_level = levels[idx];
-                state.settings_dirty[0] = (levels[idx] != cfg.log_level);
-            },
+            0 => settingsCycleLogLevel(state, cfg, false),
             1 => {
                 const cur = if (state.settings_dirty[1]) state.settings_pending_random_alloc else cfg.pool_allocation_random;
                 state.settings_pending_random_alloc = !cur;
@@ -4912,8 +4900,14 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             },
             else => {},
         }
+    } else if (!is_text_field and (key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.right, .{}))) {
+        // Left/right on non-text fields: cycle log level.
+        if (state.settings_row == 0) {
+            settingsCycleLogLevel(state, cfg, key.matches(vaxis.Key.left, .{}));
+        }
     } else if (key.matches(vaxis.Key.enter, .{})) {
-        // If any fields are dirty, apply all and reload.
+        // Validate text fields, then show confirmation diff if any fields are dirty.
+        if (!settingsValidate(state, cfg)) return;
         var any_dirty = false;
         for (state.settings_dirty) |d| {
             if (d) {
@@ -4921,33 +4915,278 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                 break;
             }
         }
-        if (any_dirty) {
-            settingsApplyAndReload(server, state);
-            return;
+        if (!any_dirty) return;
+        // Build confirmation diff and switch to settings_confirm mode.
+        settingsBuildConfirm(state, cfg);
+        state.mode = .settings_confirm;
+    } else if (key.matches(vaxis.Key.escape, .{})) {
+        // Discard all pending changes.
+        state.settings_dirty = [_]bool{false} ** SETTINGS_EDITABLE_COUNT;
+        state.settings_pending_port_len = 0;
+        state.settings_pending_bind_len = 0;
+        state.settings_cursor = 0;
+        state.settings_err_len = 0;
+    }
+}
+
+/// Cycle log level forward or backward.
+fn settingsCycleLogLevel(state: *TuiState, cfg: *config_mod.Config, backward: bool) void {
+    const levels = [_]config_mod.LogLevel{ .err, .warn, .info, .verbose, .debug };
+    const cur = if (state.settings_dirty[0]) state.settings_pending_log_level else cfg.log_level;
+    var idx: usize = 0;
+    for (levels, 0..) |l, i| {
+        if (l == cur) {
+            idx = i;
+            break;
         }
-        // If nothing dirty but on a text field, enter editing.
-        if (state.settings_row == 4) {
-            const src = if (state.settings_dirty[4]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else std.fmt.bufPrint(&state.settings_buf, "{d}", .{cfg.metrics.http_port}) catch "";
-            if (!state.settings_dirty[4]) {
-                state.settings_buf_len = src.len;
-            } else {
-                @memcpy(state.settings_buf[0..src.len], src);
-                state.settings_buf_len = src.len;
-            }
-            state.settings_cursor = state.settings_buf_len;
-            state.settings_editing = true;
-        } else if (state.settings_row == 5) {
-            const src = if (state.settings_dirty[5]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind;
-            const n = @min(src.len, state.settings_buf.len);
-            @memcpy(state.settings_buf[0..n], src[0..n]);
-            state.settings_buf_len = n;
+    }
+    if (backward) {
+        idx = if (idx == 0) levels.len - 1 else idx - 1;
+    } else {
+        idx = (idx + 1) % levels.len;
+    }
+    state.settings_pending_log_level = levels[idx];
+    state.settings_dirty[0] = (levels[idx] != cfg.log_level);
+}
+
+/// Get the length of the currently active text field's pending buffer.
+fn settingsTextLen(state: *const TuiState) usize {
+    return if (state.settings_row == 4) state.settings_pending_port_len else state.settings_pending_bind_len;
+}
+
+/// Initialize the pending buffer for the current text field from the live config,
+/// if it hasn't been touched yet (not dirty and pending len is 0).
+fn settingsInitPendingBuf(state: *TuiState, cfg: *const config_mod.Config) void {
+    if (state.settings_row == 4) {
+        if (!state.settings_dirty[4] and state.settings_pending_port_len == 0) {
+            const n = (std.fmt.bufPrint(&state.settings_pending_port_buf, "{d}", .{cfg.metrics.http_port}) catch "").len;
+            state.settings_pending_port_len = n;
             state.settings_cursor = n;
-            state.settings_editing = true;
+        }
+    } else if (state.settings_row == 5) {
+        if (!state.settings_dirty[5] and state.settings_pending_bind_len == 0) {
+            const src = cfg.metrics.http_bind;
+            const n = @min(src.len, state.settings_pending_bind_buf.len);
+            @memcpy(state.settings_pending_bind_buf[0..n], src[0..n]);
+            state.settings_pending_bind_len = n;
+            state.settings_cursor = n;
         }
     }
 }
 
-fn handleSettingsClick(state: *TuiState, term_row: u16, scroll: u16) void {
+/// When the selected row changes to a text field, initialize its pending buffer
+/// and set the cursor to the end.
+fn settingsOnRowChange(state: *TuiState, cfg: *const config_mod.Config) void {
+    if (state.settings_row == 4 or state.settings_row == 5) {
+        settingsInitPendingBuf(state, cfg);
+        state.settings_cursor = settingsTextLen(state);
+    }
+}
+
+/// Backspace in the current text field's pending buffer.
+fn settingsTextBackspace(state: *TuiState) void {
+    if (state.settings_row == 4) {
+        if (state.settings_cursor > 0 and state.settings_pending_port_len > 0) {
+            const pos = state.settings_cursor;
+            if (pos < state.settings_pending_port_len) {
+                std.mem.copyForwards(u8, state.settings_pending_port_buf[pos - 1 ..], state.settings_pending_port_buf[pos..state.settings_pending_port_len]);
+            }
+            state.settings_pending_port_len -= 1;
+            state.settings_cursor -= 1;
+        }
+    } else if (state.settings_row == 5) {
+        if (state.settings_cursor > 0 and state.settings_pending_bind_len > 0) {
+            const pos = state.settings_cursor;
+            if (pos < state.settings_pending_bind_len) {
+                std.mem.copyForwards(u8, state.settings_pending_bind_buf[pos - 1 ..], state.settings_pending_bind_buf[pos..state.settings_pending_bind_len]);
+            }
+            state.settings_pending_bind_len -= 1;
+            state.settings_cursor -= 1;
+        }
+    }
+}
+
+/// Insert a character at the cursor in the current text field's pending buffer.
+fn settingsTextInsert(state: *TuiState, ch: u8) void {
+    if (state.settings_row == 4) {
+        if (state.settings_pending_port_len < state.settings_pending_port_buf.len) {
+            const pos = state.settings_cursor;
+            if (pos < state.settings_pending_port_len) {
+                std.mem.copyBackwards(u8, state.settings_pending_port_buf[pos + 1 ..], state.settings_pending_port_buf[pos..state.settings_pending_port_len]);
+            }
+            state.settings_pending_port_buf[pos] = ch;
+            state.settings_pending_port_len += 1;
+            state.settings_cursor += 1;
+        }
+    } else if (state.settings_row == 5) {
+        if (state.settings_pending_bind_len < state.settings_pending_bind_buf.len) {
+            const pos = state.settings_cursor;
+            if (pos < state.settings_pending_bind_len) {
+                std.mem.copyBackwards(u8, state.settings_pending_bind_buf[pos + 1 ..], state.settings_pending_bind_buf[pos..state.settings_pending_bind_len]);
+            }
+            state.settings_pending_bind_buf[pos] = ch;
+            state.settings_pending_bind_len += 1;
+            state.settings_cursor += 1;
+        }
+    }
+}
+
+/// Compare the pending text field value against live config and set/clear dirty flag.
+fn settingsMarkTextDirty(state: *TuiState, cfg: *const config_mod.Config) void {
+    if (state.settings_row == 4) {
+        var live_buf: [6]u8 = undefined;
+        const live = std.fmt.bufPrint(&live_buf, "{d}", .{cfg.metrics.http_port}) catch "";
+        state.settings_dirty[4] = !std.mem.eql(u8, state.settings_pending_port_buf[0..state.settings_pending_port_len], live);
+    } else if (state.settings_row == 5) {
+        state.settings_dirty[5] = !std.mem.eql(u8, state.settings_pending_bind_buf[0..state.settings_pending_bind_len], cfg.metrics.http_bind);
+    }
+}
+
+/// Validate text fields. Returns true if valid, false if not (sets error message).
+fn settingsValidate(state: *TuiState, cfg: *const config_mod.Config) bool {
+    _ = cfg;
+    // Validate port (field 4) if dirty.
+    if (state.settings_dirty[4]) {
+        const port_str = state.settings_pending_port_buf[0..state.settings_pending_port_len];
+        const port_val = std.fmt.parseInt(u16, port_str, 10) catch {
+            const msg = "Invalid port: must be a number 1-65535";
+            @memcpy(state.settings_err_buf[0..msg.len], msg);
+            state.settings_err_len = msg.len;
+            return false;
+        };
+        if (port_val == 0) {
+            const msg = "Invalid port: must be a number 1-65535";
+            @memcpy(state.settings_err_buf[0..msg.len], msg);
+            state.settings_err_len = msg.len;
+            return false;
+        }
+    }
+    // Validate bind address (field 5) if dirty.
+    if (state.settings_dirty[5]) {
+        _ = config_mod.parseIpv4(state.settings_pending_bind_buf[0..state.settings_pending_bind_len]) catch {
+            const msg = "Invalid bind address: must be a valid IPv4 address";
+            const n = @min(msg.len, state.settings_err_buf.len);
+            @memcpy(state.settings_err_buf[0..n], msg[0..n]);
+            state.settings_err_len = n;
+            return false;
+        };
+    }
+    return true;
+}
+
+/// Build the confirmation diff text into settings_confirm_buf.
+fn settingsBuildConfirm(state: *TuiState, cfg: *const config_mod.Config) void {
+    var buf: []u8 = &state.settings_confirm_buf;
+    var pos: usize = 0;
+    var count: u8 = 0;
+    var port_warn = false;
+
+    if (state.settings_dirty[0]) {
+        const line = std.fmt.bufPrint(buf[pos..], "Log Level: {s} -> {s}\n", .{
+            @tagName(cfg.log_level), @tagName(state.settings_pending_log_level),
+        }) catch "";
+        pos += line.len;
+        count += 1;
+    }
+    if (state.settings_dirty[1]) {
+        const old = if (cfg.pool_allocation_random) "true" else "false";
+        const new = if (state.settings_pending_random_alloc) "true" else "false";
+        const line = std.fmt.bufPrint(buf[pos..], "Random IP Allocation: {s} -> {s}\n", .{ old, new }) catch "";
+        pos += line.len;
+        count += 1;
+    }
+    if (state.settings_dirty[2]) {
+        const old = if (cfg.metrics.collect) "true" else "false";
+        const new = if (state.settings_pending_collect) "true" else "false";
+        const line = std.fmt.bufPrint(buf[pos..], "Metrics Collect: {s} -> {s}\n", .{ old, new }) catch "";
+        pos += line.len;
+        count += 1;
+    }
+    if (state.settings_dirty[3]) {
+        const old = if (cfg.metrics.http_enable) "true" else "false";
+        const new = if (state.settings_pending_http_enable) "true" else "false";
+        const line = std.fmt.bufPrint(buf[pos..], "HTTP Enable: {s} -> {s}\n", .{ old, new }) catch "";
+        pos += line.len;
+        count += 1;
+    }
+    if (state.settings_dirty[4]) {
+        const port_str = state.settings_pending_port_buf[0..state.settings_pending_port_len];
+        var old_buf: [6]u8 = undefined;
+        const old = std.fmt.bufPrint(&old_buf, "{d}", .{cfg.metrics.http_port}) catch "";
+        const line = std.fmt.bufPrint(buf[pos..], "HTTP Port: {s} -> {s}\n", .{ old, port_str }) catch "";
+        pos += line.len;
+        count += 1;
+        // Check if new port < 1024.
+        const port_val = std.fmt.parseInt(u16, port_str, 10) catch 0;
+        if (port_val > 0 and port_val < 1024) port_warn = true;
+    }
+    if (state.settings_dirty[5]) {
+        const bind_str = state.settings_pending_bind_buf[0..state.settings_pending_bind_len];
+        const line = std.fmt.bufPrint(buf[pos..], "HTTP Bind: {s} -> {s}\n", .{ cfg.metrics.http_bind, bind_str }) catch "";
+        pos += line.len;
+        count += 1;
+    }
+
+    state.settings_confirm_len = pos;
+    state.settings_confirm_count = count;
+    state.settings_confirm_port_warn = port_warn;
+}
+
+fn renderSettingsConfirm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const bg: vaxis.Color = .{ .rgb = .{ 20, 20, 30 } };
+    const BOX_W: u16 = 56;
+    const warn_lines: u16 = if (state.settings_confirm_port_warn) 1 else 0;
+    const BOX_H: u16 = 6 + @as(u16, state.settings_confirm_count) + warn_lines;
+    if (win.width < BOX_W or win.height < BOX_H) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height - BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
+
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = bg };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg, .bold = true };
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = bg, .bold = true };
+    const change_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 180, 60 } }, .bg = bg };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = bg };
+    const warn_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 100, 100 } }, .bg = bg };
+
+    _ = box.print(&.{.{ .text = " Apply Settings? ", .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    // Render each change line from the pre-built buffer.
+    var row: u16 = 2;
+    const confirm_text = state.settings_confirm_buf[0..state.settings_confirm_len];
+    var line_iter = std.mem.splitScalar(u8, confirm_text, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const display = try std.fmt.allocPrint(fa, "   {s}", .{line});
+        _ = box.print(&.{.{ .text = display, .style = change_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+
+    // Port < 1024 warning.
+    if (state.settings_confirm_port_warn) {
+        _ = box.print(&.{.{ .text = "   Port < 1024 requires privileged access", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+
+    // Action hints.
+    _ = box.print(&.{.{ .text = "  Config will be saved and reloaded.", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
+    _ = box.print(&.{.{ .text = "  Y: confirm  N/Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+}
+
+fn handleSettingsConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+        settingsApplyAndReload(server, state);
+        state.mode = .normal;
+    } else if (key.matches('n', .{}) or key.matches('N', .{}) or key.matches(vaxis.Key.escape, .{})) {
+        // Go back to settings tab (keep dirty values).
+        state.mode = .normal;
+    }
+}
+
+fn handleSettingsClick(state: *TuiState, cfg: *const config_mod.Config, term_row: u16, scroll: u16) void {
     // The settings lines are rendered with row offset = line_index - scroll.
     // The body starts at row 1 (below header). So the clicked line index is
     // term_row - 1 + scroll.
@@ -4968,8 +5207,10 @@ fn handleSettingsClick(state: *TuiState, term_row: u16, scroll: u16) void {
     };
     for (field_map) |fm| {
         if (line_idx == fm.line) {
+            const old_row = state.settings_row;
             state.settings_row = fm.edit;
             state.settings_needs_scroll = true;
+            if (state.settings_row != old_row) settingsOnRowChange(state, cfg);
             return;
         }
     }
@@ -4988,8 +5229,12 @@ fn settingsApplyAndReload(server: *AdminServer, state: *TuiState) void {
     if (state.settings_dirty[5]) {
         replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), state.settings_pending_bind_buf[0..state.settings_pending_bind_len]);
     }
-    // Clear dirty flags.
+    // Clear dirty flags and pending buffer lengths so re-entry re-initializes from live config.
     state.settings_dirty = [_]bool{false} ** SETTINGS_EDITABLE_COUNT;
+    state.settings_pending_port_len = 0;
+    state.settings_pending_bind_len = 0;
+    state.settings_cursor = 0;
+    state.settings_err_len = 0;
     // Save and reload.
     config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch return;
     triggerReload(state);
