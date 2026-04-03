@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.3-alpha1 (2026-04-03)
+
+### Per-Pool Sync Protocol (v2)
+
+Major rewrite of the lease synchronization protocol:
+
+- **Per-pool hashes**: Each pool is independently hashed and compared across peers, replacing the single global hash
+- **Majority-voting conflict resolution**: When pool configs differ, the majority hash wins; ties broken by lowest IP. Losing pools are atomically disabled (stop serving DHCP)
+- **Decoupled authentication**: Peers authenticate on group name + shared secret only; pool hashes determine which pools sync, not whether peers talk
+- **Startup sync wait**: Waits up to 5 seconds for peer responses before serving, preventing split-brain on startup
+- **HELLO v2 wire format**: Carries per-pool subnet/prefix/hash entries; v1 peers rejected with version_mismatch NAK
+- **TUI indicator**: Disabled pools show "CONFIG MISMATCH, DISABLED" in bold red on the Pools tab
+
+### Per-Pool Structured MAC Classes
+
+MAC classes moved from global config to per-pool, with expanded structured field overrides:
+
+- **First-class field overrides**: router, domain_name, domain_search, dns_servers, ntp_servers, log_servers, wins_servers, time_offset, tftp_servers, boot_filename, http_boot_url, static_routes
+- **Priority**: pool defaults → MAC class (specificity ordered) → reservation
+- **TUI editor**: Scrollable sub-modal with inline [+] Add entries for multi-value fields, 3-level modal stack (pool → MAC class → server/route/option editor)
+- **`collectOverrides` returns `OverrideResult`**: Typed first-class fields with proper encoding (binary i32 for time_offset, DNS wire format for domain_search, etc.)
+- **Duplicate option prevention**: `isFirstClassOverrideActive` filter prevents MAC class dhcp_options from conflicting with first-class field overrides
+
+### Server List Rework
+
+Converted DNS, NTP, Log, WINS, and TFTP server fields to inline [+] Add entries:
+
+- **DNS Servers**: max 8, order matters, +/- reorder keys, auto-populates DNS Update Server
+- **NTP Servers**: max 4, randomized per-client (xid-seeded Fisher-Yates shuffle)
+- **Log Servers**: max 4, randomized per-client
+- **WINS Servers**: max 2, randomized per-client
+- **TFTP Servers**: max 4, order matters (merged from tftp_server_name + cisco_tftp_servers)
+- **Domain name resolution**: All server fields accept domain names; resolved to IPv4 at DHCP response time via getaddrinfo with 32-entry LRU cache (60s TTL)
+
+### DHCPFORCERENEW (RFC 3203 + RFC 6704)
+
+- **FORCERENEW**: Sent to clients when pool config changes, reservations are modified, or leases are force-released
+- **Nonce authentication (RFC 6704)**: DHCPACK includes option 145 (16-byte crypto-random nonce); FORCERENEW includes option 90 (HMAC-MD5 authentication)
+- **Graceful fallback**: Pre-existing leases without nonces receive unauthenticated FORCERENEW
+
+### DHCP Leasequery (RFC 4388 + RFC 6148)
+
+- **Query types**: by IP address, MAC address, client identifier, or relay agent information
+- **Response types**: DHCPLEASEACTIVE (with lease time, CLTT, subnet mask, router), DHCPLEASEUNASSIGNED, DHCPLEASEUNKNOWN
+
+### Pool Form Rework
+
+- **Unified layout system**: `pool_layout` array drives rendering, scroll, click handling, and navigation in visual order — sections and inline entries interleave naturally
+- **Comprehensive validation**: All fields validated on save with per-character input filtering
+- **Config validation on load**: `validatePoolFields` mirrors TUI validation for config.yaml
+
+### Backend Counters
+
+New stats tab section: SSH Attempts/Logins/Failures, Sync Full/Lease events, FORCERENEW, LEASEQUERY
+
+### Pool Hash Coverage
+
+`computePoolHash` now covers ALL pool fields: server lists, domain settings, DNS update config, DHCP options, per-reservation options, MAC classes with all structured fields
+
+### Bug Fixes (30 total across 5 audit rounds)
+
+Critical fixes:
+- Use-after-free in DHCP RELEASE handling
+- Buffer overflow in leasequery response builder
+- DNS resolve cache hash collision (wrong IP returned)
+- `addLeaseUnlocked` data loss on OOM (old lease freed before new allocation)
+- `signTsig` buffer overflow with long key names
+- String literal free in 7 array field parsing paths
+- `last_modified` not restored from persisted JSON (broke sync conflict resolution after restart)
+
+See AUDIT.md for the complete list of all 30 fixes with severity ratings.
+
+### Other
+
+- Migrated to driftlevel GitHub organization
+- /31 subnet capacity fixed (RFC 3021)
+- DNS label length validated (≤63 per RFC 1035)
+- Router at subnet/broadcast address rejected
+- ~400 unit tests across all modules
+
+---
+
 ## v0.2-alpha2 (2026-04-01)
 
 ### New DHCP Options
