@@ -671,6 +671,10 @@ pub const Counters = struct {
     decline_mac_blocked: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     decline_global_limited: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     decline_refused: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // SSH backend counters
+    ssh_attempts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    ssh_logins: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    ssh_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const DHCPServer = struct {

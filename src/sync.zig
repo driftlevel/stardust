@@ -90,6 +90,9 @@ pub const SyncManager = struct {
     /// Atomically-maintained count of currently authenticated peers.
     /// Safe to read from any thread (e.g. the SSH TUI) without a lock.
     authenticated_count: std.atomic.Value(u32),
+    /// Sync event counters (read atomically by SSH TUI stats tab).
+    sync_full_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sync_lease_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     const max_peers = 8;
     const keepalive_interval_s: i64 = 30;
@@ -510,9 +513,12 @@ pub const SyncManager = struct {
                 sent += 1;
             }
         }
-        if (sent > 0) log_v.debug("sync: sent lease update {s} ({s}) to {d} peer(s)", .{
-            lease.ip, lease.mac, sent,
-        });
+        if (sent > 0) {
+            _ = self.sync_lease_events.fetchAdd(1, .monotonic);
+            log_v.debug("sync: sent lease update {s} ({s}) to {d} peer(s)", .{
+                lease.ip, lease.mac, sent,
+            });
+        }
     }
 
     /// Notify all authenticated peers that a lease was deleted (by MAC string).
@@ -959,6 +965,7 @@ pub const SyncManager = struct {
             defer self.allocator.free(json);
             self.sendMsg(peer.addr, .lease_update, json);
         }
+        _ = self.sync_full_events.fetchAdd(1, .monotonic);
         const octets = peerIpOctets(peer);
         log_v.debug("sync: full dump sent to {d}.{d}.{d}.{d}: {d} lease(s)", .{
             octets[0], octets[1], octets[2], octets[3], list.len,
