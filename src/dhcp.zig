@@ -2834,6 +2834,33 @@ pub const DHCPServer = struct {
             // Query by client identifier (option 61).
             lease = self.store.getLeaseByClientId(client_id.?);
             query_desc = "ClientID";
+        } else if (getOption(request, .RelayAgentInformation) != null and
+            !std.mem.eql(u8, &req_header.giaddr, &zero_ip))
+        {
+            // RFC 6148: Query by relay agent information.
+            // Find the first active lease in the relay's subnet (matched via giaddr).
+            const gi_int = std.mem.readInt(u32, &req_header.giaddr, .big);
+            for (self.cfg.pools) |*pool| {
+                const s = config_mod.parseIpv4(pool.subnet) catch continue;
+                const s_int = std.mem.readInt(u32, &s, .big);
+                if ((gi_int & pool.subnet_mask) == (s_int & pool.subnet_mask)) {
+                    // Found the pool for this relay — scan leases for an active one.
+                    const all = self.store.listLeases() catch break;
+                    defer self.allocator.free(all);
+                    const now = std.time.timestamp();
+                    for (all) |l| {
+                        if (l.expires <= now) continue;
+                        const lip = config_mod.parseIpv4(l.ip) catch continue;
+                        const lip_int = std.mem.readInt(u32, &lip, .big);
+                        if ((lip_int & pool.subnet_mask) == (s_int & pool.subnet_mask)) {
+                            lease = l;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            query_desc = "relay agent info";
         } else {
             return null; // No valid query field
         }
