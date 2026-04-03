@@ -35,6 +35,10 @@ pub const MessageType = enum(u8) {
     DHCPRELEASE = 7,
     DHCPINFORM = 8,
     DHCPFORCERENEW = 9,
+    DHCPLEASEQUERY = 10,
+    DHCPLEASEUNASSIGNED = 11,
+    DHCPLEASEUNKNOWN = 12,
+    DHCPLEASEACTIVE = 13,
     _,
 };
 
@@ -97,6 +101,7 @@ pub const OptionCode = enum(u8) {
     TftpServerName = 66,
     BootFileName = 67,
     Authentication = 90, // RFC 3118 / RFC 6704
+    ClientLastTransactionTime = 91, // RFC 4388
     RelayAgentInformation = 82,
     DomainSearch = 119,
     ClasslessStaticRoutes = 121, // RFC 3442
@@ -669,6 +674,7 @@ pub const Counters = struct {
     decline: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inform: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     forcerenew: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    leasequery: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Defense / security event counters
     probe_conflict: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     decline_ip_quarantined: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1337,6 +1343,10 @@ pub const DHCPServer = struct {
             .DHCPINFORM => {
                 _ = self.counters.inform.fetchAdd(1, .monotonic);
                 return self.handleInform(packet);
+            },
+            .DHCPLEASEQUERY => {
+                _ = self.counters.leasequery.fetchAdd(1, .monotonic);
+                return self.handleLeaseQuery(packet);
             },
             else => return null,
         }
@@ -2778,6 +2788,204 @@ pub const DHCPServer = struct {
         });
 
         return pkt;
+    }
+
+    // ---------------------------------------------------------------------------
+    // RFC 4388 — DHCP Leasequery
+    // ---------------------------------------------------------------------------
+
+    /// Handle an inbound DHCPLEASEQUERY (message type 10).
+    /// Determines the query type from the request fields, looks up the lease,
+    /// and returns a DHCPLEASEACTIVE, DHCPLEASEUNASSIGNED, or DHCPLEASEUNKNOWN response.
+    fn handleLeaseQuery(self: *Self, request: []const u8) !?[]u8 {
+        if (request.len < dhcp_min_packet_size) return null;
+        const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
+
+        // Determine query type from request fields.
+        const zero_mac = [6]u8{ 0, 0, 0, 0, 0, 0 };
+        const zero_ip = [4]u8{ 0, 0, 0, 0 };
+        const has_ciaddr = !std.mem.eql(u8, &req_header.ciaddr, &zero_ip);
+        const has_chaddr = !std.mem.eql(u8, req_header.chaddr[0..6], &zero_mac);
+        const client_id = getOption(request, .ClientID);
+
+        // Look up the lease based on query type.
+        var lease: ?state_mod.Lease = null;
+        var query_desc: []const u8 = "unknown";
+
+        if (has_ciaddr) {
+            // Query by IP address.
+            var ip_buf: [16]u8 = undefined;
+            const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+                req_header.ciaddr[0], req_header.ciaddr[1],
+                req_header.ciaddr[2], req_header.ciaddr[3],
+            }) catch return null;
+            lease = self.store.getLeaseByIp(ip_str);
+            query_desc = "IP";
+        } else if (has_chaddr) {
+            // Query by MAC address.
+            var mac_buf: [17]u8 = undefined;
+            const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                req_header.chaddr[0], req_header.chaddr[1], req_header.chaddr[2],
+                req_header.chaddr[3], req_header.chaddr[4], req_header.chaddr[5],
+            }) catch return null;
+            lease = self.store.getLeaseByMac(mac_str);
+            query_desc = "MAC";
+        } else if (client_id != null) {
+            // Query by client identifier (option 61).
+            lease = self.store.getLeaseByClientId(client_id.?);
+            query_desc = "ClientID";
+        } else {
+            return null; // No valid query field
+        }
+
+        // Log the query source.
+        const gi = req_header.giaddr;
+        std.log.info("LEASEQUERY from {d}.{d}.{d}.{d} by {s}: {s}", .{
+            gi[0],      gi[1],                                        gi[2], gi[3],
+            query_desc, if (lease != null) "active" else "not found",
+        });
+
+        // Active lease found — respond with DHCPLEASEACTIVE.
+        if (lease) |l| {
+            return self.buildLeaseQueryResponse(req_header, .DHCPLEASEACTIVE, l);
+        }
+
+        // No active lease. Check if IP is in any pool (for query-by-IP).
+        if (has_ciaddr) {
+            const ip_int = std.mem.readInt(u32, &req_header.ciaddr, .big);
+            for (self.cfg.pools) |*pool| {
+                const s = config_mod.parseIpv4(pool.subnet) catch continue;
+                const s_int = std.mem.readInt(u32, &s, .big);
+                if ((ip_int & pool.subnet_mask) == (s_int & pool.subnet_mask)) {
+                    // IP is in a pool but not leased — DHCPLEASEUNASSIGNED.
+                    return self.buildLeaseQueryResponse(req_header, .DHCPLEASEUNASSIGNED, null);
+                }
+            }
+        }
+
+        // IP not in any pool, or MAC/client_id has no active lease — DHCPLEASEUNKNOWN.
+        return self.buildLeaseQueryResponse(req_header, .DHCPLEASEUNKNOWN, null);
+    }
+
+    /// Build a leasequery response packet (DHCPLEASEACTIVE, DHCPLEASEUNASSIGNED,
+    /// or DHCPLEASEUNKNOWN). Caller owns the returned allocation.
+    fn buildLeaseQueryResponse(
+        self: *Self,
+        req_header: *const DHCPHeader,
+        msg_type: MessageType,
+        lease: ?state_mod.Lease,
+    ) !?[]u8 {
+        var resp = try self.allocator.alloc(u8, 576);
+        @memset(resp, 0);
+
+        const hdr: *DHCPHeader = @ptrCast(@alignCast(resp.ptr));
+        hdr.op = 2; // BOOTREPLY
+        hdr.htype = req_header.htype;
+        hdr.hlen = req_header.hlen;
+        hdr.xid = req_header.xid;
+        hdr.magic = dhcp_magic_cookie;
+        @memcpy(&hdr.giaddr, &req_header.giaddr); // copy for relay routing
+
+        var opts_len: usize = dhcp_min_packet_size;
+
+        // Option 53: Message Type
+        resp[opts_len] = @intFromEnum(OptionCode.MessageType);
+        resp[opts_len + 1] = 1;
+        resp[opts_len + 2] = @intFromEnum(msg_type);
+        opts_len += 3;
+
+        // Option 54: Server Identifier
+        resp[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
+        resp[opts_len + 1] = 4;
+        @memcpy(resp[opts_len + 2 .. opts_len + 6], &self.server_ip);
+        opts_len += 6;
+
+        if (msg_type == .DHCPLEASEACTIVE) {
+            if (lease) |l| {
+                // Set ciaddr and chaddr from the lease.
+                const lip = config_mod.parseIpv4(l.ip) catch [4]u8{ 0, 0, 0, 0 };
+                @memcpy(&hdr.ciaddr, &lip);
+
+                // Parse and set MAC in chaddr.
+                if (l.mac.len == 17) {
+                    for (0..6) |bi| {
+                        hdr.chaddr[bi] = std.fmt.parseInt(u8, l.mac[bi * 3 .. bi * 3 + 2], 16) catch 0;
+                    }
+                }
+
+                // Option 51: Lease time remaining (seconds until expiry).
+                const now = std.time.timestamp();
+                const remaining: u32 = if (l.expires > now)
+                    @intCast(@min(l.expires - now, std.math.maxInt(u32)))
+                else
+                    0;
+                resp[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+                resp[opts_len + 1] = 4;
+                std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], remaining, .big);
+                opts_len += 6;
+
+                // Option 91: Client Last Transaction Time (seconds since last DHCP interaction).
+                const cltt: u32 = if (l.last_modified > 0 and now > l.last_modified)
+                    @intCast(@min(now - l.last_modified, std.math.maxInt(u32)))
+                else
+                    0;
+                resp[opts_len] = @intFromEnum(OptionCode.ClientLastTransactionTime);
+                resp[opts_len + 1] = 4;
+                std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], cltt, .big);
+                opts_len += 6;
+
+                // Option 1: Subnet Mask (from matching pool).
+                for (self.cfg.pools) |*pool| {
+                    const s = config_mod.parseIpv4(pool.subnet) catch continue;
+                    const s_int = std.mem.readInt(u32, &s, .big);
+                    const lip_int = std.mem.readInt(u32, &lip, .big);
+                    if ((lip_int & pool.subnet_mask) == (s_int & pool.subnet_mask)) {
+                        // Subnet mask
+                        resp[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+                        resp[opts_len + 1] = 4;
+                        std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], pool.subnet_mask, .big);
+                        opts_len += 6;
+                        // Router
+                        const rip = config_mod.parseIpv4(pool.router) catch break;
+                        resp[opts_len] = @intFromEnum(OptionCode.Router);
+                        resp[opts_len + 1] = 4;
+                        @memcpy(resp[opts_len + 2 .. opts_len + 6], &rip);
+                        opts_len += 6;
+                        break;
+                    }
+                }
+
+                // Option 12: Hostname (if available).
+                if (l.hostname) |hn| {
+                    if (hn.len > 0 and hn.len <= 255) {
+                        resp[opts_len] = @intFromEnum(OptionCode.HostName);
+                        resp[opts_len + 1] = @intCast(hn.len);
+                        @memcpy(resp[opts_len + 2 .. opts_len + 2 + hn.len], hn);
+                        opts_len += 2 + hn.len;
+                    }
+                }
+
+                // Option 61: Client ID (if available).
+                if (l.client_id) |cid| {
+                    if (cid.len > 0 and cid.len <= 255) {
+                        resp[opts_len] = @intFromEnum(OptionCode.ClientID);
+                        resp[opts_len + 1] = @intCast(cid.len);
+                        @memcpy(resp[opts_len + 2 .. opts_len + 2 + cid.len], cid);
+                        opts_len += 2 + cid.len;
+                    }
+                }
+            }
+        } else {
+            // For DHCPLEASEUNASSIGNED/DHCPLEASEUNKNOWN, copy the queried fields from the request.
+            @memcpy(&hdr.ciaddr, &req_header.ciaddr);
+            @memcpy(hdr.chaddr[0..16], req_header.chaddr[0..16]);
+        }
+
+        // End option
+        resp[opts_len] = @intFromEnum(OptionCode.End);
+        opts_len += 1;
+
+        return resp[0..opts_len];
     }
 };
 

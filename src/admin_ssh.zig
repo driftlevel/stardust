@@ -2161,11 +2161,11 @@ fn renderStatsTab(
 
     // Compute total content height:
     //   1 (blank) + 1 (pool header) + 3 * n_pools (label + bar + blank) +
-    //   1 (DHCP header) + 8 (DHCP counters) +
+    //   1 (DHCP header) + 10 (DHCP counters) +
     //   1 (blank) + 1 (defense header) + 5 (defense counters) +
     //   1 (blank) + 1 (backend header) + 5 (backend counters) + 1 (trailing blank)
     const n_pools: u16 = @intCast(server.cfg.pools.len);
-    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 8 + 1 + 1 + 5 + 1 + 1 + 5 + 1;
+    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 10 + 1 + 1 + 5 + 1 + 1 + 5 + 1;
 
     // Clamp scroll so we never scroll past the last line of content.
     const max_scroll: u16 = if (total_rows > win.height) total_rows - win.height else 0;
@@ -2250,6 +2250,7 @@ fn renderStatsTab(
         .{ .label = "DECLINE ", .val = ctr.decline.load(.monotonic) },
         .{ .label = "INFORM  ", .val = ctr.inform.load(.monotonic) },
         .{ .label = "FORCERNW", .val = ctr.forcerenew.load(.monotonic) },
+        .{ .label = "LEASEQRY", .val = ctr.leasequery.load(.monotonic) },
     };
 
     for (counter_lines) |cl| {

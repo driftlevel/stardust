@@ -173,6 +173,7 @@ pub const MetricsServer = struct {
         try w.print("stardust_dhcp_packets_total{{type=\"release\"}} {d}\n", .{self.counters.release.load(.monotonic)});
         try w.print("stardust_dhcp_packets_total{{type=\"decline\"}} {d}\n", .{self.counters.decline.load(.monotonic)});
         try w.print("stardust_dhcp_packets_total{{type=\"inform\"}} {d}\n", .{self.counters.inform.load(.monotonic)});
+        try w.print("stardust_dhcp_packets_total{{type=\"leasequery\"}} {d}\n", .{self.counters.leasequery.load(.monotonic)});
 
         // Server uptime
         try w.writeAll("\n# HELP stardust_uptime_seconds Seconds since the DHCP server started\n");
