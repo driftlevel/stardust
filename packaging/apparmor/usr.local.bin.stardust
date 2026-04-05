@@ -11,11 +11,17 @@
   # Binary
   /usr/local/bin/stardust mr,
 
-  # Configuration (read, optionally write if config_writable=true)
+  # Configuration directory (read all files by default)
   /etc/stardust/ r,
   /etc/stardust/** r,
+
+  # Config writes (when config_writable=true):
+  #   - config.yaml.writetest: startup writability check (created + deleted)
+  #   - config.yaml.tmp: atomic write (write, then rename over config.yaml)
+  #   - config.yaml: the final rename target
   /etc/stardust/config.yaml rw,
-  /etc/stardust/config.yaml.tmp rw,
+  /etc/stardust/config.yaml.tmp rwk,
+  /etc/stardust/config.yaml.writetest rwk,
 
   # SSH host key and authorized_keys (read-only)
   /etc/stardust/ssh_host_key r,
@@ -24,9 +30,12 @@
   # TSIG key files (read-only, may be in config dir or elsewhere)
   /etc/stardust/*.key r,
 
-  # State directory (leases.json, atomic writes)
+  # State directory — leases.json + atomic writes:
+  #   - leases.json: the main lease store
+  #   - leases.json.tmp: atomic write (write, then rename over leases.json)
   /var/lib/stardust/ rw,
-  /var/lib/stardust/** rw,
+  /var/lib/stardust/leases.json rw,
+  /var/lib/stardust/leases.json.tmp rwk,
 
   # Runtime directory (PID file, sockets)
   /run/stardust/ rw,
