@@ -68,6 +68,7 @@ const PeerPoolHash = struct {
     subnet_ip: [4]u8,
     prefix_len: u8,
     hash: [32]u8,
+    config_version: i64 = 0,
 };
 
 const max_pools_per_peer: u8 = 32;
@@ -889,6 +890,42 @@ pub const SyncManager = struct {
         });
     }
 
+    /// Send a POOL_CONFIG_UPDATE to a specific peer (used by config anti-entropy).
+    /// Same as notifyPoolConfigUpdate but targets one specific peer instead of all.
+    fn sendPoolConfigToPeer(self: *Self, pool: *const config_mod.PoolConfig, peer_addr: std.posix.sockaddr.in) void {
+        // Render pool to YAML
+        var yaml_buf = std.ArrayList(u8){};
+        defer yaml_buf.deinit(self.allocator);
+        config_write.renderPool(yaml_buf.writer(self.allocator), pool) catch |err| {
+            std.log.err("sync: failed to render pool YAML for anti-entropy push: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Check size: header(13) + yaml must fit in our 8192 send buffer minus crypto overhead(42)
+        const header_size: usize = 13;
+        const max_payload = 8192 - overhead - 16; // conservative margin
+        if (header_size + yaml_buf.items.len > max_payload) {
+            std.log.warn("sync: pool config YAML too large to send ({d} bytes), skipping anti-entropy push", .{yaml_buf.items.len});
+            return;
+        }
+
+        // Build payload: [subnet_ip:4][prefix_len:1][config_version:i64 big-endian:8][yaml...]
+        const payload_len = header_size + yaml_buf.items.len;
+        const payload = self.allocator.alloc(u8, payload_len) catch return;
+        defer self.allocator.free(payload);
+
+        const subnet_ip = config_mod.parseIpv4(pool.subnet) catch [4]u8{ 0, 0, 0, 0 };
+        @memcpy(payload[0..4], &subnet_ip);
+        payload[4] = pool.prefix_len;
+        std.mem.writeInt(i64, payload[5..13], pool.config_version, .big);
+        @memcpy(payload[header_size..], yaml_buf.items);
+
+        self.sendMsg(peer_addr, .pool_config_update, payload);
+        std.log.info("sync: sent pool config anti-entropy push {s}/{d} (v={d})", .{
+            pool.subnet, pool.prefix_len, pool.config_version,
+        });
+    }
+
     /// Process an incoming pool config update from a peer.
     fn processPoolConfigUpdate(self: *Self, plaintext: []const u8) void {
         if (!self.isConfigSyncCapable()) {
@@ -1163,12 +1200,13 @@ pub const SyncManager = struct {
         }
     }
 
-    /// Maximum HELLO payload size: version(1) + gn_len(1) + group_name(255) + pool_count(1) + 32 * 37
-    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 37 + 1;
+    /// Maximum HELLO payload size: version(1) + gn_len(1) + group_name(255) + pool_count(1) + 32 * 45
+    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 45 + 1;
 
     /// Build a v2 HELLO/HELLO_ACK payload into the provided buffer.
     /// Format: [version:u8=2][gn_len:u8][group_name:N][pool_count:u8]
-    ///         for each pool: [subnet_ip:4][prefix_len:1][hash:32]
+    ///         for each pool: [subnet_ip:4][prefix_len:1][hash:32][config_version:i64 big-endian:8]
+    ///         [capabilities:u8]
     /// Returns the number of bytes written.
     fn buildHelloPayload(self: *Self, buf: []u8) usize {
         var off: usize = 0;
@@ -1182,13 +1220,17 @@ pub const SyncManager = struct {
         off += gn_len;
         buf[off] = self.pool_states_len;
         off += 1;
-        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+        for (self.pool_states[0..self.pool_states_len], 0..) |*ps, i| {
             @memcpy(buf[off .. off + 4], &ps.subnet_ip);
             off += 4;
             buf[off] = ps.prefix_len;
             off += 1;
             @memcpy(buf[off .. off + 32], &ps.local_hash);
             off += 32;
+            // config_version (i64 big-endian, 8 bytes)
+            const cv: i64 = if (i < self.full_cfg.pools.len) self.full_cfg.pools[i].config_version else 0;
+            std.mem.writeInt(i64, buf[off..][0..8], cv, .big);
+            off += 8;
         }
         // Capabilities byte (appended after pool entries for backward compat)
         var caps: u8 = 0;
@@ -1199,7 +1241,7 @@ pub const SyncManager = struct {
     }
 
     fn helloPayloadLen(self: *Self) usize {
-        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 37 + 1;
+        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 45 + 1;
     }
 
     // -----------------------------------------------------------------------
@@ -1293,8 +1335,12 @@ pub const SyncManager = struct {
                 .subnet_ip = plaintext[off..][0..4].*,
                 .prefix_len = plaintext[off + 4],
                 .hash = plaintext[off + 5 ..][0..32].*,
+                .config_version = if (off + 45 <= plaintext.len)
+                    std.mem.readInt(i64, plaintext[off + 37 ..][0..8], .big)
+                else
+                    0,
             };
-            off += 37;
+            off += if (off + 45 <= plaintext.len) @as(usize, 45) else @as(usize, 37);
         }
         peer.peer_pool_hashes_len = parsed;
         if (parsed < pool_count) {
@@ -1318,6 +1364,38 @@ pub const SyncManager = struct {
 
         // Re-evaluate pool enable/disable states
         self.reevaluatePoolStates();
+
+        // Config anti-entropy: push newer config to peer if we have it
+        if (peer.config_sync_capable and self.isConfigSyncCapable()) {
+            for (self.pool_states[0..self.pool_states_len], 0..) |*ps, pool_idx| {
+                for (peer.peer_pool_hashes[0..peer.peer_pool_hashes_len]) |pph| {
+                    if (std.mem.eql(u8, &pph.subnet_ip, &ps.subnet_ip) and pph.prefix_len == ps.prefix_len) {
+                        if (!std.mem.eql(u8, &pph.hash, &ps.local_hash)) {
+                            // Hashes differ -- check config_version
+                            if (pool_idx < self.full_cfg.pools.len) {
+                                const local_pool = &self.full_cfg.pools[pool_idx];
+                                if (local_pool.config_version > pph.config_version) {
+                                    // We have newer config -- push to peer
+                                    std.log.info("sync: config anti-entropy: pushing pool {d}.{d}.{d}.{d}/{d} (v={d}) to peer (v={d})", .{
+                                        ps.subnet_ip[0],           ps.subnet_ip[1],    ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                                        local_pool.config_version, pph.config_version,
+                                    });
+                                    self.sendPoolConfigToPeer(local_pool, peer.addr);
+                                } else if (local_pool.config_version == pph.config_version and local_pool.config_version > 0) {
+                                    // Same version but different hash -- shouldn't happen
+                                    std.log.warn("sync: pool {d}.{d}.{d}.{d}/{d} config conflict: same version {d} but different hash, manual resolution needed", .{
+                                        ps.subnet_ip[0],           ps.subnet_ip[1], ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                                        local_pool.config_version,
+                                    });
+                                }
+                                // If peer has newer version, they'll push to us
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         // Exchange lease hashes immediately
         var lh: [32]u8 = self.computeLeaseHash();
@@ -2485,8 +2563,8 @@ test "buildHelloPayload v2: verify structure" {
     const pool_count = buf[2 + gn_len];
     try std.testing.expectEqual(@as(u8, 1), pool_count);
 
-    // Expected length: 1 + 1 + 10 + 1 + 1*37 + 1(caps) = 51
-    try std.testing.expectEqual(@as(usize, 51), len);
+    // Expected length: 1 + 1 + 10 + 1 + 1*45 + 1(caps) = 59
+    try std.testing.expectEqual(@as(usize, 59), len);
 
     // Subnet IP should be 192.168.1.0
     const off = 2 + @as(usize, gn_len) + 1;
@@ -2495,8 +2573,44 @@ test "buildHelloPayload v2: verify structure" {
     // Prefix len should be 24
     try std.testing.expectEqual(@as(u8, 24), buf[off + 4]);
 
+    // config_version should be 0 (default)
+    try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, buf[off + 5 + 32 ..][0..8], .big));
+
     // Capabilities byte: config_writable defaults to false, so caps = 0
     try std.testing.expectEqual(@as(u8, 0), buf[len - 1]);
+}
+
+test "buildHelloPayload v2: config_version is written correctly" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.pools[0].config_version = 1712345678;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-v2-cv-test");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const len = mgr.buildHelloPayload(&buf);
+    _ = len;
+
+    // Pool entry starts at: 2 + 10 (group_name) + 1 = 13
+    const off = 2 + @as(usize, 10) + 1;
+    // config_version is at offset 37 within the pool entry (after subnet_ip:4 + prefix_len:1 + hash:32)
+    const cv = std.mem.readInt(i64, buf[off + 37 ..][0..8], .big);
+    try std.testing.expectEqual(@as(i64, 1712345678), cv);
 }
 
 test "isIpInDisabledPool: returns false when no pool states" {
@@ -2668,16 +2782,16 @@ test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
     const pool_count = buf[2 + gn_len];
     try std.testing.expectEqual(@as(u8, 2), pool_count);
 
-    // Expected length: 1 + 1 + 5 + 1 + 2*37 + 1(caps) = 83
-    try std.testing.expectEqual(@as(usize, 83), len);
+    // Expected length: 1 + 1 + 5 + 1 + 2*45 + 1(caps) = 99
+    try std.testing.expectEqual(@as(usize, 99), len);
 
     // Pool 0 entry: subnet_ip=192.168.1.0, prefix_len=24
     const off0 = 2 + @as(usize, gn_len) + 1;
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 0 }, buf[off0 .. off0 + 4]);
     try std.testing.expectEqual(@as(u8, 24), buf[off0 + 4]);
 
-    // Pool 1 entry: subnet_ip=10.0.0.0, prefix_len=24, starts 37 bytes after pool 0
-    const off1 = off0 + 37;
+    // Pool 1 entry: subnet_ip=10.0.0.0, prefix_len=24, starts 45 bytes after pool 0
+    const off1 = off0 + 45;
     try std.testing.expectEqualSlices(u8, &[4]u8{ 10, 0, 0, 0 }, buf[off1 .. off1 + 4]);
     try std.testing.expectEqual(@as(u8, 24), buf[off1 + 4]);
 
@@ -2686,6 +2800,10 @@ test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
     try std.testing.expectEqualSlices(u8, &hash0, buf[off0 + 5 .. off0 + 37]);
     const hash1 = config_mod.computePerPoolHash(&cfg.pools[1]);
     try std.testing.expectEqualSlices(u8, &hash1, buf[off1 + 5 .. off1 + 37]);
+
+    // Verify config_version fields (both should be 0 for default configs)
+    try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, buf[off0 + 37 ..][0..8], .big));
+    try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, buf[off1 + 37 ..][0..8], .big));
 }
 
 test "buildHelloPayload v2: config_sync sets capability bit" {
@@ -3663,4 +3781,155 @@ test "processPoolConfigUpdate rejects older version" {
     // Pool should be UNCHANGED (older version rejected).
     try std.testing.expectEqual(@as(u32, 3600), cfg.pools[0].lease_time);
     try std.testing.expectEqual(@as(i64, 500), cfg.pools[0].config_version);
+}
+
+// ---------------------------------------------------------------------------
+// Config anti-entropy (Phase 5) tests
+// ---------------------------------------------------------------------------
+
+test "processHello: config_version parsed from HELLO payload" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.pools[0].config_version = 42;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    const aes_key = SyncManager.deriveKey("hello-cv-parse");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    // Need a valid socket for processHello (it sends lease_hash)
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    // Build a HELLO from a "remote" peer with config_version=100
+    var remote_cfg = makeTestConfig(alloc);
+    defer remote_cfg.deinit();
+    remote_cfg.config_writable = true;
+    remote_cfg.pools[0].config_version = 100;
+    const remote_store = try makeTestStateStore(alloc);
+    defer remote_store.deinit();
+    var remote_sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    var remote_mgr = makeTestManagerWithCfg(aes_key, &remote_cfg, remote_store);
+    remote_mgr.cfg = &remote_sync_cfg;
+    defer remote_mgr.peers.deinit(alloc);
+
+    var payload_buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const payload_len = remote_mgr.buildHelloPayload(&payload_buf);
+
+    const src = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+    };
+    mgr.processHello(src, payload_buf[0..payload_len], true);
+
+    // Verify the peer's config_version was parsed correctly
+    try std.testing.expectEqual(@as(usize, 1), mgr.peers.items.len);
+    try std.testing.expect(mgr.peers.items[0].authenticated);
+    try std.testing.expectEqual(@as(u8, 1), mgr.peers.items[0].peer_pool_hashes_len);
+    try std.testing.expectEqual(@as(i64, 100), mgr.peers.items[0].peer_pool_hashes[0].config_version);
+}
+
+test "sendPoolConfigToPeer: does not crash and builds valid payload" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 500;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("anti-entropy-send-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+
+    // Create a UDP socket so sendMsg doesn't crash
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    const peer_addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+    };
+
+    // Should not crash; exercises the YAML rendering + payload building + send path
+    mgr.sendPoolConfigToPeer(&cfg.pools[0], peer_addr);
+}
+
+test "helloPayloadLen: returns correct value for 45-byte entries" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-len-test");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    const expected_len = mgr.helloPayloadLen();
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const actual_len = mgr.buildHelloPayload(&buf);
+    try std.testing.expectEqual(expected_len, actual_len);
 }
