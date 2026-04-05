@@ -148,7 +148,10 @@ pub const SyncManager = struct {
                     detected[0], detected[1], detected[2], detected[3],
                 });
             } else {
-                std.log.warn("sync: could not detect local IP for voting tie-break; this server may not participate correctly in ties", .{});
+                // Fallback: random high IP (255.255.x.x) so configured hosts always win ties.
+                const rand_bytes = std.crypto.random.int(u16);
+                self_ip = 0xFFFF0000 | @as(u32, rand_bytes);
+                std.log.warn("sync: could not detect local IP for voting; using random high value (loses all ties to real IPs)", .{});
             }
         }
 
