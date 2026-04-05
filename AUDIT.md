@@ -76,28 +76,29 @@ remaining findings that are low-severity or by-design.
 
 ### Performance / Design
 
-| File | Description | Why not fixed |
-|------|-------------|---------------|
+| File | Description | Status |
+|------|-------------|--------|
 | state.zig | `getLeaseByIp` and `getLeaseByClientId` are O(n) linear scans | Acceptable for typical deployment sizes (<1000 leases). Secondary index would add complexity |
 | state.zig | `save()` atomic rename not guaranteed cross-filesystem | Standard limitation; state_dir should be on same filesystem |
-| state.zig | Duplicate MAC in leases.json silently overwrites | Only happens with hand-edited files; last entry wins is acceptable |
-| sync.zig | `notifyLeaseUpdate` JSON may exceed UDP MTU for leases with very long fields | Extremely unlikely in practice (hostnames/client_ids are short). Would need TCP bulk leasequery (RFC 5765) for proper fix |
-| sync.zig | processHello silently truncates if pool_count * 37 > payload length | Defensive — processes what fits. Warning would be nice but not critical |
-| dhcp.zig | `collectOverrides` HashMap put errors silently swallowed (OOM) | Resilience pattern — partial overrides better than crash |
-| dhcp.zig | `handleDecline` decline_records put error silently swallowed | Same resilience pattern |
-| dhcp.zig | LEASEQUERY realloc failure returns original larger allocation | Wastes memory but safe; extremely unlikely with small packets |
+| state.zig | Duplicate MAC in leases.json overwrites earlier entry | **Logs warning** — last entry wins is acceptable |
+| sync.zig | `notifyLeaseUpdate` JSON may exceed UDP MTU for leases with very long fields | **Logs warning** when >1400 bytes |
+| sync.zig | processHello truncates if pool_count * 37 > payload length | **Logs warning** with advertised vs actual count |
+| dhcp.zig | `collectOverrides` HashMap put errors on OOM | **Logs warning** — partial overrides better than crash |
+| dhcp.zig | `handleDecline` decline_records put error on OOM | **Logs warning** with MAC address |
+| dhcp.zig | LEASEQUERY realloc failure returns original larger allocation | **Logs info** — wastes memory but safe |
 | config.zig | `parseIpv4` accepts leading zeros (e.g., "192.168.01.001") | Functional but could be ambiguous (octal interpretation). Not fixing to avoid breaking configs |
 
 ### Style / Documentation
 
-| File | Description | Why not fixed |
-|------|-------------|---------------|
+| File | Description | Status |
+|------|-------------|--------|
 | config_write.zig | No YAML escaping for special characters in string values | Mitigated by input validation — config parser and TUI reject special chars. Documented in module header |
 | dhcp.zig | Nonce hex encoding format (`{x:0>2}`) implicitly lowercase — no explicit documentation | Zig format is stable; added comment |
 | admin_ssh.zig | `handleSettingsClick` field_map has hardcoded line indices | Fragile if renderSettingsTab changes, but functional. Would need layout-driven approach like pool form |
 | admin_ssh.zig | `activeFieldInfo` returns field_idx=0 as fallback for invalid af values | Safe in practice — callers validate against totalFields() |
-| dhcp.zig | `appendRawStringOpt` silently truncates values >255 bytes | Per DHCP spec — option length is u8. Truncation is correct behavior |
-| dhcp.zig | `encodeOptionValue` silently falls back to raw string on parse failure | Intentional — provides graceful degradation for misconfigured option values |
+| dhcp.zig | `appendRawStringOpt` truncates values >255 bytes | **Logs warning** — per DHCP spec, option length is u8 |
+| dhcp.zig | `encodeOptionValue` falls back to raw string on mixed IP/non-IP parse | **Logs warning** when partial IP parse detected (likely misconfiguration) |
+| dhcp.zig | `encodeDnsSearchList` skips domains that overflow buffer | **Logs info** with domain name |
 | config.zig | `isValidDomainName` allows single-character TLDs | RFC-compliant; single-char TLDs exist (.x, .z proposed) |
 
 ### Edge Cases (correct but worth noting)
