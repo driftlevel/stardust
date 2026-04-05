@@ -30,6 +30,9 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Suppress noisy third-party debug logs (zig-yaml parser/tokenizer/yaml scopes).
+    if (comptime (level == .debug and (scope == .parser or scope == .tokenizer or scope == .yaml))) return;
+
     // Verbose messages are emitted as std.log.debug with scope .verbose.
     // Map (level, scope) to our 5-level LogLevel for runtime filtering.
     const is_verbose = comptime (scope == .verbose and level == .debug);
