@@ -64,12 +64,18 @@ pub fn renderConfig(w: anytype, cfg: *const config_mod.Config) !void {
     try w.print("  http_port: {d}\n", .{cfg.metrics.http_port});
     try w.print("  http_bind: {s}\n\n", .{cfg.metrics.http_bind});
 
+    // global config writable
+    if (cfg.config_writable) {
+        try w.writeAll("config_writable: true\n");
+    }
+
     // sync section (only if configured)
     if (cfg.sync) |s| {
         try w.writeAll("sync:\n");
         try w.print("  enable: {s}\n", .{if (s.enable) "true" else "false"});
         try w.print("  group_name: {s}\n", .{s.group_name});
         try w.print("  key_file: {s}\n", .{s.key_file});
+        try w.print("  config_sync: {s}\n", .{if (s.config_sync) "true" else "false"});
         try w.print("  port: {d}\n", .{s.port});
         try w.print("  full_sync_interval: {d}\n", .{s.full_sync_interval});
         if (s.multicast) |mc| {

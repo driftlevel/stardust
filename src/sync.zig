@@ -107,6 +107,7 @@ pub const SyncManager = struct {
         peer_pool_hashes: [max_pools_per_peer]PeerPoolHash,
         peer_pool_hashes_len: u8,
         peer_ip: u32, // host-order IP for voting tie-break
+        config_sync_capable: bool = false, // peer has global config_writable AND sync.config_sync
     };
 
     const Self = @This();
@@ -326,6 +327,19 @@ pub const SyncManager = struct {
             }
         }
         return true; // unknown pool = enabled (conservative)
+    }
+
+    /// Return counts of total, authenticated, and config-sync-capable peers.
+    pub fn peerCount(self: *const Self) struct { total: u32, authenticated: u32, config_capable: u32 } {
+        var total: u32 = 0;
+        var authed: u32 = 0;
+        var capable: u32 = 0;
+        for (self.peers.items) |p| {
+            total += 1;
+            if (p.authenticated) authed += 1;
+            if (p.authenticated and p.config_sync_capable) capable += 1;
+        }
+        return .{ .total = total, .authenticated = authed, .config_capable = capable };
     }
 
     /// Wait for initial peer sync at startup. Polls for incoming packets
@@ -717,7 +731,7 @@ pub const SyncManager = struct {
     }
 
     /// Maximum HELLO payload size: version(1) + gn_len(1) + group_name(255) + pool_count(1) + 32 * 37
-    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 37;
+    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 37 + 1;
 
     /// Build a v2 HELLO/HELLO_ACK payload into the provided buffer.
     /// Format: [version:u8=2][gn_len:u8][group_name:N][pool_count:u8]
@@ -743,11 +757,16 @@ pub const SyncManager = struct {
             @memcpy(buf[off .. off + 32], &ps.local_hash);
             off += 32;
         }
+        // Capabilities byte (appended after pool entries for backward compat)
+        var caps: u8 = 0;
+        if (self.full_cfg.config_writable and self.cfg.config_sync) caps |= 0x01; // bit 0: config_sync_capable
+        buf[off] = caps;
+        off += 1;
         return off;
     }
 
     fn helloPayloadLen(self: *Self) usize {
-        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 37;
+        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 37 + 1;
     }
 
     // -----------------------------------------------------------------------
@@ -844,6 +863,14 @@ pub const SyncManager = struct {
         peer.peer_pool_hashes_len = parsed;
         if (parsed < pool_count) {
             std.log.warn("sync: HELLO from peer advertised {d} pools but payload only contained {d}", .{ pool_count, parsed });
+        }
+
+        // Parse optional capabilities byte (backward compat: absent = 0)
+        if (off < plaintext.len) {
+            const caps = plaintext[off];
+            peer.config_sync_capable = (caps & 0x01) != 0;
+        } else {
+            peer.config_sync_capable = false;
         }
 
         if (!is_ack) {
@@ -2022,8 +2049,8 @@ test "buildHelloPayload v2: verify structure" {
     const pool_count = buf[2 + gn_len];
     try std.testing.expectEqual(@as(u8, 1), pool_count);
 
-    // Expected length: 1 + 1 + 10 + 1 + 1*37 = 50
-    try std.testing.expectEqual(@as(usize, 50), len);
+    // Expected length: 1 + 1 + 10 + 1 + 1*37 + 1(caps) = 51
+    try std.testing.expectEqual(@as(usize, 51), len);
 
     // Subnet IP should be 192.168.1.0
     const off = 2 + @as(usize, gn_len) + 1;
@@ -2031,6 +2058,9 @@ test "buildHelloPayload v2: verify structure" {
 
     // Prefix len should be 24
     try std.testing.expectEqual(@as(u8, 24), buf[off + 4]);
+
+    // Capabilities byte: config_writable defaults to false, so caps = 0
+    try std.testing.expectEqual(@as(u8, 0), buf[len - 1]);
 }
 
 test "isIpInDisabledPool: returns false when no pool states" {
@@ -2202,8 +2232,8 @@ test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
     const pool_count = buf[2 + gn_len];
     try std.testing.expectEqual(@as(u8, 2), pool_count);
 
-    // Expected length: 1 + 1 + 5 + 1 + 2*37 = 82
-    try std.testing.expectEqual(@as(usize, 82), len);
+    // Expected length: 1 + 1 + 5 + 1 + 2*37 + 1(caps) = 83
+    try std.testing.expectEqual(@as(usize, 83), len);
 
     // Pool 0 entry: subnet_ip=192.168.1.0, prefix_len=24
     const off0 = 2 + @as(usize, gn_len) + 1;
@@ -2220,4 +2250,206 @@ test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
     try std.testing.expectEqualSlices(u8, &hash0, buf[off0 + 5 .. off0 + 37]);
     const hash1 = config_mod.computePerPoolHash(&cfg.pools[1]);
     try std.testing.expectEqualSlices(u8, &hash1, buf[off1 + 5 .. off1 + 37]);
+}
+
+test "buildHelloPayload v2: config_sync sets capability bit" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.config_writable = true; // global gate must also be true
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "caps-test",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    const aes_key = SyncManager.deriveKey("hello-v2-caps");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const len = mgr.buildHelloPayload(&buf);
+
+    // Last byte should be capabilities = 0x01 (config_sync_capable)
+    try std.testing.expectEqual(@as(u8, 0x01), buf[len - 1]);
+}
+
+test "processHello: capabilities byte parsed correctly" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-caps-parse");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    // processHello sends a lease_hash reply, so we need a valid UDP socket
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    // Build a HELLO payload with config_writable=true from a "remote" peer
+    var remote_sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    var remote_cfg = makeTestConfig(alloc);
+    defer remote_cfg.deinit();
+    remote_cfg.config_writable = true; // global gate must also be true
+    const remote_store = try makeTestStateStore(alloc);
+    defer remote_store.deinit();
+    var remote_mgr = makeTestManagerWithCfg(aes_key, &remote_cfg, remote_store);
+    remote_mgr.cfg = &remote_sync_cfg;
+    defer remote_mgr.peers.deinit(alloc);
+
+    var payload_buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const payload_len = remote_mgr.buildHelloPayload(&payload_buf);
+
+    // Process as HELLO_ACK (is_ack=true avoids sending HELLO_ACK back)
+    const src = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+    };
+    mgr.processHello(src, payload_buf[0..payload_len], true);
+
+    // Verify the peer was added with config_sync_capable=true
+    try std.testing.expectEqual(@as(usize, 1), mgr.peers.items.len);
+    try std.testing.expect(mgr.peers.items[0].config_sync_capable);
+    try std.testing.expect(mgr.peers.items[0].authenticated);
+}
+
+test "processHello: missing capabilities byte defaults to false" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-nocaps");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    // processHello sends a lease_hash reply, so we need a valid UDP socket
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    // Manually craft a v2 HELLO payload WITHOUT the capabilities byte
+    // Format: [version=2][gn_len=10][group_name="test-group"][pool_count=0]
+    var payload: [13]u8 = undefined;
+    payload[0] = HELLO_PROTOCOL_VERSION; // version
+    payload[1] = 10; // group name length
+    @memcpy(payload[2..12], "test-group");
+    payload[12] = 0; // pool_count = 0 (no pools, so no trailing caps byte)
+
+    const src = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 2 }),
+    };
+    mgr.processHello(src, &payload, true);
+
+    // Peer should be added but config_sync_capable should default to false
+    try std.testing.expectEqual(@as(usize, 1), mgr.peers.items.len);
+    try std.testing.expect(!mgr.peers.items[0].config_sync_capable);
+    try std.testing.expect(mgr.peers.items[0].authenticated);
+}
+
+test "peerCount: returns correct counts" {
+    const alloc = std.testing.allocator;
+    const aes_key = SyncManager.deriveKey("peer-count-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(alloc);
+
+    // No peers initially
+    const c0 = mgr.peerCount();
+    try std.testing.expectEqual(@as(u32, 0), c0.total);
+    try std.testing.expectEqual(@as(u32, 0), c0.authenticated);
+    try std.testing.expectEqual(@as(u32, 0), c0.config_capable);
+
+    // Add an authenticated, config-capable peer
+    try mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = true,
+    });
+    // Add an unauthenticated peer
+    try mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 2 }),
+        },
+        .authenticated = false,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = false,
+    });
+    // Add an authenticated but not config-capable peer
+    try mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 3 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = false,
+    });
+
+    const c1 = mgr.peerCount();
+    try std.testing.expectEqual(@as(u32, 3), c1.total);
+    try std.testing.expectEqual(@as(u32, 2), c1.authenticated);
+    try std.testing.expectEqual(@as(u32, 1), c1.config_capable);
 }

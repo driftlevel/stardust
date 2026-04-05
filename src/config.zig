@@ -17,6 +17,7 @@ pub const SyncConfig = struct {
     full_sync_interval: u32, // seconds, default 300
     multicast: ?[]const u8, // null if using peers mode
     peers: [][]const u8, // empty if using multicast mode
+    config_sync: bool = false, // accept config pushes from peers (also requires global config_writable)
 };
 
 /// SSH admin interface configuration.
@@ -198,6 +199,7 @@ pub const Config = struct {
     state_dir: []const u8,
     log_level: LogLevel,
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
+    config_writable: bool = false, // global gate: allow any feature (TUI, sync) to write config
     sync: ?SyncConfig,
     pools: []PoolConfig, // at least one required
     admin_ssh: AdminSSHConfig,
@@ -266,6 +268,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
         .log_level = parseLogLevel(raw.log_level orelse "info"),
         .pool_allocation_random = false,
+        .config_writable = false,
         .sync = null,
         .pools = try allocator.alloc(PoolConfig, 0),
         .admin_ssh = .{
@@ -290,6 +293,11 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             if (root_map.get("pool_allocation_random")) |par_val| {
                 if (par_val.asScalar()) |s| {
                     if (std.mem.eql(u8, s, "true")) cfg.pool_allocation_random = true;
+                }
+            }
+            if (root_map.get("config_writable")) |cw_val| {
+                if (cw_val.asScalar()) |s| {
+                    if (std.mem.eql(u8, s, "true")) cfg.config_writable = true;
                 }
             }
 
@@ -946,6 +954,13 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
         }
     }
 
+    var config_sync: bool = false;
+    if (sync_map.get("config_sync")) |v| {
+        if (v.asScalar()) |s| {
+            config_sync = std.mem.eql(u8, s, "true");
+        }
+    }
+
     return SyncConfig{
         .enable = true,
         .group_name = group_name,
@@ -954,6 +969,7 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
         .full_sync_interval = full_sync_interval,
         .multicast = multicast,
         .peers = peers,
+        .config_sync = config_sync,
     };
 }
 

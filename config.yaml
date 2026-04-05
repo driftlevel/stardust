@@ -9,6 +9,10 @@ log_level: "info"   # err | warn | info | verbose | debug
 # false (default) = sequential from pool_start; true = random starting offset.
 # pool_allocation_random: false
 
+# Allow writing to configuration files. Required for TUI saves and sync config pushes.
+# false (default) = config is read-only; true = features may write config.yaml.
+# config_writable: false
+
 # ---------------------------------------------------------------------------
 # Pool definitions — each pool is one subnet served by this daemon.
 # Multiple pools may be defined for multi-subnet deployments.
@@ -183,6 +187,7 @@ pools:
 #   enable: true
 #   group_name: "dhcp-cluster-1"
 #   key_file: "dhcp-sync.key"    # BIND TSIG key file (same format as dns_update key)
+#   config_sync: false            # accept config pushes from peers (also requires global config_writable)
 #   port: 647                    # optional, default 647
 #   full_sync_interval: 300      # optional, seconds between full lease-hash checks
 #   # Discovery — choose exactly one:
