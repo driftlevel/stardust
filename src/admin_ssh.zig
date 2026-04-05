@@ -5116,7 +5116,8 @@ fn savePoolChanges(server: *AdminServer, state: *TuiState) void {
 
     if (form.isNew()) {
         // Build a new PoolConfig from form fields.
-        const pool = buildPoolFromForm(server.allocator, form) orelse return;
+        var pool = buildPoolFromForm(server.allocator, form) orelse return;
+        pool.config_version = std.time.timestamp();
         config_write.addPool(server.allocator, server.cfg, pool) catch return;
         // New pool is appended at the end.
         affected_pool_idx = server.cfg.pools.len - 1;
@@ -5125,12 +5126,22 @@ fn savePoolChanges(server: *AdminServer, state: *TuiState) void {
         const idx = form.editing_index.?;
         if (idx >= server.cfg.pools.len) return;
         applyFormToPool(server.allocator, &server.cfg.pools[idx], form);
+        server.cfg.pools[idx].config_version = std.time.timestamp();
         affected_pool_idx = idx;
     }
 
     // Persist and reload.
     config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch return;
     triggerReload(state);
+
+    // Notify sync peers of pool config change.
+    if (server.sync_mgr) |s| {
+        if (affected_pool_idx) |idx| {
+            if (idx < server.cfg.pools.len) {
+                s.notifyPoolConfigUpdate(&server.cfg.pools[idx]);
+            }
+        }
+    }
 
     // Send FORCERENEW to all active leases in the affected pool so clients
     // pick up the new settings (lease time, options, etc.).

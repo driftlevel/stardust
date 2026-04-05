@@ -134,6 +134,7 @@ pub const PoolConfig = struct {
     reservations: []Reservation,
     static_routes: []StaticRoute,
     mac_classes: []MacClass = &.{},
+    config_version: i64 = 0, // unix timestamp; 0 = never modified via TUI/sync; excluded from pool hash
 
     pub fn deinit(self: *PoolConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.subnet);
@@ -705,6 +706,12 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         }
     }
 
+    if (pool_map.get("config_version")) |cv_val| {
+        if (cv_val.asScalar()) |cv_str| {
+            pool.config_version = std.fmt.parseInt(i64, cv_str, 10) catch 0;
+        }
+    }
+
     if (!validatePoolFields(allocator, &pool)) return null;
 
     return pool;
@@ -1194,6 +1201,33 @@ pub fn computePerPoolHash(pool: *const PoolConfig) [32]u8 {
     hashPoolIntoSha256(&h, pool);
     hashMacClasses(&h, pool.mac_classes);
     return h.finalResult();
+}
+
+/// Parse a single pool from a YAML fragment (the indented list item produced by
+/// config_write.renderPool). Wraps the fragment in a minimal `pools:\n` document,
+/// parses it via zig-yaml, and calls parseOnePool on the first entry.
+/// Caller owns the returned PoolConfig and must call pool.deinit(allocator).
+pub fn parsePoolFromYaml(allocator: std.mem.Allocator, pool_yaml: []const u8) !PoolConfig {
+    // Build a minimal YAML document: "pools:\n" + the pool fragment.
+    const prefix = "pools:\n";
+    const doc_len = prefix.len + pool_yaml.len;
+    const source = try allocator.alloc(u8, doc_len);
+    defer allocator.free(source);
+    @memcpy(source[0..prefix.len], prefix);
+    @memcpy(source[prefix.len..], pool_yaml);
+
+    var doc = yaml.Yaml{ .source = source };
+    doc.load(allocator) catch return Error.InvalidConfig;
+    defer doc.deinit(allocator);
+
+    if (doc.docs.items.len == 0) return Error.InvalidConfig;
+    const root_map = doc.docs.items[0].asMap() orelse return Error.InvalidConfig;
+    const pools_val = root_map.get("pools") orelse return Error.InvalidConfig;
+    const pools_list = pools_val.asList() orelse return Error.InvalidConfig;
+    if (pools_list.len == 0) return Error.InvalidConfig;
+
+    const pool_map = pools_list[0].asMap() orelse return Error.InvalidConfig;
+    return (try parseOnePool(allocator, pool_map)) orelse Error.InvalidConfig;
 }
 
 const Sha256 = std.crypto.hash.sha2.Sha256;

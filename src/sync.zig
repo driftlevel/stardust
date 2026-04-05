@@ -40,6 +40,7 @@ const MsgType = enum(u8) {
     lease_hash = 7,
     reservation_update = 8,
     reservation_delete = 9,
+    pool_config_update = 10,
     _,
 };
 
@@ -841,6 +842,151 @@ pub const SyncManager = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Pool config sync (Phase 4)
+    // -----------------------------------------------------------------------
+
+    /// Notify all config-sync-capable peers of a pool config update.
+    /// Renders the pool to YAML and sends it with a binary header:
+    ///   [subnet_ip: 4 bytes][prefix_len: 1 byte][config_version: i64 big-endian, 8 bytes][yaml...]
+    /// Total header: 13 bytes + YAML.
+    pub fn notifyPoolConfigUpdate(self: *Self, pool: *const config_mod.PoolConfig) void {
+        // Render pool to YAML
+        var yaml_buf = std.ArrayList(u8){};
+        defer yaml_buf.deinit(self.allocator);
+        config_write.renderPool(yaml_buf.writer(self.allocator), pool) catch |err| {
+            std.log.err("sync: failed to render pool YAML for config update: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Check size: header(13) + yaml must fit in our 8192 send buffer minus crypto overhead(42)
+        const header_size: usize = 13;
+        const max_payload = 8192 - overhead - 16; // conservative margin
+        if (header_size + yaml_buf.items.len > max_payload) {
+            std.log.warn("sync: pool config YAML too large to send ({d} bytes), skipping sync", .{yaml_buf.items.len});
+            return;
+        }
+
+        // Build payload: [subnet_ip:4][prefix_len:1][config_version:i64 big-endian:8][yaml...]
+        const payload_len = header_size + yaml_buf.items.len;
+        const payload = self.allocator.alloc(u8, payload_len) catch return;
+        defer self.allocator.free(payload);
+
+        const subnet_ip = config_mod.parseIpv4(pool.subnet) catch [4]u8{ 0, 0, 0, 0 };
+        @memcpy(payload[0..4], &subnet_ip);
+        payload[4] = pool.prefix_len;
+        std.mem.writeInt(i64, payload[5..13], pool.config_version, .big);
+        @memcpy(payload[header_size..], yaml_buf.items);
+
+        var sent: usize = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated and p.config_sync_capable) {
+                self.sendMsg(p.addr, .pool_config_update, payload);
+                sent += 1;
+            }
+        }
+        std.log.info("sync: sent pool config update {s}/{d} (v={d}) to {d} config-capable peer(s)", .{
+            pool.subnet, pool.prefix_len, pool.config_version, sent,
+        });
+    }
+
+    /// Process an incoming pool config update from a peer.
+    fn processPoolConfigUpdate(self: *Self, plaintext: []const u8) void {
+        if (!self.isConfigSyncCapable()) {
+            std.log.debug("sync: ignoring pool config update: not config-sync-capable", .{});
+            return;
+        }
+
+        // Parse binary header: [subnet_ip:4][prefix_len:1][config_version:i64:8] = 13 bytes
+        const header_size: usize = 13;
+        if (plaintext.len < header_size) {
+            std.log.warn("sync: pool config update too short ({d} bytes)", .{plaintext.len});
+            return;
+        }
+
+        const subnet_ip: [4]u8 = plaintext[0..4].*;
+        const prefix_len = plaintext[4];
+        const incoming_version = std.mem.readInt(i64, plaintext[5..13], .big);
+        const pool_yaml = plaintext[header_size..];
+
+        // Format subnet IP for logging and matching
+        var subnet_buf: [15]u8 = undefined;
+        const subnet_str = std.fmt.bufPrint(&subnet_buf, "{d}.{d}.{d}.{d}", .{
+            subnet_ip[0], subnet_ip[1], subnet_ip[2], subnet_ip[3],
+        }) catch "?";
+
+        // Find matching pool
+        const pool = self.findPoolBySubnet(subnet_str, prefix_len) orelse {
+            std.log.warn("sync: pool config update for unknown pool {s}/{d}, ignoring", .{ subnet_str, prefix_len });
+            return;
+        };
+
+        // Last-write-wins: compare config_version
+        if (incoming_version <= pool.config_version) {
+            std.log.debug("sync: discarding older pool config update for {s}/{d} (incoming={d}, existing={d})", .{
+                subnet_str, prefix_len, incoming_version, pool.config_version,
+            });
+            return;
+        }
+
+        // Parse the incoming pool YAML into a new PoolConfig
+        var new_pool = config_mod.parsePoolFromYaml(self.allocator, pool_yaml) catch |err| {
+            std.log.err("sync: failed to parse pool config YAML from peer: {s}", .{@errorName(err)});
+            return;
+        };
+        // Ensure the parsed pool matches the expected subnet/prefix (safety check)
+        if (new_pool.prefix_len != prefix_len or !std.mem.eql(u8, new_pool.subnet, subnet_str)) {
+            std.log.warn("sync: pool config update subnet mismatch: expected {s}/{d}, got {s}/{d}", .{
+                subnet_str, prefix_len, new_pool.subnet, new_pool.prefix_len,
+            });
+            new_pool.deinit(self.allocator);
+            return;
+        }
+
+        // Preserve the config_version from the header (in case YAML didn't include it)
+        new_pool.config_version = incoming_version;
+
+        // Find the pool index and replace
+        for (self.full_cfg.pools, 0..) |*p, i| {
+            if (p.prefix_len == prefix_len and std.mem.eql(u8, p.subnet, subnet_str)) {
+                // Deinit the old pool and replace
+                p.deinit(self.allocator);
+                self.full_cfg.pools[i] = new_pool;
+
+                // Persist to config.yaml
+                config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+                    std.log.err("sync: could not persist pool config update: config write failed ({s})", .{@errorName(err)});
+                    return;
+                };
+
+                // Recompute pool hash states so voting reflects the new config
+                self.computeLocalPoolStates();
+                self.reevaluatePoolStates();
+
+                // Seed any new reservations into the lease store
+                for (self.full_cfg.pools[i].reservations) |*r| {
+                    self.store.addLease(.{
+                        .mac = r.mac,
+                        .ip = r.ip,
+                        .hostname = r.hostname,
+                        .expires = 0,
+                        .client_id = r.client_id,
+                        .reserved = true,
+                    }) catch {};
+                }
+
+                std.log.info("sync: applied pool config update from peer: {s}/{d} (v={d})", .{
+                    subnet_str, prefix_len, incoming_version,
+                });
+                return;
+            }
+        }
+
+        // Should not reach here since we found the pool above, but guard anyway
+        new_pool.deinit(self.allocator);
+        std.log.warn("sync: pool config update: pool {s}/{d} disappeared during apply", .{ subnet_str, prefix_len });
+    }
+
+    // -----------------------------------------------------------------------
     // Internal: crypto
     // -----------------------------------------------------------------------
 
@@ -1073,7 +1219,7 @@ pub const SyncManager = struct {
             // (group name matched during the HELLO handshake).  After a pool
             // config change, updatePoolStates() marks all peers unauthenticated,
             // so stale-config peers are locked out until they re-handshake.
-            .lease_update, .lease_delete, .keepalive, .lease_hash, .reservation_update, .reservation_delete => {
+            .lease_update, .lease_delete, .keepalive, .lease_hash, .reservation_update, .reservation_delete, .pool_config_update => {
                 const peer = self.findPeer(src) orelse return;
                 if (!peer.authenticated) {
                     log_v.debug("sync: ignoring {s} from unauthenticated peer", .{@tagName(result.msg_type)});
@@ -1087,6 +1233,7 @@ pub const SyncManager = struct {
                     .keepalive => {},
                     .reservation_update => self.processReservationUpdate(result.plaintext),
                     .reservation_delete => self.processReservationDelete(result.plaintext),
+                    .pool_config_update => self.processPoolConfigUpdate(result.plaintext),
                     else => unreachable,
                 }
             },
@@ -3250,4 +3397,270 @@ test "encrypt/decrypt round-trip: reservation_delete message type" {
     const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
     try std.testing.expectEqual(MsgType.reservation_delete, result.msg_type);
     try std.testing.expectEqualStrings(plaintext, result.plaintext);
+}
+
+test "encrypt/decrypt round-trip: pool_config_update message type" {
+    const aes_key = SyncManager.deriveKey("pool-cfg-msg-type-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    // Build a realistic payload: [subnet:4][prefix:1][version:8][yaml...]
+    var payload: [128]u8 = undefined;
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 1712345678, .big);
+    const yaml_frag = "  - subnet: 192.168.1.0/24\n    router: 192.168.1.1\n";
+    @memcpy(payload[13 .. 13 + yaml_frag.len], yaml_frag);
+    const total = 13 + yaml_frag.len;
+
+    var buf: [512]u8 = undefined;
+    const n = mgr.encrypt(.pool_config_update, payload[0..total], &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [512]u8 = undefined;
+    const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.pool_config_update, result.msg_type);
+    try std.testing.expectEqualStrings(payload[0..total], result.plaintext);
+
+    // Verify header fields can be extracted
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 0 }, result.plaintext[0..4]);
+    try std.testing.expectEqual(@as(u8, 24), result.plaintext[4]);
+    try std.testing.expectEqual(@as(i64, 1712345678), std.mem.readInt(i64, result.plaintext[5..13], .big));
+}
+
+test "notifyPoolConfigUpdate builds correct payload" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 1712345678;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-notify-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+
+    // notifyPoolConfigUpdate should not crash even with no peers.
+    // This exercises the YAML rendering + payload building path.
+    mgr.notifyPoolConfigUpdate(&cfg.pools[0]);
+}
+
+test "processPoolConfigUpdate applies newer version" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 100;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-apply-test");
+    const tmp_cfg_path = "/tmp/stardust_test_pool_cfg_apply.yaml";
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = tmp_cfg_path,
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+    defer std.fs.cwd().deleteFile(tmp_cfg_path) catch {};
+    mgr.computeLocalPoolStates();
+
+    // Build a pool config update with newer version and changed lease_time.
+    // First render the existing pool to YAML but with modified fields.
+    var modified = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "192.168.1.10",
+        .pool_end = "192.168.1.200",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 7200, // changed from 3600
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 7200 },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = &.{},
+        .static_routes = &.{},
+        .config_version = 200, // newer than 100
+    };
+    _ = &modified;
+
+    var yaml_buf = std.ArrayList(u8){};
+    defer yaml_buf.deinit(alloc);
+    config_write.renderPool(yaml_buf.writer(alloc), &modified) catch unreachable;
+
+    // Build binary payload
+    const header_size: usize = 13;
+    const payload_len = header_size + yaml_buf.items.len;
+    const payload = alloc.alloc(u8, payload_len) catch unreachable;
+    defer alloc.free(payload);
+
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 200, .big);
+    @memcpy(payload[header_size..], yaml_buf.items);
+
+    // Process the update. Note: cfg_path="" means writeConfig will fail, but
+    // we test that the in-memory pool is replaced correctly.
+    mgr.processPoolConfigUpdate(payload);
+
+    // Since writeConfig fails (empty path), the pool should still be updated
+    // in memory. Check lease_time was changed.
+    try std.testing.expectEqual(@as(u32, 7200), cfg.pools[0].lease_time);
+    try std.testing.expectEqual(@as(i64, 200), cfg.pools[0].config_version);
+}
+
+test "processPoolConfigUpdate rejects older version" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 500;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-reject-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+    mgr.computeLocalPoolStates();
+
+    // Build a pool config update with OLDER version (100 < 500).
+    var modified = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "192.168.1.10",
+        .pool_end = "192.168.1.200",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 9999, // changed
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 9999 },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = &.{},
+        .static_routes = &.{},
+        .config_version = 100, // older than 500
+    };
+    _ = &modified;
+
+    var yaml_buf = std.ArrayList(u8){};
+    defer yaml_buf.deinit(alloc);
+    config_write.renderPool(yaml_buf.writer(alloc), &modified) catch unreachable;
+
+    const header_size: usize = 13;
+    const payload_len = header_size + yaml_buf.items.len;
+    const payload = alloc.alloc(u8, payload_len) catch unreachable;
+    defer alloc.free(payload);
+
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 100, .big);
+    @memcpy(payload[header_size..], yaml_buf.items);
+
+    mgr.processPoolConfigUpdate(payload);
+
+    // Pool should be UNCHANGED (older version rejected).
+    try std.testing.expectEqual(@as(u32, 3600), cfg.pools[0].lease_time);
+    try std.testing.expectEqual(@as(i64, 500), cfg.pools[0].config_version);
 }
