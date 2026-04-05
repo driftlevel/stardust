@@ -2509,6 +2509,8 @@ fn saveReservation(server: *AdminServer, form: *ReservationForm) ?[]const u8 {
         server.store.removeLease(orig_mac);
         if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
             _ = config_write.removeReservation(server.allocator, pool, orig_mac);
+            // Notify sync peers that the old MAC reservation was deleted.
+            if (server.sync_mgr) |s| s.notifyReservationDelete(pool, orig_mac);
         }
     }
 
@@ -2550,9 +2552,25 @@ fn saveReservation(server: *AdminServer, form: *ReservationForm) ?[]const u8 {
         _ = config_write.upsertReservation(server.allocator, pool, mac, ip, hostname, null, opts) catch |err| {
             return @errorName(err);
         };
+        // Set config_modified timestamp for sync (before writeConfig so it gets persisted).
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, mac)) {
+                r.config_modified = std.time.timestamp();
+                break;
+            }
+        }
         config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
             return @errorName(err);
         };
+        // Notify sync peers of reservation change.
+        if (server.sync_mgr) |s| {
+            for (pool.reservations) |*r| {
+                if (std.mem.eql(u8, r.mac, mac)) {
+                    s.notifyReservationUpdate(pool, r);
+                    break;
+                }
+            }
+        }
     } else {
         return "IP not in any configured pool";
     }
@@ -2763,6 +2781,8 @@ fn handleDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key
                 config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
                     log.warn("delete reservation: failed to write config: {s}", .{@errorName(err)});
                 };
+                // Notify sync peers of reservation deletion.
+                if (server.sync_mgr) |s| s.notifyReservationDelete(pool, mac);
             }
         } else {
             // Dynamic lease: notify sync peers of deletion.
