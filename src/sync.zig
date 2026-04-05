@@ -990,7 +990,7 @@ pub const SyncManager = struct {
 
         // Parse the incoming pool YAML into a new PoolConfig
         var new_pool = config_mod.parsePoolFromYaml(self.allocator, pool_yaml) catch |err| {
-            std.log.err("sync: failed to parse pool config YAML from peer: {s}", .{@errorName(err)});
+            std.log.warn("sync: failed to parse pool config YAML from peer: {s}", .{@errorName(err)});
             return;
         };
         // Ensure the parsed pool matches the expected subnet/prefix (safety check)
@@ -3825,6 +3825,92 @@ test "processPoolConfigUpdate rejects older version" {
     // Pool should be UNCHANGED (older version rejected).
     try std.testing.expectEqual(@as(u32, 3600), cfg.pools[0].lease_time);
     try std.testing.expectEqual(@as(i64, 500), cfg.pools[0].config_version);
+}
+
+test "processReservationUpdate: malformed JSON does not crash" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    const before = result.mgr.reservation_recv_events.load(.monotonic);
+
+    // Feed malformed JSON — should log a warning but not crash
+    result.mgr.processReservationUpdate("not valid json{{");
+
+    // Counter should NOT have been incremented (parse failed early)
+    try std.testing.expectEqual(before, result.mgr.reservation_recv_events.load(.monotonic));
+    // No reservations should have been added
+    try std.testing.expectEqual(@as(usize, 0), result.cfg.pools[0].reservations.len);
+}
+
+test "processPoolConfigUpdate: malformed YAML does not crash" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 10;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-malformed-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+    mgr.computeLocalPoolStates();
+
+    const before = mgr.config_recv_events.load(.monotonic);
+
+    // Build a valid binary header (subnet 192.168.1.0/24, version 20 > 10)
+    // but with garbage YAML body
+    const header_size: usize = 13;
+    const garbage_yaml = "{{{{not: valid: yaml: [[[";
+    var payload: [header_size + garbage_yaml.len]u8 = undefined;
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 20, .big);
+    @memcpy(payload[header_size..], garbage_yaml);
+
+    // Should log an error but not crash
+    mgr.processPoolConfigUpdate(&payload);
+
+    // Counter should NOT have been incremented (YAML parse failed)
+    try std.testing.expectEqual(before, mgr.config_recv_events.load(.monotonic));
+    // Pool config should be unchanged
+    try std.testing.expectEqual(@as(u32, 3600), cfg.pools[0].lease_time);
+    try std.testing.expectEqual(@as(i64, 10), cfg.pools[0].config_version);
 }
 
 // ---------------------------------------------------------------------------

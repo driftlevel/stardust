@@ -1217,8 +1217,8 @@ pub fn parsePoolFromYaml(allocator: std.mem.Allocator, pool_yaml: []const u8) !P
     @memcpy(source[prefix.len..], pool_yaml);
 
     var doc = yaml.Yaml{ .source = source };
-    doc.load(allocator) catch return Error.InvalidConfig;
     defer doc.deinit(allocator);
+    doc.load(allocator) catch return Error.InvalidConfig;
 
     if (doc.docs.items.len == 0) return Error.InvalidConfig;
     const root_map = doc.docs.items[0].asMap() orelse return Error.InvalidConfig;

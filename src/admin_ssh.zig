@@ -1965,7 +1965,7 @@ fn naturalLessThan(a: []const u8, b: []const u8) bool {
     var bi: usize = 0;
     while (ai < a.len and bi < b.len) {
         const a_digit = a[ai] >= '0' and a[ai] <= '9';
-        const b_digit = b[ai] >= '0' and b[bi] <= '9';
+        const b_digit = b[bi] >= '0' and b[bi] <= '9';
         if (a_digit and b_digit) {
             // Both at a digit run — compare numerically.
             var a_num: u64 = 0;
@@ -9424,4 +9424,15 @@ test "naturalLessThan: prefix differs before digits" {
 test "naturalLessThan: multiple digit groups" {
     try std.testing.expect(naturalLessThan("v1.2.3", "v1.2.10"));
     try std.testing.expect(naturalLessThan("v1.9", "v1.10"));
+}
+
+test "naturalLessThan: empty string edge cases" {
+    try std.testing.expect(!naturalLessThan("", "")); // equal
+    try std.testing.expect(naturalLessThan("", "foo")); // empty < non-empty
+    try std.testing.expect(!naturalLessThan("foo", "")); // non-empty > empty
+}
+
+test "naturalLessThan: misaligned digits" {
+    try std.testing.expect(naturalLessThan("abc2def", "abc10xyz")); // 2 < 10, different suffixes
+    try std.testing.expect(naturalLessThan("x1y", "x2y")); // 1 < 2
 }
