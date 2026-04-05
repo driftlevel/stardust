@@ -136,11 +136,20 @@ pub const SyncManager = struct {
         defer tsig_key.deinit();
         const aes_key = deriveKey(tsig_key.secret);
 
-        // Compute self_ip from listen_address for voting tie-break
-        const self_ip_bytes = parseIpv4Local(full_cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 };
-        const self_ip = std.mem.readInt(u32, &self_ip_bytes, .big);
+        // Compute self_ip for voting tie-break. If listen_address is 0.0.0.0,
+        // probe the OS routing table for the actual outbound IP.
+        var self_ip: u32 = 0;
+        const listen_ip = parseIpv4Local(full_cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 };
+        self_ip = std.mem.readInt(u32, &listen_ip, .big);
         if (self_ip == 0) {
-            std.log.warn("sync: listen_address is 0.0.0.0; this server will win all sync voting ties. Consider using a specific IP.", .{});
+            if (probeLocalIp()) |detected| {
+                self_ip = std.mem.readInt(u32, &detected, .big);
+                std.log.info("sync: listen_address is 0.0.0.0, detected local IP {d}.{d}.{d}.{d} for voting", .{
+                    detected[0], detected[1], detected[2], detected[3],
+                });
+            } else {
+                std.log.warn("sync: could not detect local IP for voting tie-break; this server may not participate correctly in ties", .{});
+            }
         }
 
         // Create UDP socket
@@ -1645,6 +1654,26 @@ fn parseIpv4Local(s: []const u8) ![4]u8 {
     if (idx != 3) return error.InvalidAddress;
     result[idx] = @intCast(octet);
     return result;
+}
+
+/// Detect the local outbound IPv4 address by connecting a UDP socket to a
+/// well-known external address (8.8.8.8:53) and reading the local endpoint.
+/// No traffic is sent — this just queries the OS routing table.
+fn probeLocalIp() ?[4]u8 {
+    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return null;
+    defer std.posix.close(sock);
+    const dst = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = @bitCast([4]u8{ 8, 8, 8, 8 }),
+    };
+    std.posix.connect(sock, @ptrCast(&dst), @sizeOf(std.posix.sockaddr.in)) catch return null;
+    var local: std.posix.sockaddr.in = undefined;
+    var local_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    std.posix.getsockname(sock, @ptrCast(&local), &local_len) catch return null;
+    const ip: [4]u8 = @bitCast(local.addr);
+    if (std.mem.eql(u8, &ip, &[4]u8{ 0, 0, 0, 0 })) return null;
+    return ip;
 }
 
 // ---------------------------------------------------------------------------
