@@ -1957,6 +1957,37 @@ fn drawLeaseTable(
 
 /// Sort context for raw leases.  Operates on state_mod.Lease directly so that
 /// the expires column sorts by numeric timestamp rather than a formatted string.
+/// Natural sort comparison: digit runs compared as numbers, everything else
+/// compared as bytes. "client-2" < "client-10", "ap-1" < "ap-20".
+/// Degrades to pure lexicographic when no digits are present.
+fn naturalLessThan(a: []const u8, b: []const u8) bool {
+    var ai: usize = 0;
+    var bi: usize = 0;
+    while (ai < a.len and bi < b.len) {
+        const a_digit = a[ai] >= '0' and a[ai] <= '9';
+        const b_digit = b[ai] >= '0' and b[bi] <= '9';
+        if (a_digit and b_digit) {
+            // Both at a digit run — compare numerically.
+            var a_num: u64 = 0;
+            while (ai < a.len and a[ai] >= '0' and a[ai] <= '9') : (ai += 1) {
+                a_num = a_num * 10 + (a[ai] - '0');
+            }
+            var b_num: u64 = 0;
+            while (bi < b.len and b[bi] >= '0' and b[bi] <= '9') : (bi += 1) {
+                b_num = b_num * 10 + (b[bi] - '0');
+            }
+            if (a_num != b_num) return a_num < b_num;
+            // Equal numbers — continue comparing remaining characters.
+        } else {
+            // At least one side is non-digit — compare bytes.
+            if (a[ai] != b[bi]) return a[ai] < b[bi];
+            ai += 1;
+            bi += 1;
+        }
+    }
+    return a.len < b.len;
+}
+
 const LeaseSort = struct {
     col: SortCol,
     dir: SortDir,
@@ -1967,7 +1998,7 @@ const LeaseSort = struct {
             .none => return false,
             .ip => ipLess(a.ip, b.ip),
             .mac => std.mem.lessThan(u8, a.mac, b.mac),
-            .hostname => std.mem.lessThan(u8, a.hostname orelse "", b.hostname orelse ""),
+            .hostname => naturalLessThan(a.hostname orelse "", b.hostname orelse ""),
             .type => std.mem.lessThan(u8, if (a.reserved) "reserved" else "dynamic", if (b.reserved) "reserved" else "dynamic"),
             .expires => expiresLess(a, b),
             .pool => poolLess(ctx.cfg, a.ip, b.ip),
@@ -9365,4 +9396,32 @@ test "validateReservationForm: empty hostname is valid (optional)" {
     form.mac_len = 17;
     // hostname_len stays 0 (default)
     try std.testing.expect(validateReservationForm(&form) == null);
+}
+
+test "naturalLessThan: numeric suffix ordering" {
+    try std.testing.expect(naturalLessThan("client-2", "client-10"));
+    try std.testing.expect(!naturalLessThan("client-10", "client-2"));
+}
+
+test "naturalLessThan: equal strings" {
+    try std.testing.expect(!naturalLessThan("host", "host"));
+}
+
+test "naturalLessThan: pure alpha degrades to lexicographic" {
+    try std.testing.expect(naturalLessThan("abc", "def"));
+    try std.testing.expect(!naturalLessThan("def", "abc"));
+}
+
+test "naturalLessThan: no digits same as std.mem.lessThan" {
+    try std.testing.expect(naturalLessThan("ap", "switch"));
+    try std.testing.expect(!naturalLessThan("switch", "ap"));
+}
+
+test "naturalLessThan: prefix differs before digits" {
+    try std.testing.expect(naturalLessThan("ap-1", "switch-1"));
+}
+
+test "naturalLessThan: multiple digit groups" {
+    try std.testing.expect(naturalLessThan("v1.2.3", "v1.2.10"));
+    try std.testing.expect(naturalLessThan("v1.9", "v1.10"));
 }
