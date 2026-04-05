@@ -94,7 +94,7 @@ remaining findings that are low-severity or by-design.
 |------|-------------|--------|
 | config_write.zig | No YAML escaping for special characters in string values | Mitigated by input validation — config parser and TUI reject special chars. Documented in module header |
 | dhcp.zig | Nonce hex encoding format (`{x:0>2}`) implicitly lowercase — no explicit documentation | Zig format is stable; added comment |
-| admin_ssh.zig | `handleSettingsClick` field_map has hardcoded line indices | Fragile if renderSettingsTab changes, but functional. Would need layout-driven approach like pool form |
+| admin_ssh.zig | `handleSettingsClick` field_map has hardcoded line indices | **Fixed**: click handler now uses `settings_line_to_edit` mapping populated by renderSettingsTab |
 | admin_ssh.zig | `activeFieldInfo` returns field_idx=0 as fallback for invalid af values | Safe in practice — callers validate against totalFields() |
 | dhcp.zig | `appendRawStringOpt` truncates values >255 bytes | **Logs warning** — per DHCP spec, option length is u8 |
 | dhcp.zig | `encodeOptionValue` falls back to raw string on mixed IP/non-IP parse | **Logs warning** when partial IP parse detected (likely misconfiguration) |
