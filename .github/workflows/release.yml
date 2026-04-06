@@ -112,21 +112,31 @@ jobs:
 
           mkdir -p stage/usr/local/bin
           mkdir -p stage/etc/stardust
+          mkdir -p stage/etc/apparmor.d
           mkdir -p stage/lib/systemd/system
+          mkdir -p stage/usr/share/stardust/selinux
 
           cp zig-out/bin/stardust    stage/usr/local/bin/stardust
           cp config.yaml             stage/etc/stardust/config.yaml
           cp packaging/stardust.service stage/lib/systemd/system/stardust.service
+          cp packaging/apparmor/usr.local.bin.stardust stage/etc/apparmor.d/usr.local.bin.stardust
+          cp packaging/selinux/stardust.te  stage/usr/share/stardust/selinux/
+          cp packaging/selinux/stardust.fc  stage/usr/share/stardust/selinux/
+          cp packaging/selinux/stardust.if  stage/usr/share/stardust/selinux/
 
       - name: Build tarball
         run: |
           TARBALL="stardust-${{ matrix.arch_tag }}-linux.tar.gz"
-          mkdir -p dist pkg
+          mkdir -p dist pkg/selinux
           cp stage/usr/local/bin/stardust pkg/
           cp stage/etc/stardust/config.yaml pkg/
           cp packaging/stardust.service pkg/
           cp packaging/stardust.openrc pkg/
-          tar -czf "dist/$TARBALL" -C pkg stardust config.yaml stardust.service stardust.openrc
+          cp packaging/apparmor/usr.local.bin.stardust pkg/apparmor-profile
+          cp packaging/selinux/stardust.te  pkg/selinux/
+          cp packaging/selinux/stardust.fc  pkg/selinux/
+          cp packaging/selinux/stardust.if  pkg/selinux/
+          tar -czf "dist/$TARBALL" -C pkg stardust config.yaml stardust.service stardust.openrc apparmor-profile selinux/
           echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
 
       - name: Build .deb package
@@ -145,7 +155,11 @@ jobs:
             --package "dist/stardust_${DEB_VERSION}_${{ matrix.deb_arch }}.deb" \
             stage/usr/local/bin/stardust=/usr/local/bin/stardust \
             "stage/etc/stardust/config.yaml=/etc/stardust/config.yaml" \
-            "stage/lib/systemd/system/stardust.service=/lib/systemd/system/stardust.service"
+            "stage/lib/systemd/system/stardust.service=/lib/systemd/system/stardust.service" \
+            "stage/etc/apparmor.d/usr.local.bin.stardust=/etc/apparmor.d/usr.local.bin.stardust" \
+            "stage/usr/share/stardust/selinux/stardust.te=/usr/share/stardust/selinux/stardust.te" \
+            "stage/usr/share/stardust/selinux/stardust.fc=/usr/share/stardust/selinux/stardust.fc" \
+            "stage/usr/share/stardust/selinux/stardust.if=/usr/share/stardust/selinux/stardust.if"
 
       - name: Build .rpm package
         run: |
@@ -163,7 +177,11 @@ jobs:
             --package "dist/stardust-${RPM_VERSION}-1.${{ matrix.rpm_arch }}.rpm" \
             stage/usr/local/bin/stardust=/usr/local/bin/stardust \
             "stage/etc/stardust/config.yaml=/etc/stardust/config.yaml" \
-            "stage/lib/systemd/system/stardust.service=/usr/lib/systemd/system/stardust.service"
+            "stage/lib/systemd/system/stardust.service=/usr/lib/systemd/system/stardust.service" \
+            "stage/etc/apparmor.d/usr.local.bin.stardust=/etc/apparmor.d/usr.local.bin.stardust" \
+            "stage/usr/share/stardust/selinux/stardust.te=/usr/share/stardust/selinux/stardust.te" \
+            "stage/usr/share/stardust/selinux/stardust.fc=/usr/share/stardust/selinux/stardust.fc" \
+            "stage/usr/share/stardust/selinux/stardust.if=/usr/share/stardust/selinux/stardust.if"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

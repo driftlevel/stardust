@@ -2,7 +2,7 @@
 
 ## Pending
 
-- Include selinux and apparmor profiles in RPM and deb package builds (profiles created in packaging/)
+- (none currently)
 
 ## Done
 
