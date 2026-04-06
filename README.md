@@ -2,10 +2,26 @@
 
 [![CI](https://github.com/driftlevel/stardust/actions/workflows/ci.yml/badge.svg)](https://github.com/driftlevel/stardust/actions/workflows/ci.yml)
 
-A lightweight DHCP server (RFC 2131/2132) written in Zig. Designed for
-small-to-medium networks where you want a fast, single-binary daemon with
-no runtime dependencies, optional RFC 2136 dynamic DNS integration, and
-active-active redundancy via encrypted lease synchronisation.
+A production-ready DHCP server written in Zig. Single static binary, zero
+runtime dependencies, with an interactive SSH admin TUI, active-active
+redundancy via encrypted lease and configuration sync, dynamic DNS updates
+(RFC 2136), UEFI HTTP boot, MAC class policy overrides, Prometheus metrics,
+and comprehensive input validation. Designed for small-to-medium networks
+and homelab deployments.
+
+## Screenshots
+
+| Leases | Pools | Stats |
+|--------|-------|-------|
+| ![Leases](screenshots/leases.png) | ![Pools](screenshots/pools.png) | ![Stats](screenshots/stats.png) |
+
+| Edit Pool | Edit Reservation | MAC Class |
+|-----------|-----------------|-----------|
+| ![Edit Pool](screenshots/editpool.png) | ![Edit Reservation](screenshots/editreservation.png) | ![MAC Class](screenshots/newmacclass.png) |
+
+| Settings |
+|----------|
+| ![Settings](screenshots/settings.png) |
 
 ## Quick start
 
