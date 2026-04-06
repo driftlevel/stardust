@@ -30,6 +30,9 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Suppress noisy third-party debug logs (zig-yaml parser/tokenizer/yaml scopes).
+    if (comptime (level == .debug and (scope == .parser or scope == .tokenizer or scope == .yaml))) return;
+
     // Verbose messages are emitted as std.log.debug with scope .verbose.
     // Map (level, scope) to our 5-level LogLevel for runtime filtering.
     const is_verbose = comptime (scope == .verbose and level == .debug);
@@ -228,6 +231,19 @@ pub fn main() !void {
         std.log.info("  pool[{d}]: {s}/{d}, router={s}, lease={d}s", .{
             idx, pool.subnet, pool.prefix_len, pool.router, pool.lease_time,
         });
+    }
+
+    // Verify config file is writable if config_writable is enabled.
+    if (cfg.config_writable) {
+        const test_path = std.fmt.allocPrint(allocator, "{s}.writetest", .{cfg_path}) catch
+            fatal("OOM checking config writability", .{});
+        defer allocator.free(test_path);
+        if (std.fs.cwd().createFile(test_path, .{})) |f| {
+            f.close();
+            std.fs.cwd().deleteFile(test_path) catch {};
+        } else |_| {
+            fatal("config_writable is true but config path '{s}' is not writable", .{cfg_path});
+        }
     }
 
     // Initialize state store

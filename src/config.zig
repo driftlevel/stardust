@@ -17,6 +17,7 @@ pub const SyncConfig = struct {
     full_sync_interval: u32, // seconds, default 300
     multicast: ?[]const u8, // null if using peers mode
     peers: [][]const u8, // empty if using multicast mode
+    config_sync: bool = false, // accept config pushes from peers (also requires global config_writable)
 };
 
 /// SSH admin interface configuration.
@@ -43,6 +44,7 @@ pub const Reservation = struct {
     hostname: ?[]const u8,
     client_id: ?[]const u8,
     dhcp_options: ?std.StringHashMap([]const u8) = null,
+    config_modified: i64 = 0, // unix timestamp; 0 = unknown/never modified via TUI/sync
 };
 
 /// MAC class rule: matches client MACs by prefix pattern and overrides DHCP options
@@ -132,6 +134,7 @@ pub const PoolConfig = struct {
     reservations: []Reservation,
     static_routes: []StaticRoute,
     mac_classes: []MacClass = &.{},
+    config_version: i64 = 0, // unix timestamp; 0 = never modified via TUI/sync; excluded from pool hash
 
     pub fn deinit(self: *PoolConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.subnet);
@@ -198,6 +201,7 @@ pub const Config = struct {
     state_dir: []const u8,
     log_level: LogLevel,
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
+    config_writable: bool = false, // global gate: allow any feature (TUI, sync) to write config
     sync: ?SyncConfig,
     pools: []PoolConfig, // at least one required
     admin_ssh: AdminSSHConfig,
@@ -266,6 +270,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
         .log_level = parseLogLevel(raw.log_level orelse "info"),
         .pool_allocation_random = false,
+        .config_writable = false,
         .sync = null,
         .pools = try allocator.alloc(PoolConfig, 0),
         .admin_ssh = .{
@@ -290,6 +295,11 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             if (root_map.get("pool_allocation_random")) |par_val| {
                 if (par_val.asScalar()) |s| {
                     if (std.mem.eql(u8, s, "true")) cfg.pool_allocation_random = true;
+                }
+            }
+            if (root_map.get("config_writable")) |cw_val| {
+                if (cw_val.asScalar()) |s| {
+                    if (std.mem.eql(u8, s, "true")) cfg.config_writable = true;
                 }
             }
 
@@ -696,6 +706,12 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         }
     }
 
+    if (pool_map.get("config_version")) |cv_val| {
+        if (cv_val.asScalar()) |cv_str| {
+            pool.config_version = std.fmt.parseInt(i64, cv_str, 10) catch 0;
+        }
+    }
+
     if (!validatePoolFields(allocator, &pool)) return null;
 
     return pool;
@@ -793,12 +809,21 @@ fn parseReservations(allocator: std.mem.Allocator, pool: *PoolConfig, list: anyt
             }
         }
 
+        // Parse optional config_modified timestamp.
+        var config_modified_val: i64 = 0;
+        if (m.get("config_modified")) |cm_val| {
+            if (cm_val.asScalar()) |cm_str| {
+                config_modified_val = std.fmt.parseInt(i64, cm_str, 10) catch 0;
+            }
+        }
+
         pool.reservations[idx] = .{
             .mac = mac_owned,
             .ip = ip_owned,
             .hostname = hostname_owned,
             .client_id = client_id_owned,
             .dhcp_options = res_opts,
+            .config_modified = config_modified_val,
         };
         idx += 1;
     }
@@ -946,6 +971,13 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
         }
     }
 
+    var config_sync: bool = false;
+    if (sync_map.get("config_sync")) |v| {
+        if (v.asScalar()) |s| {
+            config_sync = std.mem.eql(u8, s, "true");
+        }
+    }
+
     return SyncConfig{
         .enable = true,
         .group_name = group_name,
@@ -954,6 +986,7 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
         .full_sync_interval = full_sync_interval,
         .multicast = multicast,
         .peers = peers,
+        .config_sync = config_sync,
     };
 }
 
@@ -1168,6 +1201,33 @@ pub fn computePerPoolHash(pool: *const PoolConfig) [32]u8 {
     hashPoolIntoSha256(&h, pool);
     hashMacClasses(&h, pool.mac_classes);
     return h.finalResult();
+}
+
+/// Parse a single pool from a YAML fragment (the indented list item produced by
+/// config_write.renderPool). Wraps the fragment in a minimal `pools:\n` document,
+/// parses it via zig-yaml, and calls parseOnePool on the first entry.
+/// Caller owns the returned PoolConfig and must call pool.deinit(allocator).
+pub fn parsePoolFromYaml(allocator: std.mem.Allocator, pool_yaml: []const u8) !PoolConfig {
+    // Build a minimal YAML document: "pools:\n" + the pool fragment.
+    const prefix = "pools:\n";
+    const doc_len = prefix.len + pool_yaml.len;
+    const source = try allocator.alloc(u8, doc_len);
+    defer allocator.free(source);
+    @memcpy(source[0..prefix.len], prefix);
+    @memcpy(source[prefix.len..], pool_yaml);
+
+    var doc = yaml.Yaml{ .source = source };
+    defer doc.deinit(allocator);
+    doc.load(allocator) catch return Error.InvalidConfig;
+
+    if (doc.docs.items.len == 0) return Error.InvalidConfig;
+    const root_map = doc.docs.items[0].asMap() orelse return Error.InvalidConfig;
+    const pools_val = root_map.get("pools") orelse return Error.InvalidConfig;
+    const pools_list = pools_val.asList() orelse return Error.InvalidConfig;
+    if (pools_list.len == 0) return Error.InvalidConfig;
+
+    const pool_map = pools_list[0].asMap() orelse return Error.InvalidConfig;
+    return (try parseOnePool(allocator, pool_map)) orelse Error.InvalidConfig;
 }
 
 const Sha256 = std.crypto.hash.sha2.Sha256;

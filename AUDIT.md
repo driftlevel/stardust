@@ -10,6 +10,8 @@ remaining findings that are low-severity or by-design.
 - **Round 3** (2026-04-01): Full codebase audit after major TUI refactor
 - **Round 4** (2026-04-02): Post-feature audit (sync protocol, MAC classes, FORCERENEW)
 - **Round 5** (2026-04-02): Exhaustive line-by-line final sweep
+- **Round 6** (2026-04-05): Config sync feature audit + natural sort bug
+- **Round 7** (2026-04-05): Exhaustive re-verification after config sync
 
 ---
 
@@ -70,6 +72,23 @@ remaining findings that are low-severity or by-design.
 | 29 | dhcp.zig | Medium | Duplicate DHCP options when MAC class has both first-class field AND dhcp_options for same code. Added `isFirstClassOverrideActive` filter |
 | 30 | sync.zig | Low | No warning when self_ip=0 (listen 0.0.0.0) causes server to win all voting ties |
 
+### Round 6
+
+| # | File | Severity | Description |
+|---|------|----------|-------------|
+| 31 | admin_ssh.zig | Critical | `naturalLessThan` used `b[ai]` instead of `b[bi]` for digit detection — hostname natural sort produced wrong results |
+| 32 | config.zig | Medium | `parsePoolFromYaml` leaked zig-yaml parse_errors on load failure — `defer doc.deinit` placed after `doc.load` instead of before |
+| 33 | sync.zig | Low | `processPoolConfigUpdate` logged parse failure as `err` instead of `warn` — malformed peer data is external input, not internal error |
+
+### Round 7
+
+| # | File | Severity | Description |
+|---|------|----------|-------------|
+| 34 | admin_ssh.zig | Medium | `naturalLessThan` digit accumulation could overflow u64 on 20+ digit runs — replaced with run-extraction approach that avoids arithmetic entirely |
+| 35 | metrics.zig | Medium | Prometheus output missing `forcerenew` counter — added `stardust_dhcp_packets_total{type="forcerenew"}` |
+| 36 | state.zig | Medium | `saveUnlocked` temp file not deleted if `rename` fails — added explicit cleanup in catch block |
+| 37 | sync.zig | Low | `processPoolConfigUpdate` error log didn't clarify that in-memory update succeeded — improved message to note anti-entropy retry |
+
 ---
 
 ## Remaining Findings (not fixed — low severity or by-design)
@@ -94,7 +113,7 @@ remaining findings that are low-severity or by-design.
 |------|-------------|--------|
 | config_write.zig | No YAML escaping for special characters in string values | Mitigated by input validation — config parser and TUI reject special chars. Documented in module header |
 | dhcp.zig | Nonce hex encoding format (`{x:0>2}`) implicitly lowercase — no explicit documentation | Zig format is stable; added comment |
-| admin_ssh.zig | `handleSettingsClick` field_map has hardcoded line indices | Fragile if renderSettingsTab changes, but functional. Would need layout-driven approach like pool form |
+| admin_ssh.zig | `handleSettingsClick` field_map has hardcoded line indices | **Fixed**: click handler now uses `settings_line_to_edit` mapping populated by renderSettingsTab |
 | admin_ssh.zig | `activeFieldInfo` returns field_idx=0 as fallback for invalid af values | Safe in practice — callers validate against totalFields() |
 | dhcp.zig | `appendRawStringOpt` truncates values >255 bytes | **Logs warning** — per DHCP spec, option length is u8 |
 | dhcp.zig | `encodeOptionValue` falls back to raw string on mixed IP/non-IP parse | **Logs warning** when partial IP parse detected (likely misconfiguration) |
@@ -115,20 +134,20 @@ remaining findings that are low-severity or by-design.
 
 ## Test Coverage Summary
 
-**Total tests: ~400 across 10 files**
+**Total tests: ~440 across 10 files**
 
 | File | Tests | Coverage |
 |------|-------|----------|
-| dhcp.zig | 118 | Core DHCP protocol, all message types, option encoding, MAC class overrides, leasequery, FORCERENEW |
-| admin_ssh.zig | 104 | TUI forms, validation, field navigation, inline entries, pool layout |
+| dhcp.zig | 119 | Core DHCP protocol, all message types, option encoding, MAC class overrides (incl. time_offset), leasequery, FORCERENEW |
+| admin_ssh.zig | 120 | TUI forms, validation, field navigation, inline entries, pool layout, natural sort (overflow-safe) |
+| sync.zig | 68 | Per-pool protocol, voting algorithm, HELLO v2 format, encryption, config sync, reservation sync, malformed input handling |
 | config.zig | 63 | YAML parsing, validation, per-pool hash, MAC class parsing |
-| sync.zig | 43 | Per-pool protocol, voting algorithm, HELLO v2 format, encryption |
 | state.zig | 32 | Lease CRUD, persistence, nonce lifecycle, pruning |
+| config_write.zig | 17 | YAML serialization, MAC class fields, pool round-trip, config_version |
 | dns.zig | 15 | DNS name encoding, TSIG signing, key parsing, label limits |
-| config_write.zig | 13 | YAML serialization, MAC class fields, reservation dhcp_options |
 | util.zig | 4 | String escaping utilities |
 | probe.zig | 2 | ARP/ICMP probe helpers |
-| metrics.zig | 2 | Pool capacity computation |
+| metrics.zig | 3 | Pool capacity computation (/24, /30, /31, /32) |
 
 ### Notable test coverage
 

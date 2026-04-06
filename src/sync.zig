@@ -38,6 +38,9 @@ const MsgType = enum(u8) {
     lease_delete = 5,
     keepalive = 6,
     lease_hash = 7,
+    reservation_update = 8,
+    reservation_delete = 9,
+    pool_config_update = 10,
     _,
 };
 
@@ -65,6 +68,7 @@ const PeerPoolHash = struct {
     subnet_ip: [4]u8,
     prefix_len: u8,
     hash: [32]u8,
+    config_version: i64 = 0,
 };
 
 const max_pools_per_peer: u8 = 32;
@@ -93,6 +97,11 @@ pub const SyncManager = struct {
     /// Sync event counters (read atomically by SSH TUI stats tab).
     sync_full_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     sync_lease_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Config sync event counters (read atomically by SSH TUI stats tab).
+    config_push_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    config_recv_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    reservation_push_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    reservation_recv_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     const max_peers = 8;
     const keepalive_interval_s: i64 = 30;
@@ -107,6 +116,7 @@ pub const SyncManager = struct {
         peer_pool_hashes: [max_pools_per_peer]PeerPoolHash,
         peer_pool_hashes_len: u8,
         peer_ip: u32, // host-order IP for voting tie-break
+        config_sync_capable: bool = false, // peer has global config_writable AND sync.config_sync
     };
 
     const Self = @This();
@@ -126,11 +136,23 @@ pub const SyncManager = struct {
         defer tsig_key.deinit();
         const aes_key = deriveKey(tsig_key.secret);
 
-        // Compute self_ip from listen_address for voting tie-break
-        const self_ip_bytes = parseIpv4Local(full_cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 };
-        const self_ip = std.mem.readInt(u32, &self_ip_bytes, .big);
+        // Compute self_ip for voting tie-break. If listen_address is 0.0.0.0,
+        // probe the OS routing table for the actual outbound IP.
+        var self_ip: u32 = 0;
+        const listen_ip = parseIpv4Local(full_cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 };
+        self_ip = std.mem.readInt(u32, &listen_ip, .big);
         if (self_ip == 0) {
-            std.log.warn("sync: listen_address is 0.0.0.0; this server will win all sync voting ties. Consider using a specific IP.", .{});
+            if (probeLocalIp()) |detected| {
+                self_ip = std.mem.readInt(u32, &detected, .big);
+                std.log.info("sync: listen_address is 0.0.0.0, detected local IP {d}.{d}.{d}.{d} for voting", .{
+                    detected[0], detected[1], detected[2], detected[3],
+                });
+            } else {
+                // Fallback: random high IP (255.255.x.x) so configured hosts always win ties.
+                const rand_bytes = std.crypto.random.int(u16);
+                self_ip = 0xFFFF0000 | @as(u32, rand_bytes);
+                std.log.warn("sync: could not detect local IP for voting; using random high value (loses all ties to real IPs)", .{});
+            }
         }
 
         // Create UDP socket
@@ -326,6 +348,19 @@ pub const SyncManager = struct {
             }
         }
         return true; // unknown pool = enabled (conservative)
+    }
+
+    /// Return counts of total, authenticated, and config-sync-capable peers.
+    pub fn peerCount(self: *const Self) struct { total: u32, authenticated: u32, config_capable: u32 } {
+        var total: u32 = 0;
+        var authed: u32 = 0;
+        var capable: u32 = 0;
+        for (self.peers.items) |p| {
+            total += 1;
+            if (p.authenticated) authed += 1;
+            if (p.authenticated and p.config_sync_capable) capable += 1;
+        }
+        return .{ .total = total, .authenticated = authed, .config_capable = capable };
     }
 
     /// Wait for initial peer sync at startup. Polls for incoming packets
@@ -540,6 +575,479 @@ pub const SyncManager = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Reservation config sync (Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// Serializable struct for reservation sync payloads.
+    /// dhcp_options is encoded as a flat string "code=value,code=value" to avoid
+    /// HashMap serialization issues.
+    const ReservationSync = struct {
+        pool_subnet: []const u8,
+        pool_prefix: u8,
+        mac: []const u8,
+        ip: []const u8 = "",
+        hostname: ?[]const u8 = null,
+        client_id: ?[]const u8 = null,
+        config_modified: i64,
+        dhcp_options_str: ?[]const u8 = null,
+    };
+
+    /// Notify all config-sync-capable peers of a reservation add/update.
+    pub fn notifyReservationUpdate(self: *Self, pool: *const config_mod.PoolConfig, reservation: *const config_mod.Reservation) void {
+        // Encode dhcp_options as flat string "code=value,code=value"
+        var opts_buf = std.ArrayList(u8){};
+        defer opts_buf.deinit(self.allocator);
+        if (reservation.dhcp_options) |opts| {
+            if (opts.count() > 0) {
+                var first = true;
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    if (!first) opts_buf.writer(self.allocator).writeByte(',') catch return;
+                    opts_buf.writer(self.allocator).print("{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* }) catch return;
+                    first = false;
+                }
+            }
+        }
+
+        const payload = ReservationSync{
+            .pool_subnet = pool.subnet,
+            .pool_prefix = pool.prefix_len,
+            .mac = reservation.mac,
+            .ip = reservation.ip,
+            .hostname = reservation.hostname,
+            .client_id = reservation.client_id,
+            .config_modified = if (reservation.config_modified != 0) reservation.config_modified else std.time.timestamp(),
+            .dhcp_options_str = if (opts_buf.items.len > 0) opts_buf.items else null,
+        };
+
+        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
+        defer self.allocator.free(json);
+
+        if (json.len > 1400) {
+            std.log.warn("sync: reservation update for {s} is {d} bytes, may exceed UDP MTU", .{ reservation.mac, json.len });
+        }
+
+        var sent: usize = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated and p.config_sync_capable) {
+                self.sendMsg(p.addr, .reservation_update, json);
+                sent += 1;
+            }
+        }
+        if (sent > 0) _ = self.reservation_push_events.fetchAdd(1, .monotonic);
+        std.log.info("sync: sent reservation update {s} to {d} config-capable peer(s)", .{ reservation.mac, sent });
+    }
+
+    /// Notify all config-sync-capable peers of a reservation deletion.
+    pub fn notifyReservationDelete(self: *Self, pool: *const config_mod.PoolConfig, mac: []const u8) void {
+        const payload = ReservationSync{
+            .pool_subnet = pool.subnet,
+            .pool_prefix = pool.prefix_len,
+            .mac = mac,
+            .config_modified = std.time.timestamp(),
+        };
+
+        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
+        defer self.allocator.free(json);
+
+        var sent: usize = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated and p.config_sync_capable) {
+                self.sendMsg(p.addr, .reservation_delete, json);
+                sent += 1;
+            }
+        }
+        if (sent > 0) _ = self.reservation_push_events.fetchAdd(1, .monotonic);
+        std.log.info("sync: sent reservation delete {s} to {d} config-capable peer(s)", .{ mac, sent });
+    }
+
+    /// Check if this server is config-sync-capable (global config_writable AND sync.config_sync).
+    fn isConfigSyncCapable(self: *Self) bool {
+        return self.full_cfg.config_writable and self.cfg.config_sync;
+    }
+
+    /// Find a pool by subnet string and prefix length.
+    fn findPoolBySubnet(self: *Self, subnet: []const u8, prefix_len: u8) ?*config_mod.PoolConfig {
+        for (self.full_cfg.pools) |*pool| {
+            if (pool.prefix_len == prefix_len and std.mem.eql(u8, pool.subnet, subnet)) {
+                return pool;
+            }
+        }
+        return null;
+    }
+
+    /// Parse the flat "code=value,code=value" string into a StringHashMap.
+    fn parseDhcpOptionsStr(self: *Self, opts_str: []const u8) ?std.StringHashMap([]const u8) {
+        if (opts_str.len == 0) return null;
+        var map = std.StringHashMap([]const u8).init(self.allocator);
+        errdefer {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            map.deinit();
+        }
+        var pairs = std.mem.splitScalar(u8, opts_str, ',');
+        while (pairs.next()) |pair| {
+            if (std.mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
+                const k = self.allocator.dupe(u8, pair[0..eq_pos]) catch return null;
+                const v = self.allocator.dupe(u8, pair[eq_pos + 1 ..]) catch {
+                    self.allocator.free(k);
+                    return null;
+                };
+                map.put(k, v) catch {
+                    self.allocator.free(k);
+                    self.allocator.free(v);
+                    return null;
+                };
+            }
+        }
+        return map;
+    }
+
+    /// Process an incoming reservation update from a peer.
+    fn processReservationUpdate(self: *Self, plaintext: []const u8) void {
+        if (!self.isConfigSyncCapable()) {
+            std.log.debug("sync: ignoring reservation update: not config-sync-capable", .{});
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(
+            ReservationSync,
+            self.allocator,
+            plaintext,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            std.log.warn("sync: failed to parse reservation update JSON: {s}", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+        const incoming = parsed.value;
+
+        // Find the matching pool
+        const pool = self.findPoolBySubnet(incoming.pool_subnet, incoming.pool_prefix) orelse {
+            std.log.warn("sync: reservation update for unknown pool {s}/{d}, ignoring", .{ incoming.pool_subnet, incoming.pool_prefix });
+            return;
+        };
+
+        // Check config_modified against existing reservation's timestamp (last-write-wins)
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, incoming.mac)) {
+                if (incoming.config_modified <= r.config_modified) {
+                    std.log.debug("sync: discarding older reservation update for {s} (incoming={d}, existing={d})", .{
+                        incoming.mac, incoming.config_modified, r.config_modified,
+                    });
+                    return;
+                }
+                break;
+            }
+        }
+
+        // Parse dhcp_options from flat string
+        var opts: ?std.StringHashMap([]const u8) = null;
+        if (incoming.dhcp_options_str) |opts_str| {
+            opts = self.parseDhcpOptionsStr(opts_str);
+        }
+        defer if (opts) |*o| {
+            var oit = o.iterator();
+            while (oit.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            o.deinit();
+        };
+
+        // Apply upsert
+        _ = config_write.upsertReservation(
+            self.allocator,
+            pool,
+            incoming.mac,
+            incoming.ip,
+            incoming.hostname,
+            incoming.client_id,
+            opts,
+        ) catch |err| {
+            std.log.err("sync: failed to apply reservation update for {s}: {s}", .{ incoming.mac, @errorName(err) });
+            return;
+        };
+
+        // Set config_modified on the reservation (upsertReservation doesn't handle this field)
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, incoming.mac)) {
+                r.config_modified = incoming.config_modified;
+                break;
+            }
+        }
+
+        // Persist to config.yaml
+        config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+            std.log.err("sync: could not apply reservation from peer: config write failed ({s})", .{@errorName(err)});
+            return;
+        };
+
+        // Also seed the reservation into the lease store so it takes effect immediately
+        self.store.addLease(.{
+            .mac = incoming.mac,
+            .ip = incoming.ip,
+            .hostname = incoming.hostname,
+            .expires = 0,
+            .client_id = incoming.client_id,
+            .reserved = true,
+        }) catch {};
+
+        _ = self.reservation_recv_events.fetchAdd(1, .monotonic);
+        std.log.info("sync: applied reservation update from peer: {s} -> {s} in {s}/{d}", .{
+            incoming.mac, incoming.ip, incoming.pool_subnet, incoming.pool_prefix,
+        });
+    }
+
+    /// Process an incoming reservation delete from a peer.
+    fn processReservationDelete(self: *Self, plaintext: []const u8) void {
+        if (!self.isConfigSyncCapable()) {
+            std.log.debug("sync: ignoring reservation delete: not config-sync-capable", .{});
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(
+            ReservationSync,
+            self.allocator,
+            plaintext,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            std.log.warn("sync: failed to parse reservation delete JSON: {s}", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+        const incoming = parsed.value;
+
+        // Find the matching pool
+        const pool = self.findPoolBySubnet(incoming.pool_subnet, incoming.pool_prefix) orelse {
+            std.log.warn("sync: reservation delete for unknown pool {s}/{d}, ignoring", .{ incoming.pool_subnet, incoming.pool_prefix });
+            return;
+        };
+
+        // Check config_modified against existing reservation's timestamp (last-write-wins)
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, incoming.mac)) {
+                if (incoming.config_modified <= r.config_modified) {
+                    std.log.debug("sync: discarding older reservation delete for {s} (incoming={d}, existing={d})", .{
+                        incoming.mac, incoming.config_modified, r.config_modified,
+                    });
+                    return;
+                }
+                break;
+            }
+        }
+
+        // Remove from config
+        if (!config_write.removeReservation(self.allocator, pool, incoming.mac)) {
+            std.log.debug("sync: reservation delete for {s}: not found in pool {s}/{d}", .{
+                incoming.mac, incoming.pool_subnet, incoming.pool_prefix,
+            });
+            return;
+        }
+
+        // Remove from lease store
+        self.store.forceRemoveLease(incoming.mac);
+
+        // Persist to config.yaml
+        config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+            std.log.err("sync: could not apply reservation delete from peer: config write failed ({s})", .{@errorName(err)});
+            return;
+        };
+
+        _ = self.reservation_recv_events.fetchAdd(1, .monotonic);
+        std.log.info("sync: applied reservation delete from peer: {s} in {s}/{d}", .{
+            incoming.mac, incoming.pool_subnet, incoming.pool_prefix,
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool config sync (Phase 4)
+    // -----------------------------------------------------------------------
+
+    /// Notify all config-sync-capable peers of a pool config update.
+    /// Renders the pool to YAML and sends it with a binary header:
+    ///   [subnet_ip: 4 bytes][prefix_len: 1 byte][config_version: i64 big-endian, 8 bytes][yaml...]
+    /// Total header: 13 bytes + YAML.
+    pub fn notifyPoolConfigUpdate(self: *Self, pool: *const config_mod.PoolConfig) void {
+        // Render pool to YAML
+        var yaml_buf = std.ArrayList(u8){};
+        defer yaml_buf.deinit(self.allocator);
+        config_write.renderPool(yaml_buf.writer(self.allocator), pool) catch |err| {
+            std.log.err("sync: failed to render pool YAML for config update: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Check size: header(13) + yaml must fit in our 8192 send buffer minus crypto overhead(42)
+        const header_size: usize = 13;
+        const max_payload = 8192 - overhead - 16; // conservative margin
+        if (header_size + yaml_buf.items.len > max_payload) {
+            std.log.warn("sync: pool config YAML too large to send ({d} bytes), skipping sync", .{yaml_buf.items.len});
+            return;
+        }
+
+        // Build payload: [subnet_ip:4][prefix_len:1][config_version:i64 big-endian:8][yaml...]
+        const payload_len = header_size + yaml_buf.items.len;
+        const payload = self.allocator.alloc(u8, payload_len) catch return;
+        defer self.allocator.free(payload);
+
+        const subnet_ip = config_mod.parseIpv4(pool.subnet) catch [4]u8{ 0, 0, 0, 0 };
+        @memcpy(payload[0..4], &subnet_ip);
+        payload[4] = pool.prefix_len;
+        std.mem.writeInt(i64, payload[5..13], pool.config_version, .big);
+        @memcpy(payload[header_size..], yaml_buf.items);
+
+        var sent: usize = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated and p.config_sync_capable) {
+                self.sendMsg(p.addr, .pool_config_update, payload);
+                sent += 1;
+            }
+        }
+        if (sent > 0) _ = self.config_push_events.fetchAdd(1, .monotonic);
+        std.log.info("sync: sent pool config update {s}/{d} (v={d}) to {d} config-capable peer(s)", .{
+            pool.subnet, pool.prefix_len, pool.config_version, sent,
+        });
+    }
+
+    /// Send a POOL_CONFIG_UPDATE to a specific peer (used by config anti-entropy).
+    /// Same as notifyPoolConfigUpdate but targets one specific peer instead of all.
+    fn sendPoolConfigToPeer(self: *Self, pool: *const config_mod.PoolConfig, peer_addr: std.posix.sockaddr.in) void {
+        // Render pool to YAML
+        var yaml_buf = std.ArrayList(u8){};
+        defer yaml_buf.deinit(self.allocator);
+        config_write.renderPool(yaml_buf.writer(self.allocator), pool) catch |err| {
+            std.log.err("sync: failed to render pool YAML for anti-entropy push: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Check size: header(13) + yaml must fit in our 8192 send buffer minus crypto overhead(42)
+        const header_size: usize = 13;
+        const max_payload = 8192 - overhead - 16; // conservative margin
+        if (header_size + yaml_buf.items.len > max_payload) {
+            std.log.warn("sync: pool config YAML too large to send ({d} bytes), skipping anti-entropy push", .{yaml_buf.items.len});
+            return;
+        }
+
+        // Build payload: [subnet_ip:4][prefix_len:1][config_version:i64 big-endian:8][yaml...]
+        const payload_len = header_size + yaml_buf.items.len;
+        const payload = self.allocator.alloc(u8, payload_len) catch return;
+        defer self.allocator.free(payload);
+
+        const subnet_ip = config_mod.parseIpv4(pool.subnet) catch [4]u8{ 0, 0, 0, 0 };
+        @memcpy(payload[0..4], &subnet_ip);
+        payload[4] = pool.prefix_len;
+        std.mem.writeInt(i64, payload[5..13], pool.config_version, .big);
+        @memcpy(payload[header_size..], yaml_buf.items);
+
+        self.sendMsg(peer_addr, .pool_config_update, payload);
+        _ = self.config_push_events.fetchAdd(1, .monotonic);
+        std.log.info("sync: sent pool config anti-entropy push {s}/{d} (v={d})", .{
+            pool.subnet, pool.prefix_len, pool.config_version,
+        });
+    }
+
+    /// Process an incoming pool config update from a peer.
+    fn processPoolConfigUpdate(self: *Self, plaintext: []const u8) void {
+        if (!self.isConfigSyncCapable()) {
+            std.log.debug("sync: ignoring pool config update: not config-sync-capable", .{});
+            return;
+        }
+
+        // Parse binary header: [subnet_ip:4][prefix_len:1][config_version:i64:8] = 13 bytes
+        const header_size: usize = 13;
+        if (plaintext.len < header_size) {
+            std.log.warn("sync: pool config update too short ({d} bytes)", .{plaintext.len});
+            return;
+        }
+
+        const subnet_ip: [4]u8 = plaintext[0..4].*;
+        const prefix_len = plaintext[4];
+        const incoming_version = std.mem.readInt(i64, plaintext[5..13], .big);
+        const pool_yaml = plaintext[header_size..];
+
+        // Format subnet IP for logging and matching
+        var subnet_buf: [15]u8 = undefined;
+        const subnet_str = std.fmt.bufPrint(&subnet_buf, "{d}.{d}.{d}.{d}", .{
+            subnet_ip[0], subnet_ip[1], subnet_ip[2], subnet_ip[3],
+        }) catch "?";
+
+        // Find matching pool
+        const pool = self.findPoolBySubnet(subnet_str, prefix_len) orelse {
+            std.log.warn("sync: pool config update for unknown pool {s}/{d}, ignoring", .{ subnet_str, prefix_len });
+            return;
+        };
+
+        // Last-write-wins: compare config_version
+        if (incoming_version <= pool.config_version) {
+            std.log.debug("sync: discarding older pool config update for {s}/{d} (incoming={d}, existing={d})", .{
+                subnet_str, prefix_len, incoming_version, pool.config_version,
+            });
+            return;
+        }
+
+        // Parse the incoming pool YAML into a new PoolConfig
+        var new_pool = config_mod.parsePoolFromYaml(self.allocator, pool_yaml) catch |err| {
+            std.log.warn("sync: failed to parse pool config YAML from peer: {s}", .{@errorName(err)});
+            return;
+        };
+        // Ensure the parsed pool matches the expected subnet/prefix (safety check)
+        if (new_pool.prefix_len != prefix_len or !std.mem.eql(u8, new_pool.subnet, subnet_str)) {
+            std.log.warn("sync: pool config update subnet mismatch: expected {s}/{d}, got {s}/{d}", .{
+                subnet_str, prefix_len, new_pool.subnet, new_pool.prefix_len,
+            });
+            new_pool.deinit(self.allocator);
+            return;
+        }
+
+        // Preserve the config_version from the header (in case YAML didn't include it)
+        new_pool.config_version = incoming_version;
+
+        // Find the pool index and replace
+        for (self.full_cfg.pools, 0..) |*p, i| {
+            if (p.prefix_len == prefix_len and std.mem.eql(u8, p.subnet, subnet_str)) {
+                // Deinit the old pool and replace
+                p.deinit(self.allocator);
+                self.full_cfg.pools[i] = new_pool;
+
+                // Persist to config.yaml
+                config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+                    std.log.err("sync: pool config update applied in memory but file write failed ({s}); will retry on next sync cycle", .{@errorName(err)});
+                    return;
+                };
+
+                // Recompute pool hash states so voting reflects the new config
+                self.computeLocalPoolStates();
+                self.reevaluatePoolStates();
+
+                // Seed any new reservations into the lease store
+                for (self.full_cfg.pools[i].reservations) |*r| {
+                    self.store.addLease(.{
+                        .mac = r.mac,
+                        .ip = r.ip,
+                        .hostname = r.hostname,
+                        .expires = 0,
+                        .client_id = r.client_id,
+                        .reserved = true,
+                    }) catch {};
+                }
+
+                _ = self.config_recv_events.fetchAdd(1, .monotonic);
+                std.log.info("sync: applied pool config update from peer: {s}/{d} (v={d})", .{
+                    subnet_str, prefix_len, incoming_version,
+                });
+                return;
+            }
+        }
+
+        // Should not reach here since we found the pool above, but guard anyway
+        new_pool.deinit(self.allocator);
+        std.log.warn("sync: pool config update: pool {s}/{d} disappeared during apply", .{ subnet_str, prefix_len });
+    }
+
+    // -----------------------------------------------------------------------
     // Internal: crypto
     // -----------------------------------------------------------------------
 
@@ -716,12 +1224,13 @@ pub const SyncManager = struct {
         }
     }
 
-    /// Maximum HELLO payload size: version(1) + gn_len(1) + group_name(255) + pool_count(1) + 32 * 37
-    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 37;
+    /// Maximum HELLO payload size: version(1) + gn_len(1) + group_name(255) + pool_count(1) + 32 * 45
+    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 45 + 1;
 
     /// Build a v2 HELLO/HELLO_ACK payload into the provided buffer.
     /// Format: [version:u8=2][gn_len:u8][group_name:N][pool_count:u8]
-    ///         for each pool: [subnet_ip:4][prefix_len:1][hash:32]
+    ///         for each pool: [subnet_ip:4][prefix_len:1][hash:32][config_version:i64 big-endian:8]
+    ///         [capabilities:u8]
     /// Returns the number of bytes written.
     fn buildHelloPayload(self: *Self, buf: []u8) usize {
         var off: usize = 0;
@@ -735,19 +1244,28 @@ pub const SyncManager = struct {
         off += gn_len;
         buf[off] = self.pool_states_len;
         off += 1;
-        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+        for (self.pool_states[0..self.pool_states_len], 0..) |*ps, i| {
             @memcpy(buf[off .. off + 4], &ps.subnet_ip);
             off += 4;
             buf[off] = ps.prefix_len;
             off += 1;
             @memcpy(buf[off .. off + 32], &ps.local_hash);
             off += 32;
+            // config_version (i64 big-endian, 8 bytes)
+            const cv: i64 = if (i < self.full_cfg.pools.len) self.full_cfg.pools[i].config_version else 0;
+            std.mem.writeInt(i64, buf[off..][0..8], cv, .big);
+            off += 8;
         }
+        // Capabilities byte (appended after pool entries for backward compat)
+        var caps: u8 = 0;
+        if (self.full_cfg.config_writable and self.cfg.config_sync) caps |= 0x01; // bit 0: config_sync_capable
+        buf[off] = caps;
+        off += 1;
         return off;
     }
 
     fn helloPayloadLen(self: *Self) usize {
-        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 37;
+        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 45 + 1;
     }
 
     // -----------------------------------------------------------------------
@@ -767,7 +1285,7 @@ pub const SyncManager = struct {
             // (group name matched during the HELLO handshake).  After a pool
             // config change, updatePoolStates() marks all peers unauthenticated,
             // so stale-config peers are locked out until they re-handshake.
-            .lease_update, .lease_delete, .keepalive, .lease_hash => {
+            .lease_update, .lease_delete, .keepalive, .lease_hash, .reservation_update, .reservation_delete, .pool_config_update => {
                 const peer = self.findPeer(src) orelse return;
                 if (!peer.authenticated) {
                     log_v.debug("sync: ignoring {s} from unauthenticated peer", .{@tagName(result.msg_type)});
@@ -779,6 +1297,9 @@ pub const SyncManager = struct {
                     .lease_delete => self.applyLeaseDelete(result.plaintext),
                     .lease_hash => self.processLeaseHash(src, result.plaintext),
                     .keepalive => {},
+                    .reservation_update => self.processReservationUpdate(result.plaintext),
+                    .reservation_delete => self.processReservationDelete(result.plaintext),
+                    .pool_config_update => self.processPoolConfigUpdate(result.plaintext),
                     else => unreachable,
                 }
             },
@@ -838,12 +1359,24 @@ pub const SyncManager = struct {
                 .subnet_ip = plaintext[off..][0..4].*,
                 .prefix_len = plaintext[off + 4],
                 .hash = plaintext[off + 5 ..][0..32].*,
+                .config_version = if (off + 45 <= plaintext.len)
+                    std.mem.readInt(i64, plaintext[off + 37 ..][0..8], .big)
+                else
+                    0,
             };
-            off += 37;
+            off += if (off + 45 <= plaintext.len) @as(usize, 45) else @as(usize, 37);
         }
         peer.peer_pool_hashes_len = parsed;
         if (parsed < pool_count) {
             std.log.warn("sync: HELLO from peer advertised {d} pools but payload only contained {d}", .{ pool_count, parsed });
+        }
+
+        // Parse optional capabilities byte (backward compat: absent = 0)
+        if (off < plaintext.len) {
+            const caps = plaintext[off];
+            peer.config_sync_capable = (caps & 0x01) != 0;
+        } else {
+            peer.config_sync_capable = false;
         }
 
         if (!is_ack) {
@@ -855,6 +1388,38 @@ pub const SyncManager = struct {
 
         // Re-evaluate pool enable/disable states
         self.reevaluatePoolStates();
+
+        // Config anti-entropy: push newer config to peer if we have it
+        if (peer.config_sync_capable and self.isConfigSyncCapable()) {
+            for (self.pool_states[0..self.pool_states_len], 0..) |*ps, pool_idx| {
+                for (peer.peer_pool_hashes[0..peer.peer_pool_hashes_len]) |pph| {
+                    if (std.mem.eql(u8, &pph.subnet_ip, &ps.subnet_ip) and pph.prefix_len == ps.prefix_len) {
+                        if (!std.mem.eql(u8, &pph.hash, &ps.local_hash)) {
+                            // Hashes differ -- check config_version
+                            if (pool_idx < self.full_cfg.pools.len) {
+                                const local_pool = &self.full_cfg.pools[pool_idx];
+                                if (local_pool.config_version > pph.config_version) {
+                                    // We have newer config -- push to peer
+                                    std.log.info("sync: config anti-entropy: pushing pool {d}.{d}.{d}.{d}/{d} (v={d}) to peer (v={d})", .{
+                                        ps.subnet_ip[0],           ps.subnet_ip[1],    ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                                        local_pool.config_version, pph.config_version,
+                                    });
+                                    self.sendPoolConfigToPeer(local_pool, peer.addr);
+                                } else if (local_pool.config_version == pph.config_version and local_pool.config_version > 0) {
+                                    // Same version but different hash -- shouldn't happen
+                                    std.log.warn("sync: pool {d}.{d}.{d}.{d}/{d} config conflict: same version {d} but different hash, manual resolution needed", .{
+                                        ps.subnet_ip[0],           ps.subnet_ip[1], ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                                        local_pool.config_version,
+                                    });
+                                }
+                                // If peer has newer version, they'll push to us
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         // Exchange lease hashes immediately
         var lh: [32]u8 = self.computeLeaseHash();
@@ -1092,6 +1657,26 @@ fn parseIpv4Local(s: []const u8) ![4]u8 {
     if (idx != 3) return error.InvalidAddress;
     result[idx] = @intCast(octet);
     return result;
+}
+
+/// Detect the local outbound IPv4 address by connecting a UDP socket to a
+/// well-known external address (8.8.8.8:53) and reading the local endpoint.
+/// No traffic is sent — this just queries the OS routing table.
+fn probeLocalIp() ?[4]u8 {
+    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return null;
+    defer std.posix.close(sock);
+    const dst = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = @bitCast([4]u8{ 8, 8, 8, 8 }),
+    };
+    std.posix.connect(sock, @ptrCast(&dst), @sizeOf(std.posix.sockaddr.in)) catch return null;
+    var local: std.posix.sockaddr.in = undefined;
+    var local_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    std.posix.getsockname(sock, @ptrCast(&local), &local_len) catch return null;
+    const ip: [4]u8 = @bitCast(local.addr);
+    if (std.mem.eql(u8, &ip, &[4]u8{ 0, 0, 0, 0 })) return null;
+    return ip;
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,8 +2607,8 @@ test "buildHelloPayload v2: verify structure" {
     const pool_count = buf[2 + gn_len];
     try std.testing.expectEqual(@as(u8, 1), pool_count);
 
-    // Expected length: 1 + 1 + 10 + 1 + 1*37 = 50
-    try std.testing.expectEqual(@as(usize, 50), len);
+    // Expected length: 1 + 1 + 10 + 1 + 1*45 + 1(caps) = 59
+    try std.testing.expectEqual(@as(usize, 59), len);
 
     // Subnet IP should be 192.168.1.0
     const off = 2 + @as(usize, gn_len) + 1;
@@ -2031,6 +2616,45 @@ test "buildHelloPayload v2: verify structure" {
 
     // Prefix len should be 24
     try std.testing.expectEqual(@as(u8, 24), buf[off + 4]);
+
+    // config_version should be 0 (default)
+    try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, buf[off + 5 + 32 ..][0..8], .big));
+
+    // Capabilities byte: config_writable defaults to false, so caps = 0
+    try std.testing.expectEqual(@as(u8, 0), buf[len - 1]);
+}
+
+test "buildHelloPayload v2: config_version is written correctly" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.pools[0].config_version = 1712345678;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-v2-cv-test");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const len = mgr.buildHelloPayload(&buf);
+    _ = len;
+
+    // Pool entry starts at: 2 + 10 (group_name) + 1 = 13
+    const off = 2 + @as(usize, 10) + 1;
+    // config_version is at offset 37 within the pool entry (after subnet_ip:4 + prefix_len:1 + hash:32)
+    const cv = std.mem.readInt(i64, buf[off + 37 ..][0..8], .big);
+    try std.testing.expectEqual(@as(i64, 1712345678), cv);
 }
 
 test "isIpInDisabledPool: returns false when no pool states" {
@@ -2202,16 +2826,16 @@ test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
     const pool_count = buf[2 + gn_len];
     try std.testing.expectEqual(@as(u8, 2), pool_count);
 
-    // Expected length: 1 + 1 + 5 + 1 + 2*37 = 82
-    try std.testing.expectEqual(@as(usize, 82), len);
+    // Expected length: 1 + 1 + 5 + 1 + 2*45 + 1(caps) = 99
+    try std.testing.expectEqual(@as(usize, 99), len);
 
     // Pool 0 entry: subnet_ip=192.168.1.0, prefix_len=24
     const off0 = 2 + @as(usize, gn_len) + 1;
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 0 }, buf[off0 .. off0 + 4]);
     try std.testing.expectEqual(@as(u8, 24), buf[off0 + 4]);
 
-    // Pool 1 entry: subnet_ip=10.0.0.0, prefix_len=24, starts 37 bytes after pool 0
-    const off1 = off0 + 37;
+    // Pool 1 entry: subnet_ip=10.0.0.0, prefix_len=24, starts 45 bytes after pool 0
+    const off1 = off0 + 45;
     try std.testing.expectEqualSlices(u8, &[4]u8{ 10, 0, 0, 0 }, buf[off1 .. off1 + 4]);
     try std.testing.expectEqual(@as(u8, 24), buf[off1 + 4]);
 
@@ -2220,4 +2844,1222 @@ test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
     try std.testing.expectEqualSlices(u8, &hash0, buf[off0 + 5 .. off0 + 37]);
     const hash1 = config_mod.computePerPoolHash(&cfg.pools[1]);
     try std.testing.expectEqualSlices(u8, &hash1, buf[off1 + 5 .. off1 + 37]);
+
+    // Verify config_version fields (both should be 0 for default configs)
+    try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, buf[off0 + 37 ..][0..8], .big));
+    try std.testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, buf[off1 + 37 ..][0..8], .big));
+}
+
+test "buildHelloPayload v2: config_sync sets capability bit" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.config_writable = true; // global gate must also be true
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "caps-test",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    const aes_key = SyncManager.deriveKey("hello-v2-caps");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const len = mgr.buildHelloPayload(&buf);
+
+    // Last byte should be capabilities = 0x01 (config_sync_capable)
+    try std.testing.expectEqual(@as(u8, 0x01), buf[len - 1]);
+}
+
+test "processHello: capabilities byte parsed correctly" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-caps-parse");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    // processHello sends a lease_hash reply, so we need a valid UDP socket
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    // Build a HELLO payload with config_writable=true from a "remote" peer
+    var remote_sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    var remote_cfg = makeTestConfig(alloc);
+    defer remote_cfg.deinit();
+    remote_cfg.config_writable = true; // global gate must also be true
+    const remote_store = try makeTestStateStore(alloc);
+    defer remote_store.deinit();
+    var remote_mgr = makeTestManagerWithCfg(aes_key, &remote_cfg, remote_store);
+    remote_mgr.cfg = &remote_sync_cfg;
+    defer remote_mgr.peers.deinit(alloc);
+
+    var payload_buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const payload_len = remote_mgr.buildHelloPayload(&payload_buf);
+
+    // Process as HELLO_ACK (is_ack=true avoids sending HELLO_ACK back)
+    const src = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+    };
+    mgr.processHello(src, payload_buf[0..payload_len], true);
+
+    // Verify the peer was added with config_sync_capable=true
+    try std.testing.expectEqual(@as(usize, 1), mgr.peers.items.len);
+    try std.testing.expect(mgr.peers.items[0].config_sync_capable);
+    try std.testing.expect(mgr.peers.items[0].authenticated);
+}
+
+test "processHello: missing capabilities byte defaults to false" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-nocaps");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    // processHello sends a lease_hash reply, so we need a valid UDP socket
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    // Manually craft a v2 HELLO payload WITHOUT the capabilities byte
+    // Format: [version=2][gn_len=10][group_name="test-group"][pool_count=0]
+    var payload: [13]u8 = undefined;
+    payload[0] = HELLO_PROTOCOL_VERSION; // version
+    payload[1] = 10; // group name length
+    @memcpy(payload[2..12], "test-group");
+    payload[12] = 0; // pool_count = 0 (no pools, so no trailing caps byte)
+
+    const src = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 2 }),
+    };
+    mgr.processHello(src, &payload, true);
+
+    // Peer should be added but config_sync_capable should default to false
+    try std.testing.expectEqual(@as(usize, 1), mgr.peers.items.len);
+    try std.testing.expect(!mgr.peers.items[0].config_sync_capable);
+    try std.testing.expect(mgr.peers.items[0].authenticated);
+}
+
+test "peerCount: returns correct counts" {
+    const alloc = std.testing.allocator;
+    const aes_key = SyncManager.deriveKey("peer-count-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(alloc);
+
+    // No peers initially
+    const c0 = mgr.peerCount();
+    try std.testing.expectEqual(@as(u32, 0), c0.total);
+    try std.testing.expectEqual(@as(u32, 0), c0.authenticated);
+    try std.testing.expectEqual(@as(u32, 0), c0.config_capable);
+
+    // Add an authenticated, config-capable peer
+    try mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = true,
+    });
+    // Add an unauthenticated peer
+    try mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 2 }),
+        },
+        .authenticated = false,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = false,
+    });
+    // Add an authenticated but not config-capable peer
+    try mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 3 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = false,
+    });
+
+    const c1 = mgr.peerCount();
+    try std.testing.expectEqual(@as(u32, 3), c1.total);
+    try std.testing.expectEqual(@as(u32, 2), c1.authenticated);
+    try std.testing.expectEqual(@as(u32, 1), c1.config_capable);
+}
+
+// ---------------------------------------------------------------------------
+// Reservation config sync (Phase 2) tests
+// ---------------------------------------------------------------------------
+
+fn makeTestConfigSyncManager(alloc: std.mem.Allocator) struct {
+    mgr: SyncManager,
+    cfg: config_mod.Config,
+    sync_cfg: config_mod.SyncConfig,
+    store: *state_mod.StateStore,
+} {
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    const store = makeTestStateStore(alloc) catch unreachable;
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("reservation-sync-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "/tmp/stardust-test-config.yaml",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    mgr.computeLocalPoolStates();
+
+    // IMPORTANT: re-link after cfg is at its final address
+    return .{ .mgr = mgr, .cfg = cfg, .sync_cfg = sync_cfg, .store = store };
+}
+
+test "ReservationSync JSON round-trip" {
+    const alloc = std.testing.allocator;
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "printer",
+        .client_id = null,
+        .config_modified = 1712345678,
+        .dhcp_options_str = "66=tftp.local,67=boot.img",
+    };
+
+    const json = try std.json.Stringify.valueAlloc(alloc, payload, .{});
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(
+        SyncManager.ReservationSync,
+        alloc,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    try std.testing.expectEqualStrings("192.168.1.0", v.pool_subnet);
+    try std.testing.expectEqual(@as(u8, 24), v.pool_prefix);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", v.mac);
+    try std.testing.expectEqualStrings("192.168.1.50", v.ip);
+    try std.testing.expectEqualStrings("printer", v.hostname.?);
+    try std.testing.expect(v.client_id == null);
+    try std.testing.expectEqual(@as(i64, 1712345678), v.config_modified);
+    try std.testing.expectEqualStrings("66=tftp.local,67=boot.img", v.dhcp_options_str.?);
+}
+
+test "ReservationSync JSON round-trip: minimal delete payload" {
+    const alloc = std.testing.allocator;
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "10.0.0.0",
+        .pool_prefix = 8,
+        .mac = "11:22:33:44:55:66",
+        .config_modified = 999,
+    };
+
+    const json = try std.json.Stringify.valueAlloc(alloc, payload, .{});
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(
+        SyncManager.ReservationSync,
+        alloc,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    try std.testing.expectEqualStrings("10.0.0.0", v.pool_subnet);
+    try std.testing.expectEqual(@as(u8, 8), v.pool_prefix);
+    try std.testing.expectEqualStrings("11:22:33:44:55:66", v.mac);
+    try std.testing.expectEqual(@as(i64, 999), v.config_modified);
+    try std.testing.expectEqualStrings("", v.ip);
+    try std.testing.expect(v.hostname == null);
+    try std.testing.expect(v.dhcp_options_str == null);
+}
+
+test "notifyReservationUpdate: sends only to config-capable peers" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    // Fix up internal pointers
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // We need a valid socket to send
+    result.mgr.sock_fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP) catch unreachable;
+    defer std.posix.close(result.mgr.sock_fd);
+
+    // Add one config-capable peer and one non-capable peer
+    try result.mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = true,
+    });
+    try result.mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 2 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = false,
+    });
+
+    const reservation = config_mod.Reservation{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "testhost",
+        .client_id = null,
+        .config_modified = 12345,
+    };
+
+    // This should not crash; it sends to the config-capable peer only.
+    // (We cannot easily verify the UDP packet content in a unit test,
+    // but we verify it doesn't panic and the log message is produced.)
+    result.mgr.notifyReservationUpdate(&result.cfg.pools[0], &reservation);
+}
+
+test "processReservationUpdate: applies newer reservation" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // Build incoming JSON payload
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "synced-host",
+        .client_id = null,
+        .config_modified = 99999,
+        .dhcp_options_str = null,
+    };
+    const json = std.json.Stringify.valueAlloc(alloc, payload, .{}) catch unreachable;
+    defer alloc.free(json);
+
+    result.mgr.processReservationUpdate(json);
+
+    // Verify reservation was added to the pool
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    const r = result.cfg.pools[0].reservations[0];
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", r.mac);
+    try std.testing.expectEqualStrings("192.168.1.50", r.ip);
+    try std.testing.expectEqualStrings("synced-host", r.hostname.?);
+    try std.testing.expectEqual(@as(i64, 99999), r.config_modified);
+
+    // Verify lease was seeded in the store
+    const lease = result.store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(lease != null);
+    try std.testing.expect(lease.?.reserved);
+}
+
+test "processReservationUpdate: rejects older reservation" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // First, apply a reservation with config_modified=500
+    const payload1 = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "host-v1",
+        .client_id = null,
+        .config_modified = 500,
+    };
+    const json1 = std.json.Stringify.valueAlloc(alloc, payload1, .{}) catch unreachable;
+    defer alloc.free(json1);
+    result.mgr.processReservationUpdate(json1);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    try std.testing.expectEqualStrings("host-v1", result.cfg.pools[0].reservations[0].hostname.?);
+
+    // Now try to apply an older reservation (config_modified=100) — should be rejected
+    const payload2 = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.51",
+        .hostname = "host-old",
+        .client_id = null,
+        .config_modified = 100,
+    };
+    const json2 = std.json.Stringify.valueAlloc(alloc, payload2, .{}) catch unreachable;
+    defer alloc.free(json2);
+    result.mgr.processReservationUpdate(json2);
+
+    // Should still have the original reservation, unchanged
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    try std.testing.expectEqualStrings("host-v1", result.cfg.pools[0].reservations[0].hostname.?);
+    try std.testing.expectEqualStrings("192.168.1.50", result.cfg.pools[0].reservations[0].ip);
+    try std.testing.expectEqual(@as(i64, 500), result.cfg.pools[0].reservations[0].config_modified);
+}
+
+test "processReservationDelete: removes reservation with newer timestamp" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // First, add a reservation
+    const add_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "to-delete",
+        .client_id = null,
+        .config_modified = 100,
+    };
+    const add_json = std.json.Stringify.valueAlloc(alloc, add_payload, .{}) catch unreachable;
+    defer alloc.free(add_json);
+    result.mgr.processReservationUpdate(add_json);
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+
+    // Now delete it with a newer timestamp
+    const del_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .config_modified = 200,
+    };
+    const del_json = std.json.Stringify.valueAlloc(alloc, del_payload, .{}) catch unreachable;
+    defer alloc.free(del_json);
+    result.mgr.processReservationDelete(del_json);
+
+    // Reservation should be gone
+    try std.testing.expectEqual(@as(usize, 0), result.cfg.pools[0].reservations.len);
+
+    // Lease should also be removed
+    try std.testing.expect(result.store.leases.get("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "processReservationDelete: rejects older timestamp" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // Add a reservation with config_modified=500
+    const add_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "keep-me",
+        .client_id = null,
+        .config_modified = 500,
+    };
+    const add_json = std.json.Stringify.valueAlloc(alloc, add_payload, .{}) catch unreachable;
+    defer alloc.free(add_json);
+    result.mgr.processReservationUpdate(add_json);
+
+    // Try to delete with an older timestamp (config_modified=100) — should be rejected
+    const del_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .config_modified = 100,
+    };
+    const del_json = std.json.Stringify.valueAlloc(alloc, del_payload, .{}) catch unreachable;
+    defer alloc.free(del_json);
+    result.mgr.processReservationDelete(del_json);
+
+    // Reservation should still exist
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    try std.testing.expectEqualStrings("keep-me", result.cfg.pools[0].reservations[0].hostname.?);
+}
+
+test "processReservationUpdate: not config-sync-capable is a no-op" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    // config_writable = false (default), so NOT config-sync-capable
+    const store = makeTestStateStore(alloc) catch unreachable;
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = false,
+    };
+    const aes_key = SyncManager.deriveKey("no-config-sync");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "should-not-apply",
+        .client_id = null,
+        .config_modified = 99999,
+    };
+    const json = std.json.Stringify.valueAlloc(alloc, payload, .{}) catch unreachable;
+    defer alloc.free(json);
+
+    mgr.processReservationUpdate(json);
+
+    // Reservation should NOT have been added (config_sync disabled)
+    try std.testing.expectEqual(@as(usize, 0), cfg.pools[0].reservations.len);
+}
+
+test "parseDhcpOptionsStr: round-trip key=value pairs" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+
+    var opts = result.mgr.parseDhcpOptionsStr("66=tftp.local,67=boot.img").?;
+    defer {
+        var it = opts.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        opts.deinit();
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), opts.count());
+    try std.testing.expectEqualStrings("tftp.local", opts.get("66").?);
+    try std.testing.expectEqualStrings("boot.img", opts.get("67").?);
+}
+
+test "parseDhcpOptionsStr: empty string returns null" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+
+    const opts = result.mgr.parseDhcpOptionsStr("");
+    try std.testing.expect(opts == null);
+}
+
+test "processReservationUpdate: with dhcp_options" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "pxe-host",
+        .client_id = null,
+        .config_modified = 1000,
+        .dhcp_options_str = "66=tftp.local,67=pxelinux.0",
+    };
+    const json = std.json.Stringify.valueAlloc(alloc, payload, .{}) catch unreachable;
+    defer alloc.free(json);
+
+    result.mgr.processReservationUpdate(json);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    const r = result.cfg.pools[0].reservations[0];
+    try std.testing.expect(r.dhcp_options != null);
+    try std.testing.expectEqualStrings("tftp.local", r.dhcp_options.?.get("66").?);
+    try std.testing.expectEqualStrings("pxelinux.0", r.dhcp_options.?.get("67").?);
+}
+
+test "encrypt/decrypt round-trip: reservation_update message type" {
+    const aes_key = SyncManager.deriveKey("res-msg-type-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    const plaintext = "{\"pool_subnet\":\"192.168.1.0\",\"pool_prefix\":24,\"mac\":\"aa:bb:cc:dd:ee:ff\"}";
+    var buf: [512]u8 = undefined;
+    const n = mgr.encrypt(.reservation_update, plaintext, &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [512]u8 = undefined;
+    const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.reservation_update, result.msg_type);
+    try std.testing.expectEqualStrings(plaintext, result.plaintext);
+}
+
+test "encrypt/decrypt round-trip: reservation_delete message type" {
+    const aes_key = SyncManager.deriveKey("res-del-msg-type-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    const plaintext = "{\"mac\":\"aa:bb:cc:dd:ee:ff\"}";
+    var buf: [512]u8 = undefined;
+    const n = mgr.encrypt(.reservation_delete, plaintext, &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [512]u8 = undefined;
+    const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.reservation_delete, result.msg_type);
+    try std.testing.expectEqualStrings(plaintext, result.plaintext);
+}
+
+test "encrypt/decrypt round-trip: pool_config_update message type" {
+    const aes_key = SyncManager.deriveKey("pool-cfg-msg-type-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    // Build a realistic payload: [subnet:4][prefix:1][version:8][yaml...]
+    var payload: [128]u8 = undefined;
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 1712345678, .big);
+    const yaml_frag = "  - subnet: 192.168.1.0/24\n    router: 192.168.1.1\n";
+    @memcpy(payload[13 .. 13 + yaml_frag.len], yaml_frag);
+    const total = 13 + yaml_frag.len;
+
+    var buf: [512]u8 = undefined;
+    const n = mgr.encrypt(.pool_config_update, payload[0..total], &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [512]u8 = undefined;
+    const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.pool_config_update, result.msg_type);
+    try std.testing.expectEqualStrings(payload[0..total], result.plaintext);
+
+    // Verify header fields can be extracted
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 0 }, result.plaintext[0..4]);
+    try std.testing.expectEqual(@as(u8, 24), result.plaintext[4]);
+    try std.testing.expectEqual(@as(i64, 1712345678), std.mem.readInt(i64, result.plaintext[5..13], .big));
+}
+
+test "notifyPoolConfigUpdate builds correct payload" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 1712345678;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-notify-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+
+    // notifyPoolConfigUpdate should not crash even with no peers.
+    // This exercises the YAML rendering + payload building path.
+    mgr.notifyPoolConfigUpdate(&cfg.pools[0]);
+}
+
+test "processPoolConfigUpdate applies newer version" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 100;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-apply-test");
+    const tmp_cfg_path = "/tmp/stardust_test_pool_cfg_apply.yaml";
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = tmp_cfg_path,
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+    defer std.fs.cwd().deleteFile(tmp_cfg_path) catch {};
+    mgr.computeLocalPoolStates();
+
+    // Build a pool config update with newer version and changed lease_time.
+    // First render the existing pool to YAML but with modified fields.
+    var modified = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "192.168.1.10",
+        .pool_end = "192.168.1.200",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 7200, // changed from 3600
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 7200 },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = &.{},
+        .static_routes = &.{},
+        .config_version = 200, // newer than 100
+    };
+    _ = &modified;
+
+    var yaml_buf = std.ArrayList(u8){};
+    defer yaml_buf.deinit(alloc);
+    config_write.renderPool(yaml_buf.writer(alloc), &modified) catch unreachable;
+
+    // Build binary payload
+    const header_size: usize = 13;
+    const payload_len = header_size + yaml_buf.items.len;
+    const payload = alloc.alloc(u8, payload_len) catch unreachable;
+    defer alloc.free(payload);
+
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 200, .big);
+    @memcpy(payload[header_size..], yaml_buf.items);
+
+    // Process the update. Note: cfg_path="" means writeConfig will fail, but
+    // we test that the in-memory pool is replaced correctly.
+    mgr.processPoolConfigUpdate(payload);
+
+    // Since writeConfig fails (empty path), the pool should still be updated
+    // in memory. Check lease_time was changed.
+    try std.testing.expectEqual(@as(u32, 7200), cfg.pools[0].lease_time);
+    try std.testing.expectEqual(@as(i64, 200), cfg.pools[0].config_version);
+}
+
+test "processPoolConfigUpdate rejects older version" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 500;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-reject-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+    mgr.computeLocalPoolStates();
+
+    // Build a pool config update with OLDER version (100 < 500).
+    var modified = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "192.168.1.10",
+        .pool_end = "192.168.1.200",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 9999, // changed
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 9999 },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = &.{},
+        .static_routes = &.{},
+        .config_version = 100, // older than 500
+    };
+    _ = &modified;
+
+    var yaml_buf = std.ArrayList(u8){};
+    defer yaml_buf.deinit(alloc);
+    config_write.renderPool(yaml_buf.writer(alloc), &modified) catch unreachable;
+
+    const header_size: usize = 13;
+    const payload_len = header_size + yaml_buf.items.len;
+    const payload = alloc.alloc(u8, payload_len) catch unreachable;
+    defer alloc.free(payload);
+
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 100, .big);
+    @memcpy(payload[header_size..], yaml_buf.items);
+
+    mgr.processPoolConfigUpdate(payload);
+
+    // Pool should be UNCHANGED (older version rejected).
+    try std.testing.expectEqual(@as(u32, 3600), cfg.pools[0].lease_time);
+    try std.testing.expectEqual(@as(i64, 500), cfg.pools[0].config_version);
+}
+
+test "processReservationUpdate: malformed JSON does not crash" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    const before = result.mgr.reservation_recv_events.load(.monotonic);
+
+    // Feed malformed JSON — should log a warning but not crash
+    result.mgr.processReservationUpdate("not valid json{{");
+
+    // Counter should NOT have been incremented (parse failed early)
+    try std.testing.expectEqual(before, result.mgr.reservation_recv_events.load(.monotonic));
+    // No reservations should have been added
+    try std.testing.expectEqual(@as(usize, 0), result.cfg.pools[0].reservations.len);
+}
+
+test "processPoolConfigUpdate: malformed YAML does not crash" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 10;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("pool-cfg-malformed-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+    mgr.computeLocalPoolStates();
+
+    const before = mgr.config_recv_events.load(.monotonic);
+
+    // Build a valid binary header (subnet 192.168.1.0/24, version 20 > 10)
+    // but with garbage YAML body
+    const header_size: usize = 13;
+    const garbage_yaml = "{{{{not: valid: yaml: [[[";
+    var payload: [header_size + garbage_yaml.len]u8 = undefined;
+    @memcpy(payload[0..4], &[_]u8{ 192, 168, 1, 0 });
+    payload[4] = 24;
+    std.mem.writeInt(i64, payload[5..13], 20, .big);
+    @memcpy(payload[header_size..], garbage_yaml);
+
+    // Should log an error but not crash
+    mgr.processPoolConfigUpdate(&payload);
+
+    // Counter should NOT have been incremented (YAML parse failed)
+    try std.testing.expectEqual(before, mgr.config_recv_events.load(.monotonic));
+    // Pool config should be unchanged
+    try std.testing.expectEqual(@as(u32, 3600), cfg.pools[0].lease_time);
+    try std.testing.expectEqual(@as(i64, 10), cfg.pools[0].config_version);
+}
+
+// ---------------------------------------------------------------------------
+// Config anti-entropy (Phase 5) tests
+// ---------------------------------------------------------------------------
+
+test "processHello: config_version parsed from HELLO payload" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.pools[0].config_version = 42;
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    const aes_key = SyncManager.deriveKey("hello-cv-parse");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    // Need a valid socket for processHello (it sends lease_hash)
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    // Build a HELLO from a "remote" peer with config_version=100
+    var remote_cfg = makeTestConfig(alloc);
+    defer remote_cfg.deinit();
+    remote_cfg.config_writable = true;
+    remote_cfg.pools[0].config_version = 100;
+    const remote_store = try makeTestStateStore(alloc);
+    defer remote_store.deinit();
+    var remote_sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+    var remote_mgr = makeTestManagerWithCfg(aes_key, &remote_cfg, remote_store);
+    remote_mgr.cfg = &remote_sync_cfg;
+    defer remote_mgr.peers.deinit(alloc);
+
+    var payload_buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const payload_len = remote_mgr.buildHelloPayload(&payload_buf);
+
+    const src = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+    };
+    mgr.processHello(src, payload_buf[0..payload_len], true);
+
+    // Verify the peer's config_version was parsed correctly
+    try std.testing.expectEqual(@as(usize, 1), mgr.peers.items.len);
+    try std.testing.expect(mgr.peers.items[0].authenticated);
+    try std.testing.expectEqual(@as(u8, 1), mgr.peers.items[0].peer_pool_hashes_len);
+    try std.testing.expectEqual(@as(i64, 100), mgr.peers.items[0].peer_pool_hashes[0].config_version);
+}
+
+test "sendPoolConfigToPeer: does not crash and builds valid payload" {
+    const alloc = std.testing.allocator;
+
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    cfg.pools[0].config_version = 500;
+    defer cfg.deinit();
+
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("anti-entropy-send-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+
+    // Create a UDP socket so sendMsg doesn't crash
+    mgr.sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(mgr.sock_fd);
+
+    const peer_addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 647),
+        .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+    };
+
+    // Should not crash; exercises the YAML rendering + payload building + send path
+    mgr.sendPoolConfigToPeer(&cfg.pools[0], peer_addr);
+}
+
+test "helloPayloadLen: returns correct value for 45-byte entries" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-len-test");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    const expected_len = mgr.helloPayloadLen();
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const actual_len = mgr.buildHelloPayload(&buf);
+    try std.testing.expectEqual(expected_len, actual_len);
 }

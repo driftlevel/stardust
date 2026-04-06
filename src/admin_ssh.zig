@@ -888,7 +888,11 @@ const TuiState = struct {
     settings_pending_bind_buf: [64]u8 = [_]u8{0} ** 64,
     settings_pending_bind_len: usize = 0,
     settings_pending_random_alloc: bool = false,
+    settings_pending_config_sync: bool = false,
     settings_needs_scroll: bool = false, // set by key handler, cleared after auto-scroll
+    // Dynamic line-to-edit mapping populated by renderSettingsTab, used by handleSettingsClick.
+    settings_line_to_edit: [40]?u8 = [_]?u8{null} ** 40,
+    settings_line_count: u16 = 0,
     // Validation error display.
     settings_err_buf: [80]u8 = [_]u8{0} ** 80,
     settings_err_len: usize = 0,
@@ -1953,6 +1957,41 @@ fn drawLeaseTable(
 
 /// Sort context for raw leases.  Operates on state_mod.Lease directly so that
 /// the expires column sorts by numeric timestamp rather than a formatted string.
+/// Natural sort comparison: digit runs compared as numbers, everything else
+/// compared as bytes. "client-2" < "client-10", "ap-1" < "ap-20".
+/// Degrades to pure lexicographic when no digits are present.
+fn naturalLessThan(a: []const u8, b: []const u8) bool {
+    var ai: usize = 0;
+    var bi: usize = 0;
+    while (ai < a.len and bi < b.len) {
+        const a_digit = a[ai] >= '0' and a[ai] <= '9';
+        const b_digit = b[bi] >= '0' and b[bi] <= '9';
+        if (a_digit and b_digit) {
+            // Count digit run lengths first (avoids u64 overflow on 20+ digit runs).
+            const a_start = ai;
+            const b_start = bi;
+            while (ai < a.len and a[ai] >= '0' and a[ai] <= '9') : (ai += 1) {}
+            while (bi < b.len and b[bi] >= '0' and b[bi] <= '9') : (bi += 1) {}
+            const a_run = a[a_start..ai];
+            const b_run = b[b_start..bi];
+            // Skip leading zeros for comparison.
+            const a_sig = std.mem.trimLeft(u8, a_run, "0");
+            const b_sig = std.mem.trimLeft(u8, b_run, "0");
+            // Compare: longer significant run = larger number.
+            if (a_sig.len != b_sig.len) return a_sig.len < b_sig.len;
+            // Same length: compare lexicographically (digits are ordered).
+            if (!std.mem.eql(u8, a_sig, b_sig)) return std.mem.lessThan(u8, a_sig, b_sig);
+            // Equal numbers — continue comparing remaining characters.
+        } else {
+            // At least one side is non-digit — compare bytes.
+            if (a[ai] != b[bi]) return a[ai] < b[bi];
+            ai += 1;
+            bi += 1;
+        }
+    }
+    return a.len < b.len;
+}
+
 const LeaseSort = struct {
     col: SortCol,
     dir: SortDir,
@@ -1963,7 +2002,7 @@ const LeaseSort = struct {
             .none => return false,
             .ip => ipLess(a.ip, b.ip),
             .mac => std.mem.lessThan(u8, a.mac, b.mac),
-            .hostname => std.mem.lessThan(u8, a.hostname orelse "", b.hostname orelse ""),
+            .hostname => naturalLessThan(a.hostname orelse "", b.hostname orelse ""),
             .type => std.mem.lessThan(u8, if (a.reserved) "reserved" else "dynamic", if (b.reserved) "reserved" else "dynamic"),
             .expires => expiresLess(a, b),
             .pool => poolLess(ctx.cfg, a.ip, b.ip),
@@ -2114,7 +2153,7 @@ fn findPool(cfg: *const config_mod.Config, ip_str: []const u8) ?*const config_mo
     for (cfg.pools) |*pool| {
         const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch continue;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        if ((ip_int & pool.subnet_mask) == subnet_int) return pool;
+        if ((ip_int & pool.subnet_mask) == (subnet_int & pool.subnet_mask)) return pool;
     }
     return null;
 }
@@ -2163,9 +2202,11 @@ fn renderStatsTab(
     //   1 (blank) + 1 (pool header) + 3 * n_pools (label + bar + blank) +
     //   1 (DHCP header) + 10 (DHCP counters) +
     //   1 (blank) + 1 (defense header) + 5 (defense counters) +
-    //   1 (blank) + 1 (backend header) + 5 (backend counters) + 1 (trailing blank)
+    //   1 (blank) + 1 (backend header) + 9 (backend counters) +
+    //   1 (blank) + 1 (sync header) + sync_rows + 1 (trailing blank)
     const n_pools: u16 = @intCast(server.cfg.pools.len);
-    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 10 + 1 + 1 + 5 + 1 + 1 + 5 + 1;
+    const sync_rows: u16 = if (server.sync_mgr != null) 3 else 1; // peers + config sync + local config OR "not configured"
+    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 10 + 1 + 1 + 5 + 1 + 1 + 9 + 1 + 1 + sync_rows + 1;
 
     // Clamp scroll so we never scroll past the last line of content.
     const max_scroll: u16 = if (total_rows > win.height) total_rows - win.height else 0;
@@ -2295,6 +2336,10 @@ fn renderStatsTab(
         .{ .label = "SSH FAILURES    ", .val = ctr.ssh_failures.load(.monotonic) },
         .{ .label = "SYNC FULL       ", .val = if (server.sync_mgr) |s| s.sync_full_events.load(.monotonic) else 0 },
         .{ .label = "SYNC LEASE      ", .val = if (server.sync_mgr) |s| s.sync_lease_events.load(.monotonic) else 0 },
+        .{ .label = "CONFIG PUSH     ", .val = if (server.sync_mgr) |s| s.config_push_events.load(.monotonic) else 0 },
+        .{ .label = "CONFIG RECV     ", .val = if (server.sync_mgr) |s| s.config_recv_events.load(.monotonic) else 0 },
+        .{ .label = "RESV PUSH       ", .val = if (server.sync_mgr) |s| s.reservation_push_events.load(.monotonic) else 0 },
+        .{ .label = "RESV RECV       ", .val = if (server.sync_mgr) |s| s.reservation_recv_events.load(.monotonic) else 0 },
     };
 
     for (backend_lines) |cl| {
@@ -2302,6 +2347,42 @@ fn renderStatsTab(
             const line = try std.fmt.allocPrint(a, "    {s}  {d}", .{ cl.label, cl.val });
             _ = win.print(&.{.{ .text = line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
         }
+        vr += 1;
+    }
+
+    // ---- Sync Status ----
+    vr += 1; // blank separator
+    if (statsVr(vr, scroll, win.height)) |dr|
+        _ = win.print(&.{.{ .text = "  Sync Status", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+    vr += 1;
+
+    if (server.sync_mgr) |sm| {
+        const pc = sm.peerCount();
+        const peers_line = try std.fmt.allocPrint(a, "    Peers           {d} authenticated, {d} config-capable", .{ pc.authenticated, pc.config_capable });
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = peers_line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
+
+        const cfg_sync_on = if (server.cfg.sync) |s| s.config_sync else false;
+        const config_sync_line = try std.fmt.allocPrint(a, "    Config Sync     {s}", .{
+            if (cfg_sync_on) "enabled" else "disabled",
+        });
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = config_sync_line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
+
+        const local_label = if (server.cfg.config_writable and cfg_sync_on)
+            "    Local Config    writable + sync enabled"
+        else if (server.cfg.config_writable)
+            "    Local Config    writable (sync disabled)"
+        else
+            "    Local Config    read-only";
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = local_label, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
+    } else {
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = "    Not configured", .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
         vr += 1;
     }
 
@@ -2509,6 +2590,8 @@ fn saveReservation(server: *AdminServer, form: *ReservationForm) ?[]const u8 {
         server.store.removeLease(orig_mac);
         if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
             _ = config_write.removeReservation(server.allocator, pool, orig_mac);
+            // Notify sync peers that the old MAC reservation was deleted.
+            if (server.sync_mgr) |s| s.notifyReservationDelete(pool, orig_mac);
         }
     }
 
@@ -2550,9 +2633,25 @@ fn saveReservation(server: *AdminServer, form: *ReservationForm) ?[]const u8 {
         _ = config_write.upsertReservation(server.allocator, pool, mac, ip, hostname, null, opts) catch |err| {
             return @errorName(err);
         };
+        // Set config_modified timestamp for sync (before writeConfig so it gets persisted).
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, mac)) {
+                r.config_modified = std.time.timestamp();
+                break;
+            }
+        }
         config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
             return @errorName(err);
         };
+        // Notify sync peers of reservation change.
+        if (server.sync_mgr) |s| {
+            for (pool.reservations) |*r| {
+                if (std.mem.eql(u8, r.mac, mac)) {
+                    s.notifyReservationUpdate(pool, r);
+                    break;
+                }
+            }
+        }
     } else {
         return "IP not in any configured pool";
     }
@@ -2763,6 +2862,8 @@ fn handleDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key
                 config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
                     log.warn("delete reservation: failed to write config: {s}", .{@errorName(err)});
                 };
+                // Notify sync peers of reservation deletion.
+                if (server.sync_mgr) |s| s.notifyReservationDelete(pool, mac);
             }
         } else {
             // Dynamic lease: notify sync peers of deletion.
@@ -2793,7 +2894,7 @@ fn isIpInPool(ip_str: []const u8, pool: *const config_mod.PoolConfig) bool {
     const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
     const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-    return (ip_int & pool.subnet_mask) == subnet_int;
+    return (ip_int & pool.subnet_mask) == (subnet_int & pool.subnet_mask);
 }
 
 // ---------------------------------------------------------------------------
@@ -5096,7 +5197,8 @@ fn savePoolChanges(server: *AdminServer, state: *TuiState) void {
 
     if (form.isNew()) {
         // Build a new PoolConfig from form fields.
-        const pool = buildPoolFromForm(server.allocator, form) orelse return;
+        var pool = buildPoolFromForm(server.allocator, form) orelse return;
+        pool.config_version = std.time.timestamp();
         config_write.addPool(server.allocator, server.cfg, pool) catch return;
         // New pool is appended at the end.
         affected_pool_idx = server.cfg.pools.len - 1;
@@ -5105,12 +5207,22 @@ fn savePoolChanges(server: *AdminServer, state: *TuiState) void {
         const idx = form.editing_index.?;
         if (idx >= server.cfg.pools.len) return;
         applyFormToPool(server.allocator, &server.cfg.pools[idx], form);
+        server.cfg.pools[idx].config_version = std.time.timestamp();
         affected_pool_idx = idx;
     }
 
     // Persist and reload.
     config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch return;
     triggerReload(state);
+
+    // Notify sync peers of pool config change.
+    if (server.sync_mgr) |s| {
+        if (affected_pool_idx) |idx| {
+            if (idx < server.cfg.pools.len) {
+                s.notifyPoolConfigUpdate(&server.cfg.pools[idx]);
+            }
+        }
+    }
 
     // Send FORCERENEW to all active leases in the affected pool so clients
     // pick up the new settings (lease time, options, etc.).
@@ -5637,7 +5749,7 @@ const known_dhcp_options = [_]KnownOption{
     .{ .code = "252", .name = "WPAD URL" },
 };
 
-const SETTINGS_EDITABLE_COUNT: u8 = 6;
+const SETTINGS_EDITABLE_COUNT: u8 = 7;
 
 fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const cfg = server.cfg;
@@ -5656,7 +5768,8 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
 
     const dirty_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 60 } }, .bg = bg, .bold = true };
 
-    // Edit indices (visual order): 0=log_level, 1=random_alloc, 2=collect, 3=http_enable, 4=http_port, 5=http_bind
+    // Edit indices (visual order): 0=log_level, 1=random_alloc,
+    // 2=collect, 3=http_enable, 4=http_port, 5=http_bind, 6=config_sync (if sync enabled)
     // For text fields (4, 5), always show the pending buffer when dirty; otherwise show the live config value.
     const edit_vals = [SETTINGS_EDITABLE_COUNT][]const u8{
         if (state.settings_dirty[0]) @tagName(state.settings_pending_log_level) else @tagName(cfg.log_level),
@@ -5665,6 +5778,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         if (state.settings_dirty[3]) (if (state.settings_pending_http_enable) "true" else "false") else (if (cfg.metrics.http_enable) "true" else "false"),
         if (state.settings_pending_port_len > 0 or state.settings_dirty[4]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
         if (state.settings_pending_bind_len > 0 or state.settings_dirty[5]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
+        if (state.settings_dirty[6]) (if (state.settings_pending_config_sync) "true" else "false") else if (cfg.sync) |s| (if (s.config_sync) "true" else "false") else "false",
     };
 
     const LABEL_W: u16 = 24;
@@ -5685,6 +5799,8 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     lines_buf[lc] = .{ .label = "Log Level", .value = edit_vals[0], .is_section = false, .edit_idx = 0 };
     lc += 1;
     lines_buf[lc] = .{ .label = "Random IP Allocation", .value = edit_vals[1], .is_section = false, .edit_idx = 1 };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Config Writable", .value = if (cfg.config_writable) "true" else "false", .is_section = false, .edit_idx = null };
     lc += 1;
     lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
     lc += 1;
@@ -5719,6 +5835,8 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         lc += 1;
         lines_buf[lc] = .{ .label = "Enable", .value = "true", .is_section = false, .edit_idx = null };
         lc += 1;
+        lines_buf[lc] = .{ .label = "Config Sync", .value = edit_vals[6], .is_section = false, .edit_idx = 6 };
+        lc += 1;
         lines_buf[lc] = .{ .label = "Group", .value = s.group_name, .is_section = false, .edit_idx = null };
         lc += 1;
         lines_buf[lc] = .{ .label = "Port", .value = try std.fmt.allocPrint(fa, "{d}", .{s.port}), .is_section = false, .edit_idx = null };
@@ -5729,6 +5847,15 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         } else if (s.peers.len > 0) {
             lines_buf[lc] = .{ .label = "Peers", .value = try std.mem.join(fa, ", ", s.peers), .is_section = false, .edit_idx = null };
             lc += 1;
+        }
+    }
+
+    // Populate the line-to-edit mapping for handleSettingsClick.
+    state.settings_line_to_edit = [_]?u8{null} ** 40;
+    state.settings_line_count = @intCast(lc);
+    for (lines_buf[0..lc], 0..) |line, li| {
+        if (li < state.settings_line_to_edit.len) {
+            state.settings_line_to_edit[li] = line.edit_idx;
         }
     }
 
@@ -5800,7 +5927,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         if (is_selected and !is_text_field) {
             const hint = switch (line.edit_idx.?) {
                 0 => "  \xe2\x86\x90/\xe2\x86\x92 or Space: cycle",
-                1, 2, 3 => "  Space: toggle",
+                1, 2, 3, 6 => "  Space: toggle",
                 else => "",
             };
             _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(val_trunc.len)) + pad_n, .row_offset = dr, .wrap = .none });
@@ -5832,6 +5959,8 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     state.settings_err_len = 0;
 
     const is_text_field = (state.settings_row == 4 or state.settings_row == 5);
+    // Max editable index: 6 (config_sync) only if sync is configured, otherwise 5 (http_bind).
+    const max_edit: u8 = if (cfg.sync != null) 6 else 5;
 
     // Text field: handle typing, backspace, cursor movement directly.
     if (is_text_field) {
@@ -5880,7 +6009,7 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     // Navigation and toggle/cycle keys (shared between all field types).
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
         const old_row = state.settings_row;
-        if (state.settings_row + 1 < SETTINGS_EDITABLE_COUNT) state.settings_row += 1;
+        if (state.settings_row + 1 <= max_edit) state.settings_row += 1;
         if (state.settings_row != old_row) settingsOnRowChange(state, cfg);
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
         const old_row = state.settings_row;
@@ -5904,6 +6033,14 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                 const cur = if (state.settings_dirty[3]) state.settings_pending_http_enable else cfg.metrics.http_enable;
                 state.settings_pending_http_enable = !cur;
                 state.settings_dirty[3] = (state.settings_pending_http_enable != cfg.metrics.http_enable);
+            },
+            6 => {
+                // config_sync toggle (only reachable when sync is configured)
+                if (cfg.sync) |s| {
+                    const cur = if (state.settings_dirty[6]) state.settings_pending_config_sync else s.config_sync;
+                    state.settings_pending_config_sync = !cur;
+                    state.settings_dirty[6] = (state.settings_pending_config_sync != s.config_sync);
+                }
             },
             else => {},
         }
@@ -6133,6 +6270,15 @@ fn settingsBuildConfirm(state: *TuiState, cfg: *const config_mod.Config) void {
         pos += line.len;
         count += 1;
     }
+    if (state.settings_dirty[6]) {
+        if (cfg.sync) |s| {
+            const old = if (s.config_sync) "true" else "false";
+            const new = if (state.settings_pending_config_sync) "true" else "false";
+            const line = std.fmt.bufPrint(buf[pos..], "Config Sync: {s} -> {s}\n", .{ old, new }) catch "";
+            pos += line.len;
+            count += 1;
+        }
+    }
 
     state.settings_confirm_len = pos;
     state.settings_confirm_count = count;
@@ -6199,33 +6345,19 @@ fn handleSettingsClick(state: *TuiState, cfg: *const config_mod.Config, term_row
     // term_row - 1 + scroll.
     if (term_row < 1) return;
     const line_idx = (term_row - 1) + scroll;
-    // We need to map line_idx to an editable field. The line layout matches
-    // renderSettingsTab. After the blank line at 0:
-    // 1: --General--, 2: Listen, 3: State Dir, 4: Log Level(0), 5: Random(1),
-    // 6: blank, 7: --Metrics--, 8: Collect(2), 9: HTTP Enable(3), 10: Port(4), 11: Bind(5),
-    // 12: blank, 13: --Admin SSH--, 14-17: SSH fields (read-only)
-    const field_map = [_]struct { line: u16, edit: u8 }{
-        .{ .line = 4, .edit = 0 }, // log level
-        .{ .line = 5, .edit = 1 }, // random alloc
-        .{ .line = 8, .edit = 2 }, // collect
-        .{ .line = 9, .edit = 3 }, // http enable
-        .{ .line = 10, .edit = 4 }, // http port
-        .{ .line = 11, .edit = 5 }, // http bind
-    };
-    for (field_map) |fm| {
-        if (line_idx == fm.line) {
-            const old_row = state.settings_row;
-            state.settings_row = fm.edit;
-            state.settings_needs_scroll = true;
-            if (state.settings_row != old_row) settingsOnRowChange(state, cfg);
-            return;
-        }
+    // Use the dynamic line-to-edit mapping populated by renderSettingsTab.
+    if (line_idx >= state.settings_line_count or line_idx >= state.settings_line_to_edit.len) return;
+    if (state.settings_line_to_edit[line_idx]) |edit_idx| {
+        const old_row = state.settings_row;
+        state.settings_row = edit_idx;
+        state.settings_needs_scroll = true;
+        if (state.settings_row != old_row) settingsOnRowChange(state, cfg);
     }
 }
 
 fn settingsApplyAndReload(server: *AdminServer, state: *TuiState) void {
     const cfg = server.cfg;
-    // Indices: 0=log_level, 1=random_alloc, 2=collect, 3=http_enable, 4=http_port, 5=http_bind
+    // Indices: 0=log_level, 1=random_alloc, 2=collect, 3=http_enable, 4=http_port, 5=http_bind, 6=config_sync
     if (state.settings_dirty[0]) cfg.log_level = state.settings_pending_log_level;
     if (state.settings_dirty[1]) cfg.pool_allocation_random = state.settings_pending_random_alloc;
     if (state.settings_dirty[2]) cfg.metrics.collect = state.settings_pending_collect;
@@ -6235,6 +6367,11 @@ fn settingsApplyAndReload(server: *AdminServer, state: *TuiState) void {
     }
     if (state.settings_dirty[5]) {
         replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), state.settings_pending_bind_buf[0..state.settings_pending_bind_len]);
+    }
+    if (state.settings_dirty[6]) {
+        if (cfg.sync) |*s| {
+            s.config_sync = state.settings_pending_config_sync;
+        }
     }
     // Clear dirty flags and pending buffer lengths so re-entry re-initializes from live config.
     state.settings_dirty = [_]bool{false} ** SETTINGS_EDITABLE_COUNT;
@@ -9263,4 +9400,57 @@ test "validateReservationForm: empty hostname is valid (optional)" {
     form.mac_len = 17;
     // hostname_len stays 0 (default)
     try std.testing.expect(validateReservationForm(&form) == null);
+}
+
+test "naturalLessThan: numeric suffix ordering" {
+    try std.testing.expect(naturalLessThan("client-2", "client-10"));
+    try std.testing.expect(!naturalLessThan("client-10", "client-2"));
+}
+
+test "naturalLessThan: equal strings" {
+    try std.testing.expect(!naturalLessThan("host", "host"));
+}
+
+test "naturalLessThan: pure alpha degrades to lexicographic" {
+    try std.testing.expect(naturalLessThan("abc", "def"));
+    try std.testing.expect(!naturalLessThan("def", "abc"));
+}
+
+test "naturalLessThan: no digits same as std.mem.lessThan" {
+    try std.testing.expect(naturalLessThan("ap", "switch"));
+    try std.testing.expect(!naturalLessThan("switch", "ap"));
+}
+
+test "naturalLessThan: prefix differs before digits" {
+    try std.testing.expect(naturalLessThan("ap-1", "switch-1"));
+}
+
+test "naturalLessThan: multiple digit groups" {
+    try std.testing.expect(naturalLessThan("v1.2.3", "v1.2.10"));
+    try std.testing.expect(naturalLessThan("v1.9", "v1.10"));
+}
+
+test "naturalLessThan: empty string edge cases" {
+    try std.testing.expect(!naturalLessThan("", "")); // equal
+    try std.testing.expect(naturalLessThan("", "foo")); // empty < non-empty
+    try std.testing.expect(!naturalLessThan("foo", "")); // non-empty > empty
+}
+
+test "naturalLessThan: misaligned digits" {
+    try std.testing.expect(naturalLessThan("abc2def", "abc10xyz")); // 2 < 10, different suffixes
+    try std.testing.expect(naturalLessThan("x1y", "x2y")); // 1 < 2
+}
+
+test "naturalLessThan: 25+ digit runs do not overflow" {
+    // 25 nines vs 30 ones: 30-digit number is larger (more significant digits).
+    try std.testing.expect(naturalLessThan("item-" ++ "9" ** 25, "item-" ++ "1" ** 30));
+    try std.testing.expect(!naturalLessThan("item-" ++ "1" ** 30, "item-" ++ "9" ** 25));
+    // Equal very long digit runs.
+    try std.testing.expect(!naturalLessThan("item-" ++ "5" ** 25, "item-" ++ "5" ** 25));
+    // Same length, different digits: lexicographic comparison within equal-length significant runs.
+    try std.testing.expect(naturalLessThan("item-" ++ "1" ** 25, "item-" ++ "2" ** 25));
+    try std.testing.expect(!naturalLessThan("item-" ++ "2" ** 25, "item-" ++ "1" ** 25));
+    // Leading zeros: numerically equal, tie-broken by total string length.
+    try std.testing.expect(naturalLessThan("item-7", "item-007")); // shorter string first
+    try std.testing.expect(!naturalLessThan("item-007", "item-7"));
 }

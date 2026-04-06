@@ -64,12 +64,18 @@ pub fn renderConfig(w: anytype, cfg: *const config_mod.Config) !void {
     try w.print("  http_port: {d}\n", .{cfg.metrics.http_port});
     try w.print("  http_bind: {s}\n\n", .{cfg.metrics.http_bind});
 
+    // global config writable
+    if (cfg.config_writable) {
+        try w.writeAll("config_writable: true\n");
+    }
+
     // sync section (only if configured)
     if (cfg.sync) |s| {
         try w.writeAll("sync:\n");
         try w.print("  enable: {s}\n", .{if (s.enable) "true" else "false"});
         try w.print("  group_name: {s}\n", .{s.group_name});
         try w.print("  key_file: {s}\n", .{s.key_file});
+        try w.print("  config_sync: {s}\n", .{if (s.config_sync) "true" else "false"});
         try w.print("  port: {d}\n", .{s.port});
         try w.print("  full_sync_interval: {d}\n", .{s.full_sync_interval});
         if (s.multicast) |mc| {
@@ -91,7 +97,7 @@ pub fn renderConfig(w: anytype, cfg: *const config_mod.Config) !void {
     }
 }
 
-fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
+pub fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
     // subnet in CIDR notation
     try w.print("  - subnet: {s}/{d}\n", .{ pool.subnet, pool.prefix_len });
     try w.print("    router: {s}\n", .{pool.router});
@@ -218,7 +224,15 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
                     }
                 }
             }
+            if (r.config_modified != 0) {
+                try w.print("        config_modified: {d}\n", .{r.config_modified});
+            }
         }
+    }
+
+    // config_version (sync metadata, only if set)
+    if (pool.config_version != 0) {
+        try w.print("    config_version: {d}\n", .{pool.config_version});
     }
 
     // mac_classes (per-pool)
@@ -432,7 +446,7 @@ pub fn findPoolForIp(cfg: *const config_mod.Config, ip_str: []const u8) ?*config
     for (cfg.pools) |*pool| {
         const subnet_bytes = parseIpv4Local(pool.subnet) catch continue;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        if ((ip_int & pool.subnet_mask) == subnet_int) return pool;
+        if ((ip_int & pool.subnet_mask) == (subnet_int & pool.subnet_mask)) return pool;
     }
     return null;
 }
@@ -1463,4 +1477,259 @@ test "renderConfig: comprehensive pool with all fields populated" {
     try std.testing.expect(std.mem.indexOf(u8, out, "mac_classes:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "name: Phones") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "match: \"aa:bb:cc\"") != null);
+}
+
+test "renderPool includes config_version when non-zero" {
+    const allocator = std.testing.allocator;
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+        .config_version = 1712345678,
+    };
+    defer pool_opts.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderPool(buf.writer(allocator), &pool);
+    const out = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "config_version: 1712345678") != null);
+}
+
+test "renderPool omits config_version when zero" {
+    const allocator = std.testing.allocator;
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+        .config_version = 0,
+    };
+    defer pool_opts.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderPool(buf.writer(allocator), &pool);
+    const out = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "config_version") == null);
+}
+
+test "renderPool round-trip via parsePoolFromYaml preserves fields" {
+    const allocator = std.testing.allocator;
+
+    // Build a pool with several populated fields.
+    var dns_servers = try allocator.alloc([]const u8, 2);
+    dns_servers[0] = try allocator.dupe(u8, "8.8.8.8");
+    dns_servers[1] = try allocator.dupe(u8, "1.1.1.1");
+
+    var ntp_servers = try allocator.alloc([]const u8, 1);
+    ntp_servers[0] = try allocator.dupe(u8, "ntp.example.com");
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    {
+        const k = try allocator.dupe(u8, "66");
+        const v = try allocator.dupe(u8, "tftp.local");
+        try pool_opts.put(k, v);
+    }
+
+    var routes = try allocator.alloc(config_mod.StaticRoute, 1);
+    routes[0] = .{
+        .destination = .{ 10, 20, 0, 0 },
+        .prefix_len = 16,
+        .router = .{ 192, 168, 1, 254 },
+    };
+
+    var reservations = try allocator.alloc(config_mod.Reservation, 1);
+    reservations[0] = .{
+        .mac = try allocator.dupe(u8, "aa:bb:cc:dd:ee:ff"),
+        .ip = try allocator.dupe(u8, "192.168.1.50"),
+        .hostname = try allocator.dupe(u8, "myhost"),
+        .client_id = null,
+    };
+
+    var pool = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "192.168.1.0"),
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = try allocator.dupe(u8, "192.168.1.1"),
+        .pool_start = try allocator.dupe(u8, "192.168.1.10"),
+        .pool_end = try allocator.dupe(u8, "192.168.1.200"),
+        .dns_servers = dns_servers,
+        .domain_name = try allocator.dupe(u8, "example.local"),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 7200,
+        .time_offset = -18000,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = ntp_servers,
+        .mtu = 1400,
+        .wins_servers = try allocator.alloc([]const u8, 0),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
+        .boot_filename = try allocator.dupe(u8, "pxelinux.0"),
+        .http_boot_url = try allocator.dupe(u8, ""),
+        .dns_update = .{
+            .enable = false,
+            .server = try allocator.dupe(u8, ""),
+            .zone = try allocator.dupe(u8, ""),
+            .rev_zone = try allocator.dupe(u8, ""),
+            .key_name = try allocator.dupe(u8, ""),
+            .key_file = try allocator.dupe(u8, ""),
+            .lease_time = 7200,
+        },
+        .dhcp_options = pool_opts,
+        .reservations = reservations,
+        .static_routes = routes,
+        .config_version = 1712345678,
+    };
+    defer pool.deinit(allocator);
+
+    // Render to YAML
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderPool(buf.writer(allocator), &pool);
+
+    // Parse back
+    var parsed = try config_mod.parsePoolFromYaml(allocator, buf.items);
+    defer parsed.deinit(allocator);
+
+    // Verify fields
+    try std.testing.expectEqualStrings("192.168.1.0", parsed.subnet);
+    try std.testing.expectEqual(@as(u8, 24), parsed.prefix_len);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF00), parsed.subnet_mask);
+    try std.testing.expectEqualStrings("192.168.1.1", parsed.router);
+    try std.testing.expectEqualStrings("192.168.1.10", parsed.pool_start);
+    try std.testing.expectEqualStrings("192.168.1.200", parsed.pool_end);
+    try std.testing.expectEqual(@as(u32, 7200), parsed.lease_time);
+    try std.testing.expectEqualStrings("example.local", parsed.domain_name);
+    try std.testing.expectEqual(@as(usize, 2), parsed.dns_servers.len);
+    try std.testing.expectEqualStrings("8.8.8.8", parsed.dns_servers[0]);
+    try std.testing.expectEqualStrings("1.1.1.1", parsed.dns_servers[1]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.ntp_servers.len);
+    try std.testing.expectEqualStrings("ntp.example.com", parsed.ntp_servers[0]);
+    try std.testing.expectEqual(@as(?i32, -18000), parsed.time_offset);
+    try std.testing.expectEqual(@as(?u16, 1400), parsed.mtu);
+    try std.testing.expectEqualStrings("pxelinux.0", parsed.boot_filename);
+    try std.testing.expectEqual(@as(i64, 1712345678), parsed.config_version);
+
+    // DHCP options
+    try std.testing.expectEqual(@as(u32, 1), parsed.dhcp_options.count());
+    const opt_val = parsed.dhcp_options.get("66");
+    try std.testing.expect(opt_val != null);
+    try std.testing.expectEqualStrings("tftp.local", opt_val.?);
+
+    // Static routes
+    try std.testing.expectEqual(@as(usize, 1), parsed.static_routes.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 20, 0, 0 }, &parsed.static_routes[0].destination);
+    try std.testing.expectEqual(@as(u8, 16), parsed.static_routes[0].prefix_len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 254 }, &parsed.static_routes[0].router);
+
+    // Reservations
+    try std.testing.expectEqual(@as(usize, 1), parsed.reservations.len);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", parsed.reservations[0].mac);
+    try std.testing.expectEqualStrings("192.168.1.50", parsed.reservations[0].ip);
+    try std.testing.expect(parsed.reservations[0].hostname != null);
+    try std.testing.expectEqualStrings("myhost", parsed.reservations[0].hostname.?);
+}
+
+test "renderPool round-trip via parsePoolFromYaml minimal pool" {
+    const allocator = std.testing.allocator;
+
+    const pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pool = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "10.0.0.0"),
+        .subnet_mask = 0xFF000000,
+        .prefix_len = 8,
+        .router = try allocator.dupe(u8, "10.0.0.1"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .mtu = null,
+        .wins_servers = try allocator.alloc([]const u8, 0),
+        .tftp_servers = try allocator.alloc([]const u8, 0),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
+        .dns_update = .{
+            .enable = false,
+            .server = try allocator.dupe(u8, ""),
+            .zone = try allocator.dupe(u8, ""),
+            .rev_zone = try allocator.dupe(u8, ""),
+            .key_name = try allocator.dupe(u8, ""),
+            .key_file = try allocator.dupe(u8, ""),
+            .lease_time = 3600,
+        },
+        .dhcp_options = pool_opts,
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+        .config_version = 0,
+    };
+    defer pool.deinit(allocator);
+
+    // Render to YAML
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderPool(buf.writer(allocator), &pool);
+
+    // Parse back
+    var parsed = try config_mod.parsePoolFromYaml(allocator, buf.items);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectEqualStrings("10.0.0.0", parsed.subnet);
+    try std.testing.expectEqual(@as(u8, 8), parsed.prefix_len);
+    try std.testing.expectEqualStrings("10.0.0.1", parsed.router);
+    try std.testing.expectEqual(@as(u32, 3600), parsed.lease_time);
+    try std.testing.expectEqual(@as(i64, 0), parsed.config_version);
+    try std.testing.expectEqual(@as(usize, 0), parsed.reservations.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.static_routes.len);
 }
