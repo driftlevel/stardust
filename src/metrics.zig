@@ -9,7 +9,10 @@
 /// - Reads only the first line of the request to determine the path
 ///
 /// Metrics exposed:
-///   stardust_dhcp_packets_total{type="discover|offer|request|ack|nak|release|decline|inform"}
+///   stardust_dhcp_packets_total{type="discover|offer|request|ack|nak|release|decline|inform|leasequery|forcerenew"}
+///   stardust_defense_events_total{type="probe_conflict|decline_ip_quarantined|decline_mac_blocked|decline_global_limited|decline_refused"}
+///   stardust_ssh_events_total{type="attempts|logins|failures"}
+///   stardust_uptime_seconds
 ///   stardust_leases_active{pool="<subnet>/<prefix>"}
 ///   stardust_leases_reserved{pool="<subnet>/<prefix>"}
 ///   stardust_leases_expired{pool="<subnet>/<prefix>"}
@@ -175,6 +178,22 @@ pub const MetricsServer = struct {
         try w.print("stardust_dhcp_packets_total{{type=\"inform\"}} {d}\n", .{self.counters.inform.load(.monotonic)});
         try w.print("stardust_dhcp_packets_total{{type=\"leasequery\"}} {d}\n", .{self.counters.leasequery.load(.monotonic)});
         try w.print("stardust_dhcp_packets_total{{type=\"forcerenew\"}} {d}\n", .{self.counters.forcerenew.load(.monotonic)});
+
+        // Defense / security event counters
+        try w.writeAll("\n# HELP stardust_defense_events_total Defense and security events since start\n");
+        try w.writeAll("# TYPE stardust_defense_events_total counter\n");
+        try w.print("stardust_defense_events_total{{type=\"probe_conflict\"}} {d}\n", .{self.counters.probe_conflict.load(.monotonic)});
+        try w.print("stardust_defense_events_total{{type=\"decline_ip_quarantined\"}} {d}\n", .{self.counters.decline_ip_quarantined.load(.monotonic)});
+        try w.print("stardust_defense_events_total{{type=\"decline_mac_blocked\"}} {d}\n", .{self.counters.decline_mac_blocked.load(.monotonic)});
+        try w.print("stardust_defense_events_total{{type=\"decline_global_limited\"}} {d}\n", .{self.counters.decline_global_limited.load(.monotonic)});
+        try w.print("stardust_defense_events_total{{type=\"decline_refused\"}} {d}\n", .{self.counters.decline_refused.load(.monotonic)});
+
+        // SSH counters
+        try w.writeAll("\n# HELP stardust_ssh_events_total SSH server events since start\n");
+        try w.writeAll("# TYPE stardust_ssh_events_total counter\n");
+        try w.print("stardust_ssh_events_total{{type=\"attempts\"}} {d}\n", .{self.counters.ssh_attempts.load(.monotonic)});
+        try w.print("stardust_ssh_events_total{{type=\"logins\"}} {d}\n", .{self.counters.ssh_logins.load(.monotonic)});
+        try w.print("stardust_ssh_events_total{{type=\"failures\"}} {d}\n", .{self.counters.ssh_failures.load(.monotonic)});
 
         // Server uptime
         try w.writeAll("\n# HELP stardust_uptime_seconds Seconds since the DHCP server started\n");

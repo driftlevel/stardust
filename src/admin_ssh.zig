@@ -1682,7 +1682,7 @@ fn renderHeader(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
     const hint: []const u8 = switch (state.tab) {
         .leases => "  /:filter  n:new  e:edit  d:delete",
         .stats => "",
-        .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view" else "  /:filter  v:view  e:edit  n:new  d:del",
+        .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view" else "  /:filter  v:view  n:new  e:edit  d:delete",
         .settings => "  j/k:move  Space:toggle  Enter:review & save",
     };
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
@@ -1750,8 +1750,55 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
         return;
     }
     const uptime_s = now - server.start_time;
-    const uptime_h = @divTrunc(uptime_s, 3600);
-    const uptime_m = @divTrunc(@rem(uptime_s, 3600), 60);
+    const uptime_total_m = @divTrunc(uptime_s, 60);
+    const uptime_total_h = @divTrunc(uptime_total_m, 60);
+    const uptime_total_d = @divTrunc(uptime_total_h, 24);
+    const uptime_months = @divTrunc(uptime_total_d, 30);
+    const uptime_years = @divTrunc(uptime_months, 12);
+
+    const m = @rem(uptime_total_m, 60);
+    const h = @rem(uptime_total_h, 24);
+
+    // Build uptime string with appropriate units
+    var uptime_buf: [64]u8 = undefined;
+    var uptime_pos: usize = 0;
+
+    if (uptime_years > 0) {
+        const s = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}y", .{uptime_years});
+        uptime_pos += s.len;
+    }
+    if (uptime_months > 0) {
+        const display_months = @rem(uptime_months, 12);
+        if (display_months > 0) {
+            const s = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}m", .{display_months});
+            uptime_pos += s.len;
+        }
+        // Over a month: show remaining days (after months are subtracted)
+        const remaining_d = uptime_total_d - (uptime_months * 30);
+        if (remaining_d > 0) {
+            const s = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}d", .{remaining_d});
+            uptime_pos += s.len;
+        }
+    } else if (uptime_total_d >= 7) {
+        // Less than a month but >= 1 week: show weeks and days
+        const weeks = @divTrunc(uptime_total_d, 7);
+        const days = @rem(uptime_total_d, 7);
+        const s = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}w", .{weeks});
+        uptime_pos += s.len;
+        if (days > 0) {
+            const s2 = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}d", .{days});
+            uptime_pos += s2.len;
+        }
+    } else if (uptime_total_d > 0) {
+        // Less than a week: show days
+        const s = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}d", .{uptime_total_d});
+        uptime_pos += s.len;
+    }
+    // Always show hours and minutes
+    {
+        const s = try std.fmt.bufPrint(uptime_buf[uptime_pos..], "{d}h{d:0>2}m", .{ h, m });
+        uptime_pos += s.len;
+    }
 
     const filter_note: []const u8 = if (state.tab == .leases and state.filter_len > 0)
         try std.fmt.allocPrint(fa, "  filter: {s}  (Esc clears)", .{state.filter_buf[0..state.filter_len]})
@@ -1760,9 +1807,8 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
 
     const rw_label = if (server.cfg.admin_ssh.read_only) "read-only" else "read-write";
 
-    const text = try std.fmt.allocPrint(fa, " uptime {d}h{d:0>2}m  {s}{s}", .{
-        uptime_h,
-        uptime_m,
+    const text = try std.fmt.allocPrint(fa, " uptime {s}  {s}{s}", .{
+        uptime_buf[0..uptime_pos],
         rw_label,
         filter_note,
     });
@@ -6434,25 +6480,24 @@ fn renderHelp(state: *TuiState, win: vaxis.Window) void {
         .{ .kind = .title },
         .{ .kind = .blank },
         .{ .kind = .section, .sec_text = "Global" },
-        .{ .kind = .pair, .k1 = "1/2/3/4", .d1 = "Switch tabs", .k2 = "Tab", .d2 = "Next/prev tab" },
+        .{ .kind = .pair, .k1 = "j/k/\xe2\x86\x91/\xe2\x86\x93", .d1 = "Navigate", .k2 = "1/2/3/4", .d2 = "Switch tabs" },
+        .{ .kind = .pair, .k1 = "Tab", .d1 = "Next/prev tab", .k2 = "^C/q", .d2 = "Quit session" },
         .{ .kind = .pair, .k1 = "Ctrl+R", .d1 = "Reload config", .k2 = "?", .d2 = "This help" },
-        .{ .kind = .pair, .k1 = "q", .d1 = "Quit session", .k2 = "Ctrl+C", .d2 = "Quit session" },
         .{ .kind = .blank },
         .{ .kind = .section, .sec_text = "Leases" },
-        .{ .kind = .pair, .k1 = "j/k", .d1 = "Navigate", .k2 = "/", .d2 = "Filter" },
-        .{ .kind = .pair, .k1 = "I/M/H/T/E/P", .d1 = "Sort column", .k2 = "y+i/m/h", .d2 = "Yank" },
-        .{ .kind = .pair, .k1 = "n", .d1 = "New reserv.", .k2 = "e", .d2 = "Edit" },
-        .{ .kind = .single, .k1 = "d", .d1 = "Delete / force-release lease" },
+        .{ .kind = .pair, .k1 = "n", .d1 = "New reservation", .k2 = "/", .d2 = "Filter" },
+        .{ .kind = .pair, .k1 = "e", .d1 = "Edit", .k2 = "I/M/H/T/E/P", .d2 = "Sort column" },
+        .{ .kind = .pair, .k1 = "d", .d1 = "Delete / release", .k2 = "y+i/m/h", .d2 = "Yank" },
         .{ .kind = .blank },
         .{ .kind = .section, .sec_text = "Pools" },
-        .{ .kind = .pair, .k1 = "v / Enter", .d1 = "View pool", .k2 = "e", .d2 = "Edit pool" },
-        .{ .kind = .pair, .k1 = "n", .d1 = "New pool", .k2 = "d", .d2 = "Delete pool" },
-        .{ .kind = .single, .k1 = "/", .d1 = "Filter pools" },
+        .{ .kind = .pair, .k1 = "n", .d1 = "New pool", .k2 = "v / Enter", .d2 = "View pool" },
+        .{ .kind = .pair, .k1 = "e", .d1 = "Edit pool", .k2 = "/", .d2 = "Filter pools" },
+        .{ .kind = .single, .k1 = "d", .d1 = "Delete pool" },
         .{ .kind = .blank },
         .{ .kind = .section, .sec_text = "Forms" },
-        .{ .kind = .pair, .k1 = "Up/Down/Tab", .d1 = "Navigate", .k2 = "Left/Right", .d2 = "Move cursor" },
-        .{ .kind = .pair, .k1 = "Home/End", .d1 = "Start/end", .k2 = "Enter", .d2 = "Save" },
-        .{ .kind = .single, .k1 = "Esc", .d1 = "Cancel / close" },
+        .{ .kind = .pair, .k1 = "\xe2\x86\x91/\xe2\x86\x93/Tab", .d1 = "Navigate", .k2 = "\xe2\x86\x90/\xe2\x86\x92", .d2 = "Move cursor" },
+        .{ .kind = .pair, .k1 = "Home/End", .d1 = "Start/end", .k2 = "Space", .d2 = "Toggle" },
+        .{ .kind = .pair, .k1 = "Enter", .d1 = "Save", .k2 = "Esc", .d2 = "Cancel / close" },
     };
 
     // Two-column mode if box is wide enough.
@@ -6473,7 +6518,7 @@ fn renderHelp(state: *TuiState, win: vaxis.Window) void {
 
     // Render with scroll offset.
     var logical_row: u16 = 0; // absolute row index (before scroll)
-    var row: u16 = 2; // screen row in box
+    var row: u16 = 1; // screen row in box
     for (lines) |line| {
         if (row >= BOX_H - 2) break;
 
