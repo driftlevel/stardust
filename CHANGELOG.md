@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3-alpha3 (2026-04-12)
+
+### TUI Improvements
+
+- **Human-friendly uptime**: status bar scales from minutes through years (e.g. `2w3d5h02m`, `1y2m15d0h30m`) instead of raw hours
+- **Help screen reorganized**: better grouping, consistent key ordering, arrow key symbols, compact layout
+- **Pool tab key hints**: consistent ordering (`n:new e:edit d:delete`)
+
+### Prometheus Metrics
+
+- **`stardust_defense_events_total`**: new counter family for defense/security events (probe_conflict, decline_ip_quarantined, decline_mac_blocked, decline_global_limited, decline_refused)
+- **`stardust_ssh_events_total`**: new counter family for SSH server events (attempts, logins, failures)
+- Updated metric endpoint documentation comments
+
+### Documentation
+
+- README: updated screenshots, improved project description, fixed outdated examples, added missing feature docs
+
+---
+
 ## v0.3-alpha2 (2026-04-06)
 
 ### Config Sync
