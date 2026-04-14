@@ -15,6 +15,8 @@ pub const Lease = struct {
     last_modified: i64 = 0, // unix timestamp; 0 = unknown (old JSON records)
     local: bool = false, // true = this server issued the DHCPACK; not persisted (defaults false on load/sync)
     forcerenew_nonce: ?[]const u8 = null, // 32-char hex string (16 random bytes); RFC 6704
+    relay_agent: ?[]const u8 = null, // hex-encoded Option 82 payload from relay (RFC 3046)
+    relay_ip: ?[]const u8 = null, // dotted-decimal giaddr of the relay that forwarded the request
 };
 
 pub const StateStore = struct {
@@ -52,6 +54,8 @@ pub const StateStore = struct {
             if (lease.hostname) |h| store.allocator.free(h);
             if (lease.client_id) |c| store.allocator.free(c);
             if (lease.forcerenew_nonce) |n| store.allocator.free(n);
+            if (lease.relay_agent) |r| store.allocator.free(r);
+            if (lease.relay_ip) |r| store.allocator.free(r);
         }
         store.leases.deinit();
         store.allocator.destroy(store);
@@ -236,6 +240,10 @@ pub const StateStore = struct {
         errdefer if (client_id) |c| store.allocator.free(c);
         const nonce: ?[]const u8 = if (lease.forcerenew_nonce) |n| try store.allocator.dupe(u8, n) else null;
         errdefer if (nonce) |n| store.allocator.free(n);
+        const relay_agent: ?[]const u8 = if (lease.relay_agent) |r| try store.allocator.dupe(u8, r) else null;
+        errdefer if (relay_agent) |r| store.allocator.free(r);
+        const relay_ip: ?[]const u8 = if (lease.relay_ip) |r| try store.allocator.dupe(u8, r) else null;
+        errdefer if (relay_ip) |r| store.allocator.free(r);
 
         // Now that all allocations succeeded, remove the old entry (if any).
         if (store.leases.fetchRemove(lease.mac)) |kv| {
@@ -244,6 +252,8 @@ pub const StateStore = struct {
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
             if (kv.value.forcerenew_nonce) |n| store.allocator.free(n);
+            if (kv.value.relay_agent) |r| store.allocator.free(r);
+            if (kv.value.relay_ip) |r| store.allocator.free(r);
         }
 
         try store.leases.put(mac, .{
@@ -257,6 +267,8 @@ pub const StateStore = struct {
             // Sync peers supply the original timestamp so lease hashes stay in sync.
             .last_modified = if (lease.last_modified != 0) lease.last_modified else std.time.timestamp(),
             .forcerenew_nonce = nonce,
+            .relay_agent = relay_agent,
+            .relay_ip = relay_ip,
         });
     }
 
@@ -276,6 +288,8 @@ pub const StateStore = struct {
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
             if (kv.value.forcerenew_nonce) |n| store.allocator.free(n);
+            if (kv.value.relay_agent) |r| store.allocator.free(r);
+            if (kv.value.relay_ip) |r| store.allocator.free(r);
             return true;
         }
         return false;
@@ -290,6 +304,8 @@ pub const StateStore = struct {
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
             if (kv.value.forcerenew_nonce) |n| store.allocator.free(n);
+            if (kv.value.relay_agent) |r| store.allocator.free(r);
+            if (kv.value.relay_ip) |r| store.allocator.free(r);
             return true;
         }
         return false;

@@ -15,6 +15,7 @@ remaining findings that are low-severity or by-design.
 - **Round 8** (2026-04-12): DHCP relay agent — initial memory audit
 - **Round 9** (2026-04-12): DHCP relay agent — post-fix verification
 - **Round 10** (2026-04-12): DHCP relay agent — final sweep after SIGHUP reload, upstream socket fix
+- **Round 11** (2026-04-13): Pre-merge audit — Option 82 storage/echo, lease table UI, relay agent final
 
 ---
 
@@ -155,6 +156,27 @@ remaining findings that are low-severity or by-design.
 | dhcp.zig | `encodeOptionValue` falls back to raw string on mixed IP/non-IP parse | **Logs warning** when partial IP parse detected (likely misconfiguration) |
 | dhcp.zig | `encodeDnsSearchList` skips domains that overflow buffer | **Logs info** with domain name |
 | config.zig | `isValidDomainName` allows single-character TLDs | RFC-compliant; single-char TLDs exist (.x, .z proposed) |
+
+### Round 11 — Pre-Merge Audit
+
+| # | File | Severity | Description |
+|---|------|----------|-------------|
+| 56 | state.zig | Critical | `removeLeaseUnlocked` and `forceRemoveLeaseUnlocked` did not free `relay_agent` and `relay_ip` fields — memory leak on every lease deletion. Added matching frees in both functions |
+| 57 | dhcp.zig | Feature | Option 82 echo implemented in createOffer, createAck, createNak, handleInform per RFC 3046 §2.2. Server now echoes relay agent info verbatim in all response types |
+| 58 | dhcp.zig | Feature | Option 82 payload stored on lease as hex-encoded `relay_agent` field; relay IP (giaddr) stored as `relay_ip`. Both synced to peers automatically via JSON |
+| 59 | state.zig | Feature | Lease struct extended with `relay_agent` and `relay_ip` optional fields. Full dupe/free/errdefer coverage in addLeaseUnlocked, deinit, both remove functions |
+| 60 | admin_ssh.zig | Feature | Lease table: new relay and port columns (right-aligned, shrink-first priority). Type shortened (dyn/resv/block). Expiry reformatted (days+hours / hours+minutes). Column layout: hostname capped at 24 initially, fills remaining space |
+| 61 | admin_ssh.zig | Medium | Expiry format `{d:0>2}` on i64 produced `+4` instead of `04` — Zig 0.15 shows sign for signed integers with width specifiers. Fixed by casting `@rem` result to u64 before formatting |
+
+**Full audit coverage (all PASS):**
+- relay.zig: allocations, @intCast bounds, @memcpy lengths, slice indexing, SO_BINDTODEVICE flow, poll loop off-by-one, reloadConfig paths, Option 82 buffer safety, atomics
+- relay_main.zig: atomic signals, config_path lifetime, GPA debug config, defer ordering
+- relay_config.zig: arena lifetime, errdefer coverage, YAML error paths, deinit correctness
+- dhcp_common.zig: function purity, bounds checking in all 5 functions
+- state.zig: new field free coverage in all 4 removal paths (deinit, addLease, removeLease, forceRemove)
+- dhcp.zig: Option 82 echo bounds checks, stack buffer sizes, packet lifetime safety
+- admin_ssh.zig: column layout math, decodeHexToSlice bounds, sort enum consistency, expiry cast safety
+- build.zig: relay target links only yaml + libc (no vaxis, no libssh)
 
 ### Relay Agent — Design Limitations
 

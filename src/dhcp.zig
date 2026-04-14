@@ -1769,6 +1769,16 @@ pub const DHCPServer = struct {
             opts_len += 2 + encoded.len;
         }
 
+        // RFC 3046 §2.2: echo Option 82 (Relay Agent Information) if present in request.
+        if (getOption(request, .RelayAgentInformation)) |raw| {
+            if (opts_len + 2 + raw.len < opts_buf.len) {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.RelayAgentInformation);
+                opts_buf[opts_len + 1] = @intCast(raw.len);
+                @memcpy(opts_buf[opts_len + 2 ..][0..raw.len], raw);
+                opts_len += 2 + raw.len;
+            }
+        }
+
         // End
         opts_buf[opts_len] = @intFromEnum(OptionCode.End);
         opts_len += 1;
@@ -1897,6 +1907,23 @@ pub const DHCPServer = struct {
             nonce_bytes[12], nonce_bytes[13], nonce_bytes[14], nonce_bytes[15],
         }) catch unreachable;
 
+        // RFC 3046: capture Option 82 (Relay Agent Information) for lease storage.
+        // Hex-encode the raw bytes for JSON compatibility (same pattern as forcerenew_nonce).
+        const opt82_raw = getOption(request, .RelayAgentInformation);
+        var opt82_hex_buf: [510]u8 = undefined; // max 255 bytes → 510 hex chars
+        const opt82_hex: ?[]const u8 = if (opt82_raw) |raw| blk: {
+            break :blk std.fmt.bufPrint(&opt82_hex_buf, "{x}", .{raw}) catch null;
+        } else null;
+
+        // Store the relay IP (giaddr) so the TUI can show which relay forwarded the request.
+        const gi = req_header.giaddr;
+        const is_relayed = !std.mem.eql(u8, &gi, &[_]u8{ 0, 0, 0, 0 });
+        var giaddr_buf: [15]u8 = undefined;
+        const relay_ip_str: ?[]const u8 = if (is_relayed)
+            std.fmt.bufPrint(&giaddr_buf, "{d}.{d}.{d}.{d}", .{ gi[0], gi[1], gi[2], gi[3] }) catch null
+        else
+            null;
+
         const new_lease = state_mod.Lease{
             .mac = mac_str,
             .ip = ip_str,
@@ -1906,6 +1933,8 @@ pub const DHCPServer = struct {
             .reserved = reservation != null,
             .local = true, // this server issued the DHCPACK
             .forcerenew_nonce = &nonce_hex,
+            .relay_agent = opt82_hex,
+            .relay_ip = relay_ip_str,
         };
         self.store.addLease(new_lease) catch |err| {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
@@ -2165,6 +2194,16 @@ pub const DHCPServer = struct {
             opts_buf[opts_len + 2] = 1; // algorithm: HMAC-MD5
             @memcpy(opts_buf[opts_len + 3 .. opts_len + 19], &nonce_bytes);
             opts_len += 19;
+        }
+
+        // RFC 3046 §2.2: echo Option 82 (Relay Agent Information) if present in request.
+        if (opt82_raw) |raw| {
+            if (opts_len + 2 + raw.len < opts_buf.len) {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.RelayAgentInformation);
+                opts_buf[opts_len + 1] = @intCast(raw.len);
+                @memcpy(opts_buf[opts_len + 2 ..][0..raw.len], raw);
+                opts_len += 2 + raw.len;
+            }
         }
 
         // End
@@ -2660,6 +2699,16 @@ pub const DHCPServer = struct {
             opts_len += 2 + encoded.len;
         }
 
+        // RFC 3046 §2.2: echo Option 82 if present in request.
+        if (getOption(request, .RelayAgentInformation)) |raw| {
+            if (opts_len + 2 + raw.len < opts_buf.len) {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.RelayAgentInformation);
+                opts_buf[opts_len + 1] = @intCast(raw.len);
+                @memcpy(opts_buf[opts_len + 2 ..][0..raw.len], raw);
+                opts_len += 2 + raw.len;
+            }
+        }
+
         // End
         opts_buf[opts_len] = @intFromEnum(OptionCode.End);
         opts_len += 1;
@@ -2691,7 +2740,7 @@ pub const DHCPServer = struct {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
         const server_ip = self.server_ip;
 
-        var opts_buf: [16]u8 = undefined;
+        var opts_buf: [280]u8 = undefined; // 10 base + up to 257 for Option 82 + 1 End
         var opts_len: usize = 0;
         opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
         opts_len += 1;
@@ -2705,6 +2754,17 @@ pub const DHCPServer = struct {
         opts_len += 1;
         @memcpy(opts_buf[opts_len .. opts_len + 4], &server_ip);
         opts_len += 4;
+
+        // RFC 3046 §2.2: echo Option 82 if present in request.
+        if (getOption(request, .RelayAgentInformation)) |raw| {
+            if (opts_len + 2 + raw.len < opts_buf.len) {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.RelayAgentInformation);
+                opts_buf[opts_len + 1] = @intCast(raw.len);
+                @memcpy(opts_buf[opts_len + 2 ..][0..raw.len], raw);
+                opts_len += 2 + raw.len;
+            }
+        }
+
         opts_buf[opts_len] = @intFromEnum(OptionCode.End);
         opts_len += 1;
 

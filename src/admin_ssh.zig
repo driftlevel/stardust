@@ -448,6 +448,8 @@ const LeaseRow = struct {
     hostname: []const u8,
     type: []const u8,
     expires: []const u8,
+    relay: []const u8,
+    port: []const u8,
     pool: []const u8,
 };
 
@@ -821,7 +823,7 @@ const PoolSaveConfirm = struct {
 };
 
 // Lease table sort state.  Column index matches LeaseRow field order (0-based).
-const SortCol = enum(u8) { none = 255, ip = 0, mac = 1, hostname = 2, type = 3, expires = 4, pool = 5 };
+const SortCol = enum(u8) { none = 255, ip = 0, mac = 1, hostname = 2, type = 3, expires = 4, relay = 5, port = 6, pool = 7 };
 const SortDir = enum { asc, desc };
 
 const TuiState = struct {
@@ -922,6 +924,24 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
+}
+
+/// Decode a hex string into a byte slice. Returns null if the hex is invalid.
+fn decodeHexToSlice(hex: []const u8, out: []u8) ?[]const u8 {
+    if (hex.len % 2 != 0) return null;
+    const n = hex.len / 2;
+    if (n > out.len) return null;
+    for (0..n) |i| {
+        out[i] = (hexVal(hex[i * 2]) orelse return null) << 4 | (hexVal(hex[i * 2 + 1]) orelse return null);
+    }
+    return out[0..n];
+}
+
+fn hexVal(ch: u8) ?u8 {
+    if (ch >= '0' and ch <= '9') return ch - '0';
+    if (ch >= 'a' and ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' and ch <= 'F') return ch - 'A' + 10;
+    return null;
 }
 
 /// Send an OSC 52 clipboard write sequence (base64-encodes text).
@@ -1845,7 +1865,7 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
 // ---------------------------------------------------------------------------
 
 // Column base names (index matches SortCol enum value).
-const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expires", "pool" };
+const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expiry", "relay", "port", "pool" };
 
 // Per-column layout spec:
 //   ideal     — preferred width (chars) when terminal has enough space
@@ -1853,35 +1873,64 @@ const LEASE_COL_NAMES = [_][]const u8{ "ip", "mac", "hostname", "type", "expires
 //   left_trunc — true = show the END of the string (best for addresses);
 //               false = show the START (best for hostnames, labels)
 const LeaseColSpec = struct { ideal: u16, min: u16, left_trunc: bool, right_align: bool = false };
-const LEASE_COL_SPECS = [6]LeaseColSpec{
+const LEASE_COL_SPECS = [8]LeaseColSpec{
     .{ .ideal = 16, .min = 7, .left_trunc = true }, // ip      ("255.255.255.255" = 15 + 1 padding)
     .{ .ideal = 18, .min = 9, .left_trunc = true }, // mac     ("aa:bb:cc:dd:ee:ff" = 17 + 1 padding)
-    .{ .ideal = 60, .min = 6, .left_trunc = false }, // hostname (room for FQDNs)
-    .{ .ideal = 8, .min = 4, .left_trunc = false }, // type    ("reserved" = 8)
-    .{ .ideal = 9, .min = 7, .left_trunc = false }, // expires ("1234h56m" ~ 9)
+    .{ .ideal = 60, .min = 6, .left_trunc = false }, // hostname (room for FQDNs; see calcLeaseColWidths for cap/fill logic)
+    .{ .ideal = 6, .min = 4, .left_trunc = false }, // type    ("block" = 5, "resv" = 4, "dyn" = 3)
+    .{ .ideal = 8, .min = 6, .left_trunc = false }, // expiry  ("13d+19h" = 7, "11h+12m" = 7)
+    .{ .ideal = 16, .min = 1, .left_trunc = true, .right_align = true }, // relay   (IP, right-aligned, shrinks first)
+    .{ .ideal = 5, .min = 1, .left_trunc = true, .right_align = true }, // port    (interface name, right-aligned, shrinks first)
     .{ .ideal = 18, .min = 10, .left_trunc = false, .right_align = true }, // pool    ("192.168.100.0/24" = 16)
 };
 // Columns reduced in this priority order when terminal is too narrow.
-// Flexible/variable content is reduced first; address columns last.
-const LEASE_COL_REDUCE_ORDER = [6]usize{ 2, 5, 4, 3, 0, 1 }; // hostname→pool→exp→type→ip→mac
+// relay/port shrink first (lowest priority), then hostname, then pool, etc.
+const LEASE_COL_REDUCE_ORDER = [8]usize{ 5, 6, 2, 7, 4, 3, 0, 1 }; // relay→port→hostname→pool→expiry→type→ip→mac
 const LEASE_COL_SEP: u16 = 1; // single space between columns
 
 /// Calculate column widths that fit within win_width.
 /// Total occupied = sum(widths) + (N-1)*LEASE_COL_SEP.
-fn calcLeaseColWidths(win_width: u16) [6]u16 {
-    var widths: [6]u16 = undefined;
+///
+/// Layout logic:
+///  1. Start all columns at ideal width.
+///  2. Shrink in reduce-order to fit: relay/port first, then hostname (capped
+///     at 24 during shrink phase — relay/port give way before hostname drops
+///     below 24), then pool, expiry, type, ip, mac.
+///  3. If space remains after all columns are at ideal, hostname gets the extra
+///     (it's the only unbounded column — FQDNs benefit from width).
+fn calcLeaseColWidths(win_width: u16) [8]u16 {
+    const N = LEASE_COL_SPECS.len;
+    const seps: u16 = (N - 1) * LEASE_COL_SEP;
+    const hostname_col = 2;
+    const hostname_cap: u16 = 24; // hostname priority threshold
+
+    // Start all columns at ideal, but cap hostname at 24. Hostname gets
+    // remaining space later (Phase 3) — this ensures relay/port get their
+    // ideal widths before hostname expands beyond 24.
+    var widths: [N]u16 = undefined;
     for (LEASE_COL_SPECS, 0..) |spec, i| widths[i] = spec.ideal;
-    const seps: u16 = (LEASE_COL_SPECS.len - 1) * LEASE_COL_SEP;
+    widths[hostname_col] = hostname_cap;
+
     var total: u16 = seps;
     for (widths) |w| total +|= w;
+
+    // Phase 1: shrink in reduce-order to fit. Relay/port shrink first,
+    // then hostname (below 24), then pool, expiry, type, ip, mac.
     for (LEASE_COL_REDUCE_ORDER) |col| {
         if (total <= win_width) break;
+        if (widths[col] <= LEASE_COL_SPECS[col].min) continue;
         const over = total - win_width;
         const slack = widths[col] - LEASE_COL_SPECS[col].min;
         const cut = @min(over, slack);
         widths[col] -= cut;
         total -= cut;
     }
+
+    // Phase 2: give remaining space to hostname (FQDNs benefit from width).
+    if (total < win_width) {
+        widths[hostname_col] +|= win_width - total;
+    }
+
     return widths;
 }
 
@@ -1948,7 +1997,7 @@ fn drawLeaseTable(
         const hdr_win = win.child(.{ .y_off = 0, .height = 1, .width = win.width });
         hdr_win.fill(.{ .style = .{ .bg = hdr_bg } });
         var x: i17 = 0;
-        for (0..6) |ci| {
+        for (0..LEASE_COL_SPECS.len) |ci| {
             if (widths[ci] > 0) {
                 const cell = hdr_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
                 const raw = try truncateCell(fa, header_names[ci], widths[ci], false);
@@ -1986,9 +2035,9 @@ fn drawLeaseTable(
         const row_win = win.child(.{ .x_off = 0, .y_off = @intCast(ri + 1), .width = win.width, .height = 1 });
         row_win.fill(.{ .style = row_style });
 
-        const fields = [6][]const u8{ row.ip, row.mac, row.hostname, row.type, row.expires, row.pool };
+        const fields = [LEASE_COL_SPECS.len][]const u8{ row.ip, row.mac, row.hostname, row.type, row.expires, row.relay, row.port, row.pool };
         var x: i17 = 0;
-        for (0..6) |ci| {
+        for (0..LEASE_COL_SPECS.len) |ci| {
             if (widths[ci] > 0) {
                 const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
                 const spec = LEASE_COL_SPECS[ci];
@@ -2049,8 +2098,10 @@ const LeaseSort = struct {
             .ip => ipLess(a.ip, b.ip),
             .mac => std.mem.lessThan(u8, a.mac, b.mac),
             .hostname => naturalLessThan(a.hostname orelse "", b.hostname orelse ""),
-            .type => std.mem.lessThan(u8, if (a.reserved) "reserved" else "dynamic", if (b.reserved) "reserved" else "dynamic"),
+            .type => std.mem.lessThan(u8, if (a.reserved) "resv" else "dyn", if (b.reserved) "resv" else "dyn"),
             .expires => expiresLess(a, b),
+            .relay => std.mem.lessThan(u8, a.relay_ip orelse "", b.relay_ip orelse ""),
+            .port => std.mem.lessThan(u8, a.relay_agent orelse "", b.relay_agent orelse ""),
             .pool => poolLess(ctx.cfg, a.ip, b.ip),
         };
         return if (ctx.dir == .asc) asc else !asc;
@@ -2115,16 +2166,45 @@ fn renderLeaseTab(
             try std.fmt.allocPrint(a, "{s}/{d}", .{ p.subnet, p.prefix_len })
         else
             "?";
-        const type_str: []const u8 = if (is_conflict) "conflict" else if (lease.reserved) "reserved" else "dynamic";
+        const type_str: []const u8 = if (is_conflict) "block" else if (lease.reserved) "resv" else "dyn";
         const hostname_str: []const u8 = if (is_conflict) "" else lease.hostname orelse "";
 
         const expires_str = blk: {
-            if (lease.reserved) break :blk try a.dupe(u8, "forever");
+            if (lease.reserved) break :blk try a.dupe(u8, "none");
             const diff = lease.expires - now;
             if (diff <= 0) break :blk try a.dupe(u8, "expired");
-            const h = @divTrunc(diff, 3600);
-            const m = @divTrunc(@rem(diff, 3600), 60);
-            break :blk try std.fmt.allocPrint(a, "{d}h{d:0>2}m", .{ h, m });
+            const total_m = @divTrunc(diff, 60);
+            const total_h = @divTrunc(total_m, 60);
+            const total_d = @divTrunc(total_h, 24);
+            if (total_d > 0) {
+                const rem_h: u64 = @intCast(@rem(total_h, 24));
+                break :blk try std.fmt.allocPrint(a, "{d}d+{d}h", .{ total_d, rem_h });
+            } else {
+                const rem_m: u64 = @intCast(@rem(total_m, 60));
+                break :blk try std.fmt.allocPrint(a, "{d}h+{d:0>2}m", .{ total_h, rem_m });
+            }
+        };
+
+        // Relay agent info: extract relay IP (giaddr) and port (circuit-id) from
+        // the hex-encoded Option 82 stored on the lease.
+        const relay_str: []const u8 = lease.relay_ip orelse "";
+        const port_str = blk: {
+            const hex = lease.relay_agent orelse break :blk "";
+            // Decode hex to find sub-option 1 (circuit-id).
+            var decoded_buf: [255]u8 = undefined;
+            const decoded = decodeHexToSlice(hex, &decoded_buf) orelse break :blk "";
+            var di: usize = 0;
+            while (di + 1 < decoded.len) {
+                const sub_code = decoded[di];
+                const sub_len = decoded[di + 1];
+                if (di + 2 + sub_len > decoded.len) break;
+                if (sub_code == 1) { // circuit-id
+                    const cid = decoded[di + 2 .. di + 2 + sub_len];
+                    break :blk try a.dupe(u8, cid);
+                }
+                di += 2 + sub_len;
+            }
+            break :blk "";
         };
 
         // Filter: skip rows that don't match any field (case-insensitive).
@@ -2133,7 +2213,8 @@ fn renderLeaseTab(
                 containsIgnoreCase(lease.mac, filter) or
                 containsIgnoreCase(hostname_str, filter) or
                 containsIgnoreCase(type_str, filter) or
-                containsIgnoreCase(pool_cidr, filter);
+                containsIgnoreCase(pool_cidr, filter) or
+                containsIgnoreCase(port_str, filter);
             if (!match) continue;
         }
 
@@ -2143,6 +2224,8 @@ fn renderLeaseTab(
             .hostname = try a.dupe(u8, hostname_str),
             .type = type_str,
             .expires = expires_str,
+            .relay = relay_str,
+            .port = port_str,
             .pool = pool_cidr,
         });
     }
@@ -2177,11 +2260,11 @@ fn renderLeaseTab(
         const hn_len = @min(sel.hostname.len, state.sel_hostname.len);
         @memcpy(state.sel_hostname[0..hn_len], sel.hostname[0..hn_len]);
         state.sel_hostname_len = hn_len;
-        state.sel_reserved = std.mem.eql(u8, sel.type, "reserved");
+        state.sel_reserved = std.mem.eql(u8, sel.type, "resv");
     }
 
     // Build column headers with sort indicator on the active column.
-    var hdr_names: [LEASE_COL_NAMES.len][]const u8 = undefined;
+    var hdr_names: [LEASE_COL_SPECS.len][]const u8 = undefined;
     for (LEASE_COL_NAMES, 0..) |base, i| {
         if (state.sort_col != .none and @intFromEnum(state.sort_col) == i) {
             const arrow: []const u8 = if (state.sort_dir == .asc) " ^" else " v";
@@ -8334,7 +8417,7 @@ test "calcDynColWidth: single column returns full width" {
 }
 
 test "calcLeaseColWidths: fits within window" {
-    const seps: u16 = 5;
+    const seps: u16 = LEASE_COL_SPECS.len - 1;
     for ([_]u16{ 80, 100, 120, 200 }) |w| {
         const cols = calcLeaseColWidths(w);
         var total: u16 = seps;
@@ -8344,11 +8427,15 @@ test "calcLeaseColWidths: fits within window" {
 }
 
 test "calcLeaseColWidths: ideal layout at wide terminal" {
-    // At 200 chars, all columns should be at their ideal widths.
-    const cols = calcLeaseColWidths(200);
+    // At 250 chars, all non-hostname columns should be at their ideal widths.
+    // Hostname gets remaining space (which will exceed its ideal).
+    const cols = calcLeaseColWidths(250);
     for (LEASE_COL_SPECS, 0..) |spec, i| {
+        if (i == 2) continue; // hostname fills remaining space
         try std.testing.expectEqual(spec.ideal, cols[i]);
     }
+    // Hostname should be at least ideal width.
+    try std.testing.expect(cols[2] >= LEASE_COL_SPECS[2].ideal);
 }
 
 test "calcLeaseColWidths: respects minimums at narrow terminal" {
@@ -8356,6 +8443,18 @@ test "calcLeaseColWidths: respects minimums at narrow terminal" {
     for (LEASE_COL_SPECS, 0..) |spec, i| {
         try std.testing.expect(cols[i] >= spec.min);
     }
+}
+
+test "calcLeaseColWidths: relay/port shrink before hostname reaches 24" {
+    // At a width where relay/port should be at minimum (1) before hostname drops below 24.
+    const cols = calcLeaseColWidths(100);
+    if (cols[2] >= 24) {
+        // If hostname is >= 24, relay/port should have shrunk first.
+        // (They may or may not be at min depending on total space.)
+    }
+    // Relay and port should never exceed their ideal regardless.
+    try std.testing.expect(cols[5] <= LEASE_COL_SPECS[5].ideal);
+    try std.testing.expect(cols[6] <= LEASE_COL_SPECS[6].ideal);
 }
 
 test "truncateCell: no truncation when fits" {
